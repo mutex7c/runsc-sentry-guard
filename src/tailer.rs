@@ -1,12 +1,16 @@
 use regex::Regex;
 use std::collections::HashMap;
-use std::fs::{self, File};
+use std::fs::{self, OpenOptions}; // Cleaned up: Added OpenOptions here
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
+
+// Conditionally import Unix file system extensions for flag manipulation
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 
 use crate::config::{AtomicAction, GuardConfig};
 use crate::logger::emit_log;
@@ -44,6 +48,7 @@ pub fn start_monitor_loop(config: GuardConfig) {
         })
         .collect();
 
+    // ID verification rule bounds
     let id_extractor = Regex::new(r"--id=([a-fA-F0-9]{12,64})").unwrap();
     let mut file_state_tracker: HashMap<String, LogDescriptor> = HashMap::new();
     let mut first_run = true;
@@ -63,9 +68,11 @@ pub fn start_monitor_loop(config: GuardConfig) {
     loop {
         let log_dir_path = Path::new(&config.monitor.log_dir);
 
+        // Dynamic cross-platform desktop initialization guard
         if !log_dir_path.exists() {
             #[cfg(not(target_os = "linux"))]
             {
+                // Auto-create simulation targets on Desktop developer environments
                 let _ = fs::create_dir_all(log_dir_path);
             }
             #[cfg(target_os = "linux")]
@@ -98,8 +105,10 @@ pub fn start_monitor_loop(config: GuardConfig) {
                         path.metadata().map(|m| m.st_ino()).unwrap_or(0)
                     };
                     #[cfg(not(target_os = "linux"))]
-                    let current_inode = 0;
+                    let current_inode = 0; // Mock profile for local desktop evaluations
 
+                    // On the very first loop pass, establish a baseline position
+                    // at the END of existing files to ignore historical lines.
                     if first_run {
                         if let Ok(metadata) = path.metadata() {
                             let file_len = metadata.len();
@@ -120,16 +129,56 @@ pub fn start_monitor_loop(config: GuardConfig) {
                             last_pos = desc.position;
                         }
                     }
-                    if let Ok(file) = File::open(&path) {
+
+                    // Open file descriptors securely utilizing strict OS security constraints (Symlink defense)
+                    #[cfg(unix)]
+                    let file_result = OpenOptions::new()
+                        .read(true)
+                        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                        .open(&path);
+
+                    #[cfg(not(unix))]
+                    let file_result = File::open(&path); // Baseline cross-platform development workstation fallback
+
+                    if let Ok(file) = file_result {
+                        // Execute strict owner validation to defend against directory traversals / TOCTOU
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::MetadataExt;
+                            if let Ok(metadata) = file.metadata() {
+                                if metadata.uid() != 0 {
+                                    emit_log(
+                                        "WARN",
+                                        "orchestrator",
+                                        None,
+                                        None,
+                                        None,
+                                        Some("security_audit"),
+                                        "REJECTED",
+                                        &format!(
+                                            "TOCTOU/Symlink intercept: File {} owner UID is {}, expected 0. Skipping log parsing loop.",
+                                            path_str,
+                                            metadata.uid()
+                                        ),
+                                        json_enabled,
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
+
                         let mut reader = BufReader::new(file);
                         let _ = reader.seek(SeekFrom::Start(last_pos));
 
+                        // Process the streaming log blocks continuously
                         loop {
                             let mut line_bytes = Vec::new();
                             let mut reached_eof = false;
                             let mut exceeded_limit = false;
 
+                            // Internal low-level buffer window parsing loop (OOM defense)
                             loop {
+                                // Inspect the internal buffer without moving the file cursor
                                 let available_buffer = match reader.fill_buf() {
                                     Ok(buf) if buf.is_empty() => {
                                         reached_eof = true;
@@ -142,6 +191,7 @@ pub fn start_monitor_loop(config: GuardConfig) {
                                     }
                                 };
 
+                                // Scan the memory slice for a newline delimiter
                                 if let Some(newline_pos) =
                                     available_buffer.iter().position(|&b| b == b'\n')
                                 {
@@ -160,6 +210,7 @@ pub fn start_monitor_loop(config: GuardConfig) {
                                     }
                                     break;
                                 } else {
+                                    // No newline in current chunk; consume the segment up to the limit
                                     let chunk_len = available_buffer.len();
                                     if line_bytes.len() + chunk_len > 8192 {
                                         exceeded_limit = true;
@@ -175,10 +226,12 @@ pub fn start_monitor_loop(config: GuardConfig) {
                                 }
                             }
 
+                            // If we hit EOF and no bytes were fetched, we have fully processed the current file state
                             if reached_eof && line_bytes.is_empty() {
                                 break;
                             }
 
+                            // Convert the bounded byte array securely into a string view
                             let current_line = String::from_utf8_lossy(&line_bytes);
                             let trimmed_line = current_line.trim_end();
 
@@ -201,6 +254,7 @@ pub fn start_monitor_loop(config: GuardConfig) {
                                 break;
                             }
 
+                            // Evaluate line strings against security signatures
                             for (rule_name, rx, try_act, final_act) in &regex_compiled {
                                 if rx.is_match(trimmed_line) {
                                     if let Some(caps) = id_extractor.captures(trimmed_line) {
@@ -218,8 +272,8 @@ pub fn start_monitor_loop(config: GuardConfig) {
                                                     let tbl_clone = table.clone();
                                                     let reg_clone = Arc::clone(&worker_registry);
 
+                                                    // Spawn self-reaping worker thread with 30s inactivity timeout
                                                     thread::spawn(move || {
-                                                        // Set a strict 30-second channel timeout limit
                                                         let timeout_dur = Duration::from_secs(30);
                                                         loop {
                                                             match rx_chan.recv_timeout(timeout_dur)
@@ -240,12 +294,11 @@ pub fn start_monitor_loop(config: GuardConfig) {
                                                                     );
                                                                 }
                                                                 Err(_) => {
-                                                                    // Channel timed out or disconnected. Acquire registry lock.
+                                                                    // Inactivity timeout hit or sender dropped. Evict key from registry.
                                                                     let mut reg =
                                                                         reg_clone.lock().unwrap();
-                                                                    // Verify no new messages arrived right before locking
                                                                     reg.remove(&cid_clone);
-                                                                    break; // Exit loop, terminating the thread cleanly
+                                                                    break; // Exit worker thread execution safely
                                                                 }
                                                             }
                                                         }
@@ -279,6 +332,7 @@ pub fn start_monitor_loop(config: GuardConfig) {
                             }
                         }
 
+                        // Sync position pointers tracking changes cleanly
                         if let Ok(pos) = reader.stream_position() {
                             file_state_tracker.insert(
                                 path_str,
@@ -293,24 +347,28 @@ pub fn start_monitor_loop(config: GuardConfig) {
             }
         }
 
+        // Drop the first run flag after establishing the baseline tracking map
         first_run = false;
+
+        // Handle Systemd native supervisor datagram heartbeat telemetry notifications
         notify_systemd_watchdog();
         thread::sleep(Duration::from_millis(config.monitor.check_interval_ms));
     }
 }
 
 fn notify_systemd_watchdog() {
-    // Native Systemd Notify Protocol Implementation
-
+    // Native out-of-band Systemd Notify Protocol Implementation
     if let Ok(socket_path) = std::env::var("NOTIFY_SOCKET") {
         if !socket_path.is_empty() {
             use std::os::unix::net::UnixDatagram;
-            // Systemd sockets can use an abstract namespace path if prefixed with '@'
+
+            // Abstract namespace handling for Linux systemd configurations
             let resolved_path = if let Some(stripped) = socket_path.strip_prefix('@') {
                 format!("\0{}", stripped)
             } else {
                 socket_path
             };
+
             if let Ok(socket) = UnixDatagram::unbound() {
                 let _ = socket.send_to(b"WATCHDOG=1\nREADY=1\n", resolved_path);
             }

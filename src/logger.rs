@@ -32,7 +32,6 @@ pub fn emit_log(
 
     if json_enabled {
         // SIEM optimized JSON log-format
-
         let payload = JsonLogPayload {
             timestamp,
             level,
@@ -50,7 +49,6 @@ pub fn emit_log(
         }
     } else {
         // Human-readable fallback console output profile
-
         let id_str = container_id.unwrap_or("-");
         println!(
             "[{}] [{}] [Comp: {}] [ID: {}] {} -> {}",

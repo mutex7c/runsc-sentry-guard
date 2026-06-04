@@ -51,9 +51,7 @@ fn execute_atomic_command(
     json_enabled: bool,
 ) -> Result<(), String> {
     match action {
-
         // Insert this variant into the match action block in src/worker.rs
-
         AtomicAction::WebhookAlert { url } => {
             let payload = format!(
                 "{{\"text\":\"🚨 [SENTRY-GUARD] Active containment pipeline triggered for container context: {}\"}}",
@@ -63,10 +61,13 @@ fn execute_atomic_command(
             // Execute out-of-band POST network payloads securely via array slices
             let s = Command::new("curl")
                 .args(&[
-                    "-X", "POST",
-                    "-H", "Content-type: application/json",
-                    "--data", &payload,
-                    url
+                    "-X",
+                    "POST",
+                    "-H",
+                    "Content-type: application/json",
+                    "--data",
+                    &payload,
+                    url,
                 ])
                 .status()
                 .map_err(|e| e.to_string())?;
@@ -77,11 +78,6 @@ fn execute_atomic_command(
                 Err("Out-of-band Webhook alert dispatch payload failed execution".into())
             }
         }
-
-
-
-
-
 
         AtomicAction::ValidateState => {
             let output = Command::new("docker")

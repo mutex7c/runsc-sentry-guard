@@ -14,3 +14,4 @@ toml = "1.1.2"
 ipnet = { version = "2.12.0", features = ["serde"] }
 libc = "0.2.186"
 regex = "1.12.3"
+caps = "0.5.6"

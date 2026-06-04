@@ -5,9 +5,6 @@ use std::path::Path;
 use std::path::PathBuf;
 
 // Data Contracts mapped directly to config.toml.example
-
-// Replace the top section of src/config.rs down to GuardConfig
-
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AtomicAction {

@@ -1,0 +1,23 @@
+# Rust compilation artifacts
+/target/
+
+# Cargo lock file
+**/*.rs.bk
+
+# IDE configuration files
+.idea/
+.rustrover/
+*.iml
+
+# Local environmental files
+.env
+*.local
+
+# Omit local runtime configs
+config.toml
+
+# Local mock_logs
+/mock_logs
+
+# Local dev / testing files
+/repo_dump.txt

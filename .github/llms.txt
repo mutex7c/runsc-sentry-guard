@@ -1,0 +1,16 @@
+# runsc-sentry-guard Architecture Context Manifest
+
+## Meta-References
+- Compliance & Requirements Architecture Profile: See [/REQUIREMENTS_AND_COMPLIANCE.md]
+- Low-Level Technical Implementation Blueprint: See [/TECHNICAL_SPECIFICATION.md]
+- Advanced OS Kernel Sandboxing Parameters: See [/SECURITY_HARDENING.md]
+
+## Core Project Objective
+- Non-intrusive CNDR daemon designed to watch gVisor (runsc) debug files (*.boot) out-of-band.
+- Uses Key-Based Concurrency models to process incoming container events asynchronously.
+
+## Rules Engine Constraints
+- Entrypoint logs read line-by-line using Inode tracking loops.
+- Matched container IDs verified using a strict hex regex pattern before invoking commands.
+- Before firing firewall rules, targets are filtered via the `ipnet` library against a hard exclusion whitelist.
+- If a primary playbook step returns an Err status, execution instantly transfers to the hard 'final_actions' block.

@@ -1,6 +1,7 @@
 # runsc-sentry-guard
 
-An ultra-lightweight, out-of-band active incident response daemon for `runsc` (gVisor) sandboxes written in modern, memory-safe Rust.
+An ultra-lightweight, out-of-band active incident response daemon 
+for `runsc` (gVisor) sandboxes written in memory-safe Rust.
 
 > ⚠️ **Development Status: ALPHA** 
 > > This daemon has been structurally verified and 
@@ -64,11 +65,14 @@ If you do not want to install the Rust compiler natively on your production host
 docker run --rm -v "$PWD":/usr/src/guard -w /usr/src/guard rust:1.96-alpine cargo build --release
 ```
 
-This command mounts your local source directories, leverages the isolated build container cache, and drops the compiled native Linux binary smoothly into your local `./target/release/` output path without polluting your host engine dependencies.
+This command mounts your local source directories, leverages the isolated build container cache, 
+and drops the compiled native Linux binary smoothly into your local `./target/release/` output 
+path without polluting your host engine dependencies.
 
 ### Path C: Automated CI/CD Image Assembly (Cloud-Native)
 
-To distribute and run the guard inside containerized or orchestrated environments (like Kubernetes), utilize this multi-stage `Dockerfile`. It compiles the binary within an isolated build layer and copies it into a highly stripped, minimal runtime image to keep the attack surface microscopic.
+To distribute and run the guard inside containerized or orchestrated environments (like Kubernetes), 
+utilize this multi-stage `Dockerfile`. It compiles the binary within an isolated build layer and copies it into a highly stripped, minimal runtime image to keep the attack surface microscopic.
 
 Create a file named `Dockerfile` in your root folder:
 
@@ -86,110 +90,15 @@ COPY --from=builder /usr/src/runsc-sentry-guard/target/release/runsc-sentry-guar
 ENTRYPOINT ["/usr/sbin/runsc-sentry-guard"]
 ```
 
-#### GitHub Actions Workflow Automation Pipeline
+## 5. Installation & Deployment
 
-To automatically compile and push your defensive security image to GitHub Packages (GHCR) on every stable tag release, create `.github/workflows/release.yml`:
-
-```yaml
-name: Build and Publish Security Image
-on:
-  push:
-    tags:
-      - 'v*'
-
-jobs:
-  publish:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout Source Code
-        uses: actions/checkout@v4
-
-      - name: Authenticate to Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Assemble and Push Micro-Image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          push: true
-          tags: ghcr.io/mutex7c/runsc-sentry-guard:latest,ghcr.io/mutex7c/runsc-sentry-guard:${{ github.ref_name }}
-```
-
-## 5. Kubernetes DaemonSet Deployment Blueprint
-
-Because the guard needs out-of-band host visibility to intercept gVisor logs and apply host-level `nftables` network isolation blocks, it must run as a privileged **DaemonSet** mapped directly to the underlying host namespaces.
-
-Create a deployment configuration manifest named `runsc-sentry-guard-daemonset.yaml`:
-
-```yaml
-apiVersion: apps/v1
-kind: DaemonSet
-metadata:
-  name: runsc-sentry-guard
-  namespace: kube-system
-  labels:
-    k8s-app: runsc-sentry-guard
-spec:
-  selector:
-    matchLabels:
-      name: runsc-sentry-guard
-  template:
-    metadata:
-      labels:
-        name: runsc-sentry-guard
-    spec:
-      # Required to query host network states and isolate sockets
-      hostNetwork: true
-      hostPID: true
-      tolerations:
-        - operator: Exists
-          effect: NoSchedule
-      containers:
-        - name: sentry-guard
-          image: ghcr.io/mutex7c/runsc-sentry-guard:latest
-          imagePullPolicy: Always
-          securityContext:
-            privileged: true
-            capabilities:
-              add: ["NET_ADMIN"]
-          volumeMounts:
-            # Mount host container engine sockets
-            - name: docker-socket
-              mountPath: /var/run/docker.sock
-            # Mount host destination log arrays where runsc writes streams
-            - name: gvisor-logs
-              mountPath: /var/log/gvisor
-              readOnly: true
-      volumes:
-        - name: docker-socket
-          hostPath:
-            path: /var/run/docker.sock
-            type: Socket
-        - name: gvisor-logs
-          hostPath:
-            path: /var/log/gvisor
-            type: DirectoryOrCreate
-```
-
-To deploy the entire monitoring framework to your live Kubernetes cluster topology, run:
-
-```bash
-kubectl apply -f runsc-sentry-guard-daemonset.yaml
-```
-
-## 6. Installation & Deployment
-
-### 6.1 Prerequisites
+### 5.1 Prerequisites
 
 * A Linux host system running a supported modern kernel distribution (Debian, Ubuntu, RHEL, Fedora, Arch).
 * Docker or Podman running workloads utilizing the gVisor `runsc` runtime wrapper.
 * `nftables` active on the host edge for automated network isolation support.
 
-### 6.2 Step 1: Acquire the Source Code
+### 5.2 Step 1: Acquire the Source Code
 
 Choose the method that matches your environment setup:
 
@@ -205,7 +114,7 @@ Choose the method that matches your environment setup:
   cd mutex7c-runsc-sentry-guard-*
   ```
 
-### 6.3 Step 2: Establish Configuration Profile
+### 5.3 Step 2: Establish Configuration Profile
 
 Provision your example configuration file blueprint:
 
@@ -215,7 +124,7 @@ cp config.toml.example config.toml
 
 Open and modify `config.toml` to customize your threat signatures, define core infrastructure whitelists, and align your mitigation playbooks.
 
-### 6.4 Step 3: Run the System Installer
+### 5.4 Step 3: Run the System Installer
 
 Ensure the installer script has administrative execution permissions on the host system:
 

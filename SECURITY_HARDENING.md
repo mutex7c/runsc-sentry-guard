@@ -5,8 +5,6 @@ privileges, this document provides baseline profiles
 required to restrict the daemon's host-level access to 
 only the necessary directories and kernel interfaces.
 
----
-
 ## 1. Systemd Sandboxing (Built-in Hardening)
 
 Our systemd service unit utilizes advanced Linux namespace isolation flags. This ensures that even if a vulnerability is discovered within our dependency tree, the binary cannot access user home directories, spawn arbitrary network listeners, or modify critical system binaries.

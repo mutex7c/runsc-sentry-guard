@@ -1,7 +1,11 @@
 # System Requirements & Architecture Specification: runsc-sentry-guard
 
 ## 1. Executive Summary & Objective
-`runsc-sentry-guard` is an ultra-lightweight, out-of-band Cloud-Native Detection and Response (CNDR) daemon written in native Rust. Its primary objective is to monitor gVisor (`runsc`) sandbox debug streams on a host system, identify runtime Indicators of Compromise (IOCs), and execute configurable, atomized, fail-safe incident containment pipelines without introducing external runtime dependencies or kernel-level hooking (e.g., eBPF) vulnerabilities.
+`runsc-sentry-guard` is an ultra-lightweight, out-of-band Cloud-Native Detection and Response (CNDR) 
+daemon written in native Rust. Its primary objective is to monitor gVisor (`runsc`) sandbox debug 
+streams on a host system, identify runtime Indicators of Compromise (IOCs), and execute configurable, 
+atomized, fail-safe incident containment pipelines without introducing external runtime dependencies 
+or kernel-level hooking (e.g., eBPF) vulnerabilities.
 
 ## 2. Core Functional Requirements
 

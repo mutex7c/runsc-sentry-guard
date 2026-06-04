@@ -15,7 +15,7 @@ We actively monitor and maintain security updates for the following versions of 
 
 If you discover a memory exploit, capability leak, sandbox bypass, or a remote code execution (RCE) flaw within this daemon, please report it via the **GitHub Private Vulnerability Reporting:** 
 
-Navigate to the [Security tab](https://github.com/mutex7c/runsc-sentry-guard/security) of this repository, click **Vulnerability reporting**, and select **Report a vulnerability**. This allows you to privately discuss and coordinate a patch with the maintainers inside an isolated draft advisory space.
+Navigate to the [Security tab](https://github.com/mutex7c/runsc-sentry-guard/security) of this repository, and select **Report a vulnerability**. This allows you to privately discuss and coordinate a patch with the maintainers inside an isolated draft advisory space.
 
 ### What to Include in a Report
 To ensure a rapid triage process, please include as much technical telemetry as possible:

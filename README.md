@@ -5,8 +5,7 @@ for `runsc` (gVisor) sandboxes written in memory-safe Rust.
 
 > ⚠️ **Development Status: ALPHA** 
 > > This daemon has been structurally verified and 
-> tested in development environments. 
-> Linux kernel validation (`nftables` and active `runsc` log tailing) is currently underway. 
+> tested in development environments.
 > 
 > DO NOT USE in production environments yet!
 

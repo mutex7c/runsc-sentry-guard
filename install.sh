@@ -2,12 +2,14 @@
 set -e
 
 # Establish FHS-compliant deployment destination paths
+
 BIN_DEST="/usr/sbin/runsc-sentry-guard"
 CONF_DIR="/etc/runsc-sentry-guard"
 CONF_DEST="$CONF_DIR/config.toml"
 SERVICE_DEST="/etc/systemd/system/runsc-sentry-guard.service"
 
 # Enforcement Boundary: Enforce administrative privileges check
+
 if [ "$(id -u)" -ne 0 ]; then
     echo "Installation Error: This deployment routine must be run with root permissions (sudo)." >&2
     exit 1
@@ -16,6 +18,7 @@ fi
 echo "Bootstrapping runsc-sentry-guard installation pipeline..."
 
 # Locate build artifact from both native or containerized cargo paths
+
 if [ -f "./target/release/runsc-sentry-guard" ]; then
     echo "Verified local release build target artifact. Deploying..."
     cp "./target/release/runsc-sentry-guard" "$BIN_DEST"
@@ -26,10 +29,12 @@ else
 fi
 
 # Restrict file execution permissions on binary
+
 chmod 700 "$BIN_DEST"
 chown root:root "$BIN_DEST"
 
 # Provision configuration file paths securely
+
 if [ ! -d "$CONF_DIR" ]; then
     mkdir -p "$CONF_DIR"
     chmod 750 "$CONF_DIR"
@@ -50,6 +55,7 @@ else
 fi
 
 # Provision host systemd service structures if native paths are present
+
 if [ -d "/run/systemd/system" ]; then
     echo "Systemd supervisor layers detected. Generating hardened daemon unit configuration..."
     cat << EOF > "$SERVICE_DEST"
@@ -59,12 +65,13 @@ After=docker.service
 Requires=docker.service
 
 [Service]
-Type=simple
+Type=notify
 User=root
 WorkingDirectory=/var/log/gvisor
 ExecStart=$BIN_DEST
 Restart=always
 RestartSec=3
+WatchdogSec=10
 
 # Security Hardening & Sandboxing Matrix
 NoNewPrivileges=true
@@ -84,10 +91,15 @@ EOF
     chmod 644 "$SERVICE_DEST"
 
     # Force systemd subsystem index synchronization updates
+
     systemctl daemon-reload
+
     echo "Systemd service profile armed. To activate run: sudo systemctl enable --now runsc-sentry-guard"
+
 else
+
     echo "Warning: Systemd initialized configuration space not located. Please establish process supervisor profiles manually."
+
 fi
 
 echo "Installation complete!"

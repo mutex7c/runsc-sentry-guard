@@ -31,6 +31,8 @@ pub fn emit_log(
         .as_secs();
 
     if json_enabled {
+        // SIEM optimized JSON log-format
+
         let payload = JsonLogPayload {
             timestamp,
             level,
@@ -42,11 +44,13 @@ pub fn emit_log(
             status,
             details,
         };
+
         if let Ok(json_string) = serde_json::to_string(&payload) {
             println!("{}", json_string);
         }
     } else {
         // Human-readable fallback console output profile
+
         let id_str = container_id.unwrap_or("-");
         println!(
             "[{}] [{}] [Comp: {}] [ID: {}] {} -> {}",

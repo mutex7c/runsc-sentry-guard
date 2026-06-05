@@ -54,6 +54,8 @@ pub struct MonitorConfig {
     pub ip_whitelist: Vec<IpNet>,
     pub nftables_default_table: String,
     pub json_logging_enabled: bool,
+    // FIX: Extracted hardcoded socket path to allow Rootless/Podman support
+    pub docker_socket_path: String,
     /// Preserved for explicit systemd watchdog configuration parity in schema deployments
     #[allow(dead_code)]
     pub systemd_watchdog_interval_ms: u64,
@@ -85,7 +87,6 @@ pub struct GuardConfig {
 pub fn load_config<P: AsRef<Path>>(path: P) -> Result<GuardConfig, String> {
     let path_ref = path.as_ref();
 
-    // FIX: Eliminated TOCTOU race condition. Atomic read natively handles missing files.
     let content = fs::read_to_string(path_ref).map_err(|e| {
         format!(
             "Configuration missing, inaccessible, or tampered at '{}': {}",
@@ -134,6 +135,7 @@ mod tests {
             ip_whitelist = ["127.0.0.1/32"]
             nftables_default_table = "inet filter"
             json_logging_enabled = true
+            docker_socket_path = "/var/run/docker.sock"
             systemd_watchdog_interval_ms = 5000
 
             [[rules]]
@@ -148,17 +150,16 @@ mod tests {
         let config = load_config(&temp_path).expect("Failed to parse valid configuration");
 
         assert_eq!(config.monitor.mode, IngestionMode::File);
+        assert_eq!(config.monitor.docker_socket_path, "/var/run/docker.sock");
         assert_eq!(config.rules.len(), 1);
         assert_eq!(config.rules[0].name, "test_rule");
 
-        std::fs::remove_file(temp_path).unwrap();
+        fs::remove_file(temp_path).unwrap();
     }
 
     #[test]
     fn test_load_config_missing_file_handling() {
-        // Proving the atomic read handles non-existent files safely without crashing
         let result = load_config("/path/that/absolutely/does/not/exist/config.toml");
-
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Configuration missing, inaccessible, or tampered"));
     }

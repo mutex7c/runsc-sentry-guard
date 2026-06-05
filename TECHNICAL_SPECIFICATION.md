@@ -32,6 +32,7 @@ The parsing engine uses a declarative, strict-typing deserializer enforced via `
 [monitor]
 mode = "file" # Options: "file", "socket", or "dual"
 log_dir = "/var/log/gvisor/"
+docker_socket_path = "/var/run/docker.sock"
 check_interval_ms = 1000
 ip_whitelist = ["127.0.0.1/32", "10.11.11.0/24", "192.168.3.0/24"]
 nftables_default_table = "inet security_ops"

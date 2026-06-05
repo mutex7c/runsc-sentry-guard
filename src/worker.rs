@@ -59,13 +59,19 @@ fn execute_docker_uds_request(
     method: &str,
     path: &str,
     body: Option<&str>,
+    socket_path: &str,
 ) -> Result<(u16, String), String> {
     use std::io::{BufReader, Read, Write};
     use std::os::unix::net::UnixStream;
     use std::time::Duration;
 
-    let mut stream = UnixStream::connect("/var/run/docker.sock")
-        .map_err(|e| format!("Docker Socket Connection Refused: {}", e))?;
+    // FIX: Client connects dynamically to the path passed from configuration routing
+    let mut stream = UnixStream::connect(socket_path).map_err(|e| {
+        format!(
+            "Container Engine Socket Connection Refused at {}: {}",
+            socket_path, e
+        )
+    })?;
 
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
 
@@ -91,11 +97,10 @@ fn execute_docker_uds_request(
 
     let mut reader = BufReader::new(stream);
 
-    // FIX: Bounded read eliminates unbounded line extraction vulnerabilities
     let status_line = read_bounded_line(&mut reader, 8192)?;
 
     if status_line.is_empty() {
-        return Err("Received completely empty frame stream from Docker daemon socket.".into());
+        return Err("Received completely empty frame stream from container daemon socket.".into());
     }
 
     let status_code = status_line
@@ -174,11 +179,15 @@ pub fn is_ip_safe(target_ip: &IpAddr, whitelist: &[IpNet]) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-pub fn resolve_container_ips(container_id: &str, json_enabled: bool) -> Vec<IpAddr> {
+pub fn resolve_container_ips(
+    container_id: &str,
+    json_enabled: bool,
+    socket_path: &str,
+) -> Vec<IpAddr> {
     let endpoint = format!("/containers/{}/json", container_id);
     let mut ips = Vec::new();
 
-    match execute_docker_uds_request("GET", &endpoint, None) {
+    match execute_docker_uds_request("GET", &endpoint, None, socket_path) {
         Ok((status, json_payload)) if status == 200 => {
             if let Ok(parsed) = serde_json::from_str::<DockerInspectResponse>(&json_payload) {
                 for network in parsed.NetworkSettings.Networks.values() {
@@ -200,7 +209,7 @@ pub fn resolve_container_ips(container_id: &str, json_enabled: bool) -> Vec<IpAd
                 Some("resolve_ip"),
                 "FAILURE",
                 &format!(
-                    "Docker socket returned HTTP {} during IP resolution.",
+                    "Container socket returned HTTP {} during IP resolution.",
                     status
                 ),
                 json_enabled,
@@ -216,7 +225,7 @@ pub fn resolve_container_ips(container_id: &str, json_enabled: bool) -> Vec<IpAd
                 Some("resolve_ip"),
                 "FAILURE",
                 &format!(
-                    "Failed to query Docker socket for networking metadata via UDS channel: {}",
+                    "Failed to query Container socket for networking metadata via UDS channel: {}",
                     e
                 ),
                 json_enabled,
@@ -232,8 +241,10 @@ fn execute_atomic_command(
     whitelist: &[IpNet],
     table: &str,
     json_enabled: bool,
+    socket_path: &str,
 ) -> Result<(), String> {
     let _ = whitelist;
+    let _ = socket_path;
 
     match action {
         AtomicAction::WebhookAlert { url } => {
@@ -274,7 +285,6 @@ fn execute_atomic_command(
             loop {
                 match child.try_wait() {
                     Ok(Some(status)) => {
-                        // FIX: Return lifted out of the if/else block to evaluate as a pure expression
                         return if status.success() {
                             Ok(())
                         } else {
@@ -351,7 +361,7 @@ fn execute_atomic_command(
                     AtomicAction::Pause => {
                         let endpoint = format!("/containers/{}/pause", container_id);
                         let (status, err_payload) =
-                            execute_docker_uds_request("POST", &endpoint, None)?;
+                            execute_docker_uds_request("POST", &endpoint, None, socket_path)?;
 
                         if (200..300).contains(&status) || status == 409 {
                             Ok(())
@@ -366,7 +376,7 @@ fn execute_atomic_command(
                     AtomicAction::Unpause => {
                         let endpoint = format!("/containers/{}/unpause", container_id);
                         let (status, err_payload) =
-                            execute_docker_uds_request("POST", &endpoint, None)?;
+                            execute_docker_uds_request("POST", &endpoint, None, socket_path)?;
 
                         if (200..300).contains(&status) || status == 409 {
                             Ok(())
@@ -381,7 +391,7 @@ fn execute_atomic_command(
                     AtomicAction::Restart => {
                         let endpoint = format!("/containers/{}/restart", container_id);
                         let (status, err_payload) =
-                            execute_docker_uds_request("POST", &endpoint, None)?;
+                            execute_docker_uds_request("POST", &endpoint, None, socket_path)?;
 
                         if (200..300).contains(&status) {
                             Ok(())
@@ -405,7 +415,7 @@ fn execute_atomic_command(
                         );
 
                         let (status, err_payload) =
-                            execute_docker_uds_request("POST", &query_path, None)?;
+                            execute_docker_uds_request("POST", &query_path, None, socket_path)?;
 
                         if (200..300).contains(&status) {
                             Ok(())
@@ -421,7 +431,7 @@ fn execute_atomic_command(
                         let query_path =
                             format!("/containers/{}/kill?signal={}", container_id, signal);
                         let (status, err_payload) =
-                            execute_docker_uds_request("POST", &query_path, None)?;
+                            execute_docker_uds_request("POST", &query_path, None, socket_path)?;
 
                         if (200..300).contains(&status) || status == 409 {
                             Ok(())
@@ -434,7 +444,7 @@ fn execute_atomic_command(
                     }
 
                     AtomicAction::NftBlacklist { set_name, timeout } => {
-                        let ips = resolve_container_ips(container_id, json_enabled);
+                        let ips = resolve_container_ips(container_id, json_enabled, socket_path);
 
                         if ips.is_empty() {
                             return Err("IP resolution yielded zero addresses; cannot apply nftables blacklist.".into());
@@ -581,13 +591,19 @@ pub fn execute_containment_pipeline(
     table: String,
     json_enabled: bool,
     rule_name: String,
+    socket_path: String,
 ) {
     let mut pipeline_failed = false;
 
     for action in &try_actions {
-        if let Err(e) =
-            execute_atomic_command(action, &container_id, &whitelist, &table, json_enabled)
-        {
+        if let Err(e) = execute_atomic_command(
+            action,
+            &container_id,
+            &whitelist,
+            &table,
+            json_enabled,
+            &socket_path,
+        ) {
             emit_log(
                 "WARN",
                 "worker_engine",
@@ -608,9 +624,14 @@ pub fn execute_containment_pipeline(
         emit_json_escalation_marker(&container_id, &rule_name, json_enabled);
 
         for fallback in &final_actions {
-            if let Err(fallback_error) =
-                execute_atomic_command(fallback, &container_id, &whitelist, &table, json_enabled)
-            {
+            if let Err(fallback_error) = execute_atomic_command(
+                fallback,
+                &container_id,
+                &whitelist,
+                &table,
+                json_enabled,
+                &socket_path,
+            ) {
                 emit_log(
                     "CRITICAL",
                     "worker_engine",
@@ -658,8 +679,14 @@ mod tests {
         let safe_ip: IpAddr = "10.5.5.5".parse().unwrap();
         let unsafe_ip: IpAddr = "172.16.0.5".parse().unwrap();
 
-        assert!(is_ip_safe(&safe_ip, &whitelist), "Failed: 10.5.5.5 should be whitelisted");
-        assert!(!is_ip_safe(&unsafe_ip, &whitelist), "Failed: 172.16.0.5 should be blacklisted");
+        assert!(
+            is_ip_safe(&safe_ip, &whitelist),
+            "Failed: 10.5.5.5 should be whitelisted"
+        );
+        assert!(
+            !is_ip_safe(&unsafe_ip, &whitelist),
+            "Failed: 172.16.0.5 should be blacklisted"
+        );
     }
 
     #[test]
@@ -673,8 +700,6 @@ mod tests {
 
     #[test]
     fn test_read_bounded_line_bloat_protection() {
-        // Simulating a Slowloris/Buffer-bloat attack: feeding 100 bytes without a newline delimiter.
-        // We set the ceiling to 50 bytes. The engine must abort.
         let data = vec![b'A'; 100];
         let mut cursor = Cursor::new(data);
 

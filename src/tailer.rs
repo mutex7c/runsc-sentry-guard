@@ -26,7 +26,6 @@ struct LogDescriptor {
 }
 
 type WorkerChannelMessage = (Vec<AtomicAction>, Vec<AtomicAction>, String);
-// FIX: Replaced unbound Sender with bounded SyncSender to prevent OOM
 type RegistryMap = HashMap<String, SyncSender<WorkerChannelMessage>>;
 
 pub fn start_monitor_loop(config: GuardConfig) {
@@ -34,6 +33,7 @@ pub fn start_monitor_loop(config: GuardConfig) {
     let json_enabled = config.monitor.json_logging_enabled;
     let whitelist = config.monitor.ip_whitelist.clone();
     let table = config.monitor.nftables_default_table.clone();
+    let docker_socket_path = config.monitor.docker_socket_path.clone();
 
     let worker_registry: Arc<Mutex<RegistryMap>> = Arc::new(Mutex::new(HashMap::new()));
     let regex_compiled: Arc<Vec<(String, Regex, Vec<AtomicAction>, Vec<AtomicAction>)>> = Arc::new(
@@ -63,6 +63,7 @@ pub fn start_monitor_loop(config: GuardConfig) {
         let uds_id_extractor = id_extractor.clone();
         let uds_whitelist = whitelist.clone();
         let uds_table = table.clone();
+        let uds_socket_path = docker_socket_path.clone();
 
         thread::spawn(move || {
             run_uds_server(
@@ -72,6 +73,7 @@ pub fn start_monitor_loop(config: GuardConfig) {
                 uds_whitelist,
                 uds_table,
                 json_enabled,
+                uds_socket_path,
             );
         });
     }
@@ -293,6 +295,7 @@ pub fn start_monitor_loop(config: GuardConfig) {
                                 &whitelist,
                                 &table,
                                 json_enabled,
+                                &docker_socket_path,
                             );
                         }
 
@@ -324,6 +327,7 @@ fn run_uds_server(
     whitelist: Vec<ipnet::IpNet>,
     table: String,
     json_enabled: bool,
+    docker_socket_path: String,
 ) {
     let socket_path = "/var/run/runsc-sentry-guard.sock";
     let _ = fs::remove_file(socket_path);
@@ -371,6 +375,7 @@ fn run_uds_server(
             let id_clone = id_extractor.clone();
             let wl_clone = whitelist.clone();
             let tbl_clone = table.clone();
+            let ds_path_clone = docker_socket_path.clone();
 
             thread::spawn(move || {
                 handle_uds_stream(
@@ -381,6 +386,7 @@ fn run_uds_server(
                     wl_clone,
                     tbl_clone,
                     json_enabled,
+                    ds_path_clone,
                 );
             });
         }
@@ -395,6 +401,7 @@ fn handle_uds_stream(
     whitelist: Vec<ipnet::IpNet>,
     table: String,
     json_enabled: bool,
+    docker_socket_path: String,
 ) {
     if let Err(e) = stream.set_read_timeout(Some(Duration::from_millis(100))) {
         emit_log(
@@ -455,6 +462,7 @@ fn handle_uds_stream(
                     &whitelist,
                     &table,
                     json_enabled,
+                    &docker_socket_path,
                 );
             }
             Err(_) => break,
@@ -470,6 +478,7 @@ fn evaluate_line_signatures(
     whitelist: &[ipnet::IpNet],
     table: &str,
     json_enabled: bool,
+    docker_socket_path: &str,
 ) {
     for (rule_name, rx, try_act, final_act) in rules.iter() {
         if rx.is_match(line) {
@@ -486,6 +495,7 @@ fn evaluate_line_signatures(
                         whitelist,
                         table,
                         json_enabled,
+                        docker_socket_path,
                     );
                 }
             }
@@ -502,6 +512,7 @@ fn dispatch_to_worker(
     whitelist: &[ipnet::IpNet],
     table: &str,
     json_enabled: bool,
+    docker_socket_path: &str,
 ) {
     const MAX_WORKERS: usize = 100;
 
@@ -525,11 +536,11 @@ fn dispatch_to_worker(
     }
 
     let tx = reg.entry(container_id.clone()).or_insert_with(|| {
-        // FIX: Hardcap channel memory boundaries to backpressure memory leaks
         let (worker_tx, worker_rx) = sync_channel::<WorkerChannelMessage>(64);
         let cid_clone = container_id.clone();
         let wl_clone = whitelist.to_vec();
         let tbl_clone = table.to_string();
+        let ds_clone = docker_socket_path.to_string();
         let reg_sharing_reference = Arc::clone(registry);
 
         thread::spawn(move || {
@@ -540,13 +551,13 @@ fn dispatch_to_worker(
                 wl_clone,
                 tbl_clone,
                 json_enabled,
+                ds_clone,
             );
         });
 
         worker_tx
     });
 
-    // FIX: try_send securely enforces backpressure.
     match tx.try_send((try_actions, final_actions, rule_name.clone())) {
         Ok(_) => {}
         Err(TrySendError::Full(_)) => {
@@ -585,6 +596,7 @@ fn run_worker_lifecycle(
     whitelist: Vec<ipnet::IpNet>,
     table: String,
     json_enabled: bool,
+    docker_socket_path: String,
 ) {
     let timeout_dur = Duration::from_secs(30);
 
@@ -599,6 +611,7 @@ fn run_worker_lifecycle(
                     table.clone(),
                     json_enabled,
                     rule,
+                    docker_socket_path.clone(),
                 );
             }
             Err(_) => {
@@ -618,6 +631,7 @@ fn run_worker_lifecycle(
                             table.clone(),
                             json_enabled,
                             rule,
+                            docker_socket_path.clone(),
                         );
                     }
                     Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => {
@@ -654,22 +668,17 @@ mod tests {
 
     #[test]
     fn test_id_extractor_strict_boundaries() {
-        // The exact regex compiled in start_monitor_loop
         let id_extractor = Regex::new(r"--id=\b([a-fA-F0-9]{12}|[a-fA-F0-9]{64})\b").unwrap();
 
-        // Valid Standard 64-character Docker ID
         let valid_64 = "--id=a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
         assert!(id_extractor.is_match(valid_64), "Regex failed to match valid 64-char ID");
 
-        // Valid Short 12-character ID
         let valid_12 = "--id=a1b2c3d4e5f6";
         assert!(id_extractor.is_match(valid_12), "Regex failed to match valid 12-char ID");
 
-        // Malicious Payload: Thread Exhaustion Attack Attempt (17 chars, no boundary)
         let invalid_spoof = "--id=a1b2c3d4e5f67890a";
         assert!(!id_extractor.is_match(invalid_spoof), "SECURITY ALERT: Regex matched an unbounded invalid spoof ID");
 
-        // Malicious Payload: Random short string
         let invalid_short = "--id=abc";
         assert!(!id_extractor.is_match(invalid_short), "SECURITY ALERT: Regex matched a malformed short ID");
     }

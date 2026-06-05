@@ -6,7 +6,6 @@ use crate::logger::emit_log;
 use ipnet::IpNet;
 use std::process::Command;
 
-// Platform-Gated Imports: Prevents unused import warnings on non-Linux environments
 #[cfg(target_os = "linux")]
 use serde::Deserialize;
 #[cfg(target_os = "linux")]
@@ -16,7 +15,6 @@ use std::net::IpAddr;
 #[cfg(target_os = "linux")]
 use std::sync::OnceLock;
 
-// Linux Production Models: Gated completely to prevent unconstructed struct alerts on non-Linux systems
 #[derive(Deserialize)]
 #[allow(non_snake_case)]
 #[cfg(target_os = "linux")]
@@ -38,6 +36,23 @@ struct DockerInspectResponse {
     NetworkSettings: DockerNetworkSettings,
 }
 
+#[cfg(target_os = "linux")]
+fn read_bounded_line<R: std::io::BufRead>(reader: &mut R, limit: u64) -> Result<String, String> {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    reader
+        .by_ref()
+        .take(limit)
+        .read_until(b'\n', &mut buf)
+        .map_err(|e| e.to_string())?;
+
+    if buf.len() as u64 == limit && !buf.ends_with(&[b'\n']) {
+        return Err("Buffer-bloat protection: HTTP line exceeded maximum bounded length".into());
+    }
+
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
 /// Zero-Fork Native HTTP Over Unix Domain Socket Engine (Linux Production Mode Only)
 #[cfg(target_os = "linux")]
 fn execute_docker_uds_request(
@@ -45,17 +60,15 @@ fn execute_docker_uds_request(
     path: &str,
     body: Option<&str>,
 ) -> Result<(u16, String), String> {
-    use std::io::{BufRead, BufReader, Read, Write};
+    use std::io::{BufReader, Read, Write};
     use std::os::unix::net::UnixStream;
     use std::time::Duration;
 
     let mut stream = UnixStream::connect("/var/run/docker.sock")
         .map_err(|e| format!("Docker Socket Connection Refused: {}", e))?;
 
-    // Safe boundary against Docker Engine hangs
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
 
-    // Upgraded to HTTP/1.1 with explicit Host/Connection headers to standardize chunked responses
     let request_payload = if let Some(b) = body {
         format!(
             "{} {} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
@@ -78,11 +91,9 @@ fn execute_docker_uds_request(
 
     let mut reader = BufReader::new(stream);
 
-    // Read status line
-    let mut status_line = String::new();
-    reader
-        .read_line(&mut status_line)
-        .map_err(|e| e.to_string())?;
+    // FIX: Bounded read eliminates unbounded line extraction vulnerabilities
+    let status_line = read_bounded_line(&mut reader, 8192)?;
+
     if status_line.is_empty() {
         return Err("Received completely empty frame stream from Docker daemon socket.".into());
     }
@@ -96,14 +107,12 @@ fn execute_docker_uds_request(
     let mut is_chunked = false;
     let mut content_length: Option<usize> = None;
 
-    // Parse Headers
     loop {
-        let mut line = String::new();
-        reader.read_line(&mut line).map_err(|e| e.to_string())?;
+        let line = read_bounded_line(&mut reader, 8192)?;
         let trimmed = line.trim();
 
         if trimmed.is_empty() {
-            break; // End of headers
+            break;
         }
 
         let lower_line = trimmed.to_lowercase();
@@ -120,15 +129,10 @@ fn execute_docker_uds_request(
 
     let mut body_payload = String::new();
 
-    // Native HTTP Chunked Body Decoder
     if is_chunked {
         loop {
-            let mut chunk_size_str = String::new();
-            reader
-                .read_line(&mut chunk_size_str)
-                .map_err(|e| e.to_string())?;
+            let chunk_size_str = read_bounded_line(&mut reader, 8192)?;
 
-            // Strip extensions (e.g. "1A; ext-name") and whitespace
             let trimmed_size = chunk_size_str.split(';').next().unwrap_or("").trim();
             if trimmed_size.is_empty() {
                 continue;
@@ -138,7 +142,7 @@ fn execute_docker_uds_request(
                 .map_err(|e| format!("Failed to parse chunk size: {}", e))?;
 
             if chunk_size == 0 {
-                break; // End of stream
+                break;
             }
 
             let mut chunk_buf = vec![0; chunk_size];
@@ -147,17 +151,14 @@ fn execute_docker_uds_request(
                 .map_err(|e| e.to_string())?;
             body_payload.push_str(&String::from_utf8_lossy(&chunk_buf));
 
-            // Consume trailing CRLF
             let mut crlf = vec![0; 2];
             let _ = reader.read_exact(&mut crlf);
         }
     } else if let Some(len) = content_length {
-        // Safe bounded read if content-length is declared
         let mut buf = vec![0; len];
         reader.read_exact(&mut buf).map_err(|e| e.to_string())?;
         body_payload = String::from_utf8_lossy(&buf).into_owned();
     } else {
-        // Fallback for non-chunked, un-sized responses (relying on Connection: close)
         reader
             .take(65536)
             .read_to_string(&mut body_payload)
@@ -167,7 +168,6 @@ fn execute_docker_uds_request(
     Ok((status_code, body_payload))
 }
 
-// Firewall Utilities: Gated to Linux to eliminate dead-code diagnostics on development hosts
 #[cfg(target_os = "linux")]
 pub fn is_ip_safe(target_ip: &IpAddr, whitelist: &[IpNet]) -> bool {
     whitelist.iter().any(|network| network.contains(target_ip))
@@ -233,7 +233,6 @@ fn execute_atomic_command(
     table: &str,
     json_enabled: bool,
 ) -> Result<(), String> {
-    // Clear variable to allow flawless optimization evaluations across platforms
     let _ = whitelist;
 
     match action {
@@ -264,15 +263,39 @@ fn execute_atomic_command(
         }
 
         AtomicAction::RunCustomScript { path } => {
-            let s = Command::new(path)
+            let mut child = Command::new(path)
                 .arg(container_id)
-                .status()
-                .map_err(|e| e.to_string())?;
+                .spawn()
+                .map_err(|e| format!("Failed to spawn automation extension subprocess: {}", e))?;
 
-            if s.success() {
-                Ok(())
-            } else {
-                Err("Custom automated automation extension script crashed.".into())
+            let timeout = std::time::Duration::from_secs(15);
+            let start = std::time::Instant::now();
+
+            loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        // FIX: Return lifted out of the if/else block to evaluate as a pure expression
+                        return if status.success() {
+                            Ok(())
+                        } else {
+                            Err(format!(
+                                "Custom extension script exited with failure footprint: {}",
+                                status
+                            ))
+                        };
+                    }
+                    Ok(None) => {
+                        if start.elapsed() > timeout {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            return Err("Custom extension script exceeded 15-second execution boundary. Process forcefully terminated.".into());
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                    Err(e) => {
+                        return Err(format!("Failed to parse child execution status: {}", e));
+                    }
+                }
             }
         }
 
@@ -311,7 +334,6 @@ fn execute_atomic_command(
             {
                 match infrastructure_action {
                     AtomicAction::ValidateState => {
-                        // Deprecated logical check to resolve TOCTOU vulnerability
                         emit_log(
                             "INFO",
                             "worker_engine",
@@ -330,6 +352,7 @@ fn execute_atomic_command(
                         let endpoint = format!("/containers/{}/pause", container_id);
                         let (status, err_payload) =
                             execute_docker_uds_request("POST", &endpoint, None)?;
+
                         if (200..300).contains(&status) || status == 409 {
                             Ok(())
                         } else {
@@ -344,6 +367,7 @@ fn execute_atomic_command(
                         let endpoint = format!("/containers/{}/unpause", container_id);
                         let (status, err_payload) =
                             execute_docker_uds_request("POST", &endpoint, None)?;
+
                         if (200..300).contains(&status) || status == 409 {
                             Ok(())
                         } else {
@@ -358,6 +382,7 @@ fn execute_atomic_command(
                         let endpoint = format!("/containers/{}/restart", container_id);
                         let (status, err_payload) =
                             execute_docker_uds_request("POST", &endpoint, None)?;
+
                         if (200..300).contains(&status) {
                             Ok(())
                         } else {
@@ -373,12 +398,15 @@ fn execute_atomic_command(
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_secs();
+
                         let query_path = format!(
                             "/commit?container={}&repo={}-{}&tag=latest",
                             container_id, prefix, timestamp
                         );
+
                         let (status, err_payload) =
                             execute_docker_uds_request("POST", &query_path, None)?;
+
                         if (200..300).contains(&status) {
                             Ok(())
                         } else {
@@ -394,6 +422,7 @@ fn execute_atomic_command(
                             format!("/containers/{}/kill?signal={}", container_id, signal);
                         let (status, err_payload) =
                             execute_docker_uds_request("POST", &query_path, None)?;
+
                         if (200..300).contains(&status) || status == 409 {
                             Ok(())
                         } else {
@@ -406,6 +435,7 @@ fn execute_atomic_command(
 
                     AtomicAction::NftBlacklist { set_name, timeout } => {
                         let ips = resolve_container_ips(container_id, json_enabled);
+
                         if ips.is_empty() {
                             return Err("IP resolution yielded zero addresses; cannot apply nftables blacklist.".into());
                         }
@@ -515,6 +545,7 @@ fn execute_firewall_mutation(
 ) -> Result<(), String> {
     use regex::Regex;
     static VALIDATION_RULE: OnceLock<Regex> = OnceLock::new();
+
     let rule = VALIDATION_RULE.get_or_init(|| Regex::new(r"^\d+[smhd]$").unwrap());
 
     if !rule.is_match(timeout) {

@@ -85,15 +85,14 @@ pub struct GuardConfig {
 pub fn load_config<P: AsRef<Path>>(path: P) -> Result<GuardConfig, String> {
     let path_ref = path.as_ref();
 
-    if !path_ref.exists() {
-        return Err(format!(
-            "Configuration file missing at: '{}'. System initialization aborted safely.",
-            path_ref.display()
-        ));
-    }
-
-    let content = fs::read_to_string(path_ref)
-        .map_err(|e| format!("Failed to read configuration file payload: {}", e))?;
+    // FIX: Eliminated TOCTOU race condition. Atomic read natively handles missing files.
+    let content = fs::read_to_string(path_ref).map_err(|e| {
+        format!(
+            "Configuration missing, inaccessible, or tampered at '{}': {}",
+            path_ref.display(),
+            e
+        )
+    })?;
 
     let config: GuardConfig = toml::from_str(&content)
         .map_err(|e| format!("Configuration structural verification failed: {}", e))?;

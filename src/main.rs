@@ -32,9 +32,11 @@ fn main() {
     } else {
         developer_path
     };
+
     match load_config(active_path) {
         Ok(valid_config) => {
             let json_enabled = valid_config.monitor.json_logging_enabled;
+
             logger::emit_log(
                 "INFO",
                 "initialization",
@@ -49,14 +51,18 @@ fn main() {
                 ),
                 json_enabled,
             );
-            // Permanently lock down permitted POSIX capabilities
+
+            // Permanently lock down permitted POSIX capabilities and drop DAC overrides
             #[cfg(target_os = "linux")]
             drop_privileges(json_enabled);
+
             // Commit rigid Berkeley Packet Filters directly into active kernel execution space
             #[cfg(target_os = "linux")]
             init_seccomp(json_enabled);
+
             // Compliance Fix: Issue systemd orchestration READY notify packets EXACTLY once at initialization success
             notify_systemd_ready();
+
             // Hand execution layers gracefully onto multithreaded monitoring handlers
             start_monitor_loop(valid_config);
         }
@@ -67,11 +73,32 @@ fn main() {
     }
 }
 
-// Permanently strips effective and ambient process capabilities strictly down to CAP_NET_ADMIN.
+// Permanently strips effective and ambient process capabilities strictly down to CAP_NET_ADMIN and sheds UID 0.
 #[cfg(target_os = "linux")]
 fn drop_privileges(json_enabled: bool) {
     use caps::{CapSet, Capability};
     use std::collections::HashSet;
+
+    // FIX: Complete Privilege Shedding to neutralize DAC Override
+    unsafe {
+        // 1. Inform kernel to preserve permitted capability boundaries across the identity shift
+        if libc::prctl(libc::PR_SET_KEEPCAPS, 1, 0, 0, 0) != 0 {
+            eprintln!("Fatal System Error: prctl(PR_SET_KEEPCAPS) invocation rejected by kernel.");
+            std::process::exit(1);
+        }
+
+        // 2. Drop execution identity to `nobody` user and group (UID/GID 65534)
+        if libc::setresgid(65534, 65534, 65534) != 0 {
+            eprintln!("Fatal System Error: Execution boundary failed to drop GID to 65534.");
+            std::process::exit(1);
+        }
+        if libc::setresuid(65534, 65534, 65534) != 0 {
+            eprintln!("Fatal System Error: Execution boundary failed to drop UID to 65534.");
+            std::process::exit(1);
+        }
+    }
+
+    // 3. Clear all ambiently inherited privileges
     if let Err(e) = caps::clear(None, CapSet::Ambient) {
         eprintln!(
             "[WARN] Failed to wipe ambient initialization capabilities: {:?}",
@@ -81,24 +108,8 @@ fn drop_privileges(json_enabled: bool) {
 
     let mut structural_capabilities = HashSet::new();
     structural_capabilities.insert(Capability::CAP_NET_ADMIN);
-    if let Err(e) = caps::set(None, CapSet::Effective, &structural_capabilities) {
-        logger::emit_log(
-            "ERROR",
-            "initialization",
-            None,
-            None,
-            None,
-            Some("privilege_drop"),
-            "CRASH",
-            &format!(
-                "Fatal security boundary breakdown lowering effective sets: {:?}",
-                e
-            ),
-            json_enabled,
-        );
-        std::process::exit(1);
-    }
 
+    // 4. Lock Permitted set to CAP_NET_ADMIN
     if let Err(e) = caps::set(None, CapSet::Permitted, &structural_capabilities) {
         logger::emit_log(
             "ERROR",
@@ -117,6 +128,25 @@ fn drop_privileges(json_enabled: bool) {
         std::process::exit(1);
     }
 
+    // 5. Re-assert CAP_NET_ADMIN into the Effective execution set
+    if let Err(e) = caps::set(None, CapSet::Effective, &structural_capabilities) {
+        logger::emit_log(
+            "ERROR",
+            "initialization",
+            None,
+            None,
+            None,
+            Some("privilege_drop"),
+            "CRASH",
+            &format!(
+                "Fatal security boundary breakdown lowering effective sets: {:?}",
+                e
+            ),
+            json_enabled,
+        );
+        std::process::exit(1);
+    }
+
     logger::emit_log(
         "INFO",
         "initialization",
@@ -125,7 +155,7 @@ fn drop_privileges(json_enabled: bool) {
         None,
         Some("privilege_drop"),
         "SUCCESS",
-        "Process context shed ambient root access patterns. Boundary safely pinned to CAP_NET_ADMIN.",
+        "Process context shed UID 0 (root) and dropped DAC overrides. Boundary safely pinned to CAP_NET_ADMIN.",
         json_enabled,
     );
 }
@@ -134,6 +164,7 @@ fn drop_privileges(json_enabled: bool) {
 #[cfg(target_os = "linux")]
 fn init_seccomp(json_enabled: bool) {
     use libseccomp::{ScmpAction, ScmpArch, ScmpFilterContext, ScmpSyscall};
+
     let mut filter = match ScmpFilterContext::new(ScmpAction::KillProcess) {
         Ok(ctx) => ctx,
         Err(e) => {
@@ -146,6 +177,7 @@ fn init_seccomp(json_enabled: bool) {
     };
 
     let target_archs = [ScmpArch::X8664, ScmpArch::Aarch64, ScmpArch::X86];
+
     for arch in target_archs {
         if let Err(e) = filter.add_arch(arch) {
             eprintln!(
@@ -207,7 +239,11 @@ fn init_seccomp(json_enabled: bool) {
         "setsockopt",
         "getsockopt",
         "uname", // Networking
+        "prctl",
+        "setresgid",
+        "setresuid", // Identity Boundary Alteration (Required for privilege drop)
     ];
+
     for syscall_name in system_call_whitelist {
         if let Ok(syscall) = ScmpSyscall::from_name(syscall_name) {
             if let Err(e) = filter.add_rule(ScmpAction::Allow, syscall) {
@@ -256,11 +292,13 @@ fn notify_systemd_ready() {
     if let Ok(socket_path) = std::env::var("NOTIFY_SOCKET") {
         if !socket_path.is_empty() {
             use std::os::unix::net::UnixDatagram;
+
             let resolved_path = if let Some(stripped) = socket_path.strip_prefix('@') {
                 format!("\0{}", stripped)
             } else {
                 socket_path
             };
+
             if let Ok(socket) = UnixDatagram::unbound() {
                 let _ = socket.send_to(b"READY=1\n", resolved_path);
             }

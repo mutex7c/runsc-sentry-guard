@@ -8,7 +8,7 @@ use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
-use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -16,7 +16,6 @@ use std::time::Duration;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 
-// Updated to ingest the centralized IngestionMode enumeration from the configuration profile space
 use crate::config::{AtomicAction, GuardConfig, IngestionMode};
 use crate::logger::emit_log;
 use crate::worker::execute_containment_pipeline;
@@ -27,10 +26,10 @@ struct LogDescriptor {
 }
 
 type WorkerChannelMessage = (Vec<AtomicAction>, Vec<AtomicAction>, String);
-type RegistryMap = HashMap<String, Sender<WorkerChannelMessage>>;
+// FIX: Replaced unbound Sender with bounded SyncSender to prevent OOM
+type RegistryMap = HashMap<String, SyncSender<WorkerChannelMessage>>;
 
 pub fn start_monitor_loop(config: GuardConfig) {
-    // Read the explicit ingestion strategy mode from the monitor configuration segment
     let mode = &config.monitor.mode;
     let json_enabled = config.monitor.json_logging_enabled;
     let whitelist = config.monitor.ip_whitelist.clone();
@@ -54,14 +53,10 @@ pub fn start_monitor_loop(config: GuardConfig) {
             .collect(),
     );
 
-    // FIX: Tightened regex to strictly validate word boundaries around 12 or 64 character hex strings
     let id_extractor = Regex::new(r"--id=\b([a-fA-F0-9]{12}|[a-fA-F0-9]{64})\b").unwrap();
     let mut file_state_tracker: HashMap<String, LogDescriptor> = HashMap::new();
     let mut first_run = true;
 
-    // --- DEPLOYMENT MODE ROUTING BLOCKS ---
-
-    // Option A: Spin up the UDS streaming server thread if Socket or Dual mode is explicitly enabled
     if mode == &IngestionMode::Socket || mode == &IngestionMode::Dual {
         let uds_registry = Arc::clone(&worker_registry);
         let uds_regex = Arc::clone(&regex_compiled);
@@ -81,7 +76,6 @@ pub fn start_monitor_loop(config: GuardConfig) {
         });
     }
 
-    // Option B: Short-circuit and freeze the main thread if configured strictly to Socket mode
     if mode == &IngestionMode::Socket {
         emit_log(
             "INFO",
@@ -95,11 +89,10 @@ pub fn start_monitor_loop(config: GuardConfig) {
             json_enabled,
         );
         loop {
-            thread::park(); // Puts the main execution thread into a permanent sleep state
+            thread::park();
         }
     }
 
-    // Option C: Fall straight through into standard host directory log-tailing loops
     emit_log(
         "INFO",
         "orchestrator",
@@ -275,7 +268,6 @@ pub fn start_monitor_loop(config: GuardConfig) {
                             let current_line = String::from_utf8_lossy(&scratchpad_buffer);
                             let trimmed_line = current_line.trim_end();
 
-                            // FIX: Discard-and-continue to prevent file-tailer blind spots
                             if exceeded_limit {
                                 emit_log(
                                     "CRITICAL",
@@ -288,13 +280,11 @@ pub fn start_monitor_loop(config: GuardConfig) {
                                     "Line limit hit. Payload ignored and remainder discarded to prevent sensor blinding.",
                                     json_enabled,
                                 );
-                                // Fast-forward file pointer past the oversized, malicious line
                                 let mut discard = Vec::new();
                                 let _ = reader.read_until(b'\n', &mut discard);
                                 continue;
                             }
 
-                            // Clean Deduplication: Invoking centralized line evaluator block
                             evaluate_line_signatures(
                                 trimmed_line,
                                 &regex_compiled,
@@ -327,7 +317,6 @@ pub fn start_monitor_loop(config: GuardConfig) {
     }
 }
 
-// Out-of-band high-performance Unix Domain Socket server infrastructure engine
 fn run_uds_server(
     registry: Arc<Mutex<RegistryMap>>,
     regex_rules: Arc<Vec<(String, Regex, Vec<AtomicAction>, Vec<AtomicAction>)>>,
@@ -407,7 +396,6 @@ fn handle_uds_stream(
     table: String,
     json_enabled: bool,
 ) {
-    // FIX: Enforce a strict 100ms OS-level socket timeout to mitigate Slowloris resource exhaustion attacks
     if let Err(e) = stream.set_read_timeout(Some(Duration::from_millis(100))) {
         emit_log(
             "ERROR",
@@ -429,15 +417,13 @@ fn handle_uds_stream(
     loop {
         buf.clear();
 
-        // Secure Bounded Intake: Read up to 8192 bytes looking for a newline delimiter
         let mut chunk = reader.by_ref().take(8192);
 
         match chunk.read_until(b'\n', &mut buf) {
-            Ok(0) => break, // EOF
+            Ok(0) => break,
             Ok(_) => {
                 let has_newline = buf.ends_with(&[b'\n']);
 
-                // Defense against unbounded payload buffering attacks
                 if !has_newline && buf.len() >= 8192 {
                     emit_log(
                         "CRITICAL",
@@ -451,11 +437,10 @@ fn handle_uds_stream(
                         json_enabled,
                     );
 
-                    // FIX: Safe discard with kernel timeout handling
                     let mut discard_buf = Vec::new();
                     match reader.read_until(b'\n', &mut discard_buf) {
                         Ok(_) => continue,
-                        Err(_) => break, // Timed out or disconnected
+                        Err(_) => break,
                     }
                 }
 
@@ -477,7 +462,6 @@ fn handle_uds_stream(
     }
 }
 
-// Centralized Reusable Ingestion Helper to evaluate string signatures cleanly
 fn evaluate_line_signatures(
     line: &str,
     rules: &[(String, Regex, Vec<AtomicAction>, Vec<AtomicAction>)],
@@ -509,7 +493,6 @@ fn evaluate_line_signatures(
     }
 }
 
-// Dispatches signature notifications safely across key-serialized downstream communication lines.
 fn dispatch_to_worker(
     registry: &Arc<Mutex<RegistryMap>>,
     container_id: String,
@@ -526,7 +509,6 @@ fn dispatch_to_worker(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-    // FIX: Hard worker ceiling to eliminate memory exhaustion from randomized hex ID spoofing
     if !reg.contains_key(&container_id) && reg.len() >= MAX_WORKERS {
         emit_log(
             "CRITICAL",
@@ -543,7 +525,8 @@ fn dispatch_to_worker(
     }
 
     let tx = reg.entry(container_id.clone()).or_insert_with(|| {
-        let (worker_tx, worker_rx) = channel::<WorkerChannelMessage>();
+        // FIX: Hardcap channel memory boundaries to backpressure memory leaks
+        let (worker_tx, worker_rx) = sync_channel::<WorkerChannelMessage>(64);
         let cid_clone = container_id.clone();
         let wl_clone = whitelist.to_vec();
         let tbl_clone = table.to_string();
@@ -563,22 +546,38 @@ fn dispatch_to_worker(
         worker_tx
     });
 
-    if let Err(e) = tx.send((try_actions, final_actions, rule_name.clone())) {
-        emit_log(
-            "ERROR",
-            "orchestrator",
-            Some(&rule_name),
-            Some(&container_id),
-            None,
-            Some("route"),
-            "FAIL",
-            &format!("Channel broken: {}", e),
-            json_enabled,
-        );
+    // FIX: try_send securely enforces backpressure.
+    match tx.try_send((try_actions, final_actions, rule_name.clone())) {
+        Ok(_) => {}
+        Err(TrySendError::Full(_)) => {
+            emit_log(
+                "CRITICAL",
+                "orchestrator",
+                Some(&rule_name),
+                Some(&container_id),
+                None,
+                Some("route"),
+                "DROPPED",
+                "Worker execution queue full. Action dropped to prevent OOM.",
+                json_enabled,
+            );
+        }
+        Err(TrySendError::Disconnected(_)) => {
+            emit_log(
+                "ERROR",
+                "orchestrator",
+                Some(&rule_name),
+                Some(&container_id),
+                None,
+                Some("route"),
+                "FAIL",
+                "Worker channel broken unexpectedly.",
+                json_enabled,
+            );
+        }
     }
 }
 
-// Handles safe worker lifecycles, completely solving the 30-second reaper race condition.
 fn run_worker_lifecycle(
     container_id: String,
     rx_chan: Receiver<WorkerChannelMessage>,

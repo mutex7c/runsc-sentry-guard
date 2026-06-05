@@ -32,11 +32,9 @@ fn main() {
     } else {
         developer_path
     };
-
     match load_config(active_path) {
         Ok(valid_config) => {
             let json_enabled = valid_config.monitor.json_logging_enabled;
-
             logger::emit_log(
                 "INFO",
                 "initialization",
@@ -51,18 +49,14 @@ fn main() {
                 ),
                 json_enabled,
             );
-
             // Permanently lock down permitted POSIX capabilities
             #[cfg(target_os = "linux")]
             drop_privileges(json_enabled);
-
             // Commit rigid Berkeley Packet Filters directly into active kernel execution space
             #[cfg(target_os = "linux")]
             init_seccomp(json_enabled);
-
             // Compliance Fix: Issue systemd orchestration READY notify packets EXACTLY once at initialization success
             notify_systemd_ready();
-
             // Hand execution layers gracefully onto multithreaded monitoring handlers
             start_monitor_loop(valid_config);
         }
@@ -78,7 +72,6 @@ fn main() {
 fn drop_privileges(json_enabled: bool) {
     use caps::{CapSet, Capability};
     use std::collections::HashSet;
-
     if let Err(e) = caps::clear(None, CapSet::Ambient) {
         eprintln!(
             "[WARN] Failed to wipe ambient initialization capabilities: {:?}",
@@ -88,7 +81,6 @@ fn drop_privileges(json_enabled: bool) {
 
     let mut structural_capabilities = HashSet::new();
     structural_capabilities.insert(Capability::CAP_NET_ADMIN);
-
     if let Err(e) = caps::set(None, CapSet::Effective, &structural_capabilities) {
         logger::emit_log(
             "ERROR",
@@ -142,7 +134,6 @@ fn drop_privileges(json_enabled: bool) {
 #[cfg(target_os = "linux")]
 fn init_seccomp(json_enabled: bool) {
     use libseccomp::{ScmpAction, ScmpArch, ScmpFilterContext, ScmpSyscall};
-
     let mut filter = match ScmpFilterContext::new(ScmpAction::KillProcess) {
         Ok(ctx) => ctx,
         Err(e) => {
@@ -156,7 +147,13 @@ fn init_seccomp(json_enabled: bool) {
 
     let target_archs = [ScmpArch::X8664, ScmpArch::Aarch64, ScmpArch::X86];
     for arch in target_archs {
-        let _ = filter.add_arch(arch);
+        if let Err(e) = filter.add_arch(arch) {
+            eprintln!(
+                "Fatal Error adding system architecture compilation matrix targets [{:?}]: {:?}",
+                arch, e
+            );
+            std::process::exit(1);
+        }
     }
 
     let system_call_whitelist = [
@@ -164,7 +161,7 @@ fn init_seccomp(json_enabled: bool) {
         "mmap",
         "munmap",
         "mprotect",
-        "madvise", // Memory [cite: 181]
+        "madvise", // Memory
         "openat",
         "read",
         "write",
@@ -174,8 +171,8 @@ fn init_seccomp(json_enabled: bool) {
         "newfstatat",
         "statx",
         "pread64",
-        "pwrite64",   // Files [cite: 183]
-        "getdents64", // Directories [cite: 185]
+        "pwrite64",   // Files
+        "getdents64", // Directories
         "clone",
         "clone3",
         "execve",
@@ -184,22 +181,22 @@ fn init_seccomp(json_enabled: bool) {
         "exit_group",
         "futex",
         "sched_yield",
-        "set_robust_list", // Process [cite: 187]
+        "set_robust_list", // Process
         "pipe",
         "pipe2",
         "fcntl",
         "ioctl",
         "writev",
-        "readv", // IPC [cite: 189]
+        "readv", // IPC
         "epoll_create1",
         "epoll_ctl",
         "epoll_wait",
         "nanosleep",
-        "clock_nanosleep", // Timers [cite: 191]
+        "clock_nanosleep", // Timers
         "rt_sigaction",
         "rt_sigprocmask",
         "rt_sigreturn",
-        "rt_sigqueue", // Signals [cite: 193]
+        "rt_sigqueue", // Signals
         "socket",
         "connect",
         "bind",
@@ -209,9 +206,8 @@ fn init_seccomp(json_enabled: bool) {
         "recvfrom",
         "setsockopt",
         "getsockopt",
-        "uname", // Networking [cite: 196]
+        "uname", // Networking
     ];
-
     for syscall_name in system_call_whitelist {
         if let Ok(syscall) = ScmpSyscall::from_name(syscall_name) {
             if let Err(e) = filter.add_rule(ScmpAction::Allow, syscall) {

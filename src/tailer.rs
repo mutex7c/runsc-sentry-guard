@@ -1,10 +1,9 @@
 // Ingestion Pipeline Engine
 // Operates high-performance file tailers and parallel UDS socket tracking pipelines cleanly.
-
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
@@ -37,7 +36,6 @@ pub fn start_monitor_loop(config: GuardConfig) {
     let table = config.monitor.nftables_default_table.clone();
 
     let worker_registry: Arc<Mutex<RegistryMap>> = Arc::new(Mutex::new(HashMap::new()));
-
     let regex_compiled: Arc<Vec<(String, Regex, Vec<AtomicAction>, Vec<AtomicAction>)>> = Arc::new(
         config
             .rules
@@ -54,7 +52,6 @@ pub fn start_monitor_loop(config: GuardConfig) {
             })
             .collect(),
     );
-
     let id_extractor = Regex::new(r"--id=([a-fA-F0-9]{12,64})").unwrap();
     let mut file_state_tracker: HashMap<String, LogDescriptor> = HashMap::new();
     let mut first_run = true;
@@ -111,12 +108,10 @@ pub fn start_monitor_loop(config: GuardConfig) {
         "Master directory tailer and Unix socket pipelines active.",
         json_enabled,
     );
-
     let mut scratchpad_buffer = Vec::with_capacity(8192);
 
     loop {
         let log_dir_path = Path::new(&config.monitor.log_dir);
-
         if !log_dir_path.exists() {
             #[cfg(not(target_os = "linux"))]
             {
@@ -141,7 +136,6 @@ pub fn start_monitor_loop(config: GuardConfig) {
         }
 
         let mut actively_seen_paths = HashSet::new();
-
         if let Ok(entries) = fs::read_dir(log_dir_path) {
             for entry in entries.flatten() {
                 let path = entry.path();
@@ -197,13 +191,25 @@ pub fn start_monitor_loop(config: GuardConfig) {
                         }
 
                         let mut reader = BufReader::new(file);
-                        let _ = reader.seek(SeekFrom::Start(last_pos));
+                        if let Err(e) = reader.seek(SeekFrom::Start(last_pos)) {
+                            emit_log(
+                                "ERROR",
+                                "orchestrator",
+                                None,
+                                None,
+                                None,
+                                Some("seek"),
+                                "FAILURE",
+                                &format!("Failed to seek to target stream pointer: {}", e),
+                                json_enabled,
+                            );
+                            continue;
+                        }
 
                         loop {
                             scratchpad_buffer.clear();
                             let mut reached_eof = false;
                             let mut exceeded_limit = false;
-
                             loop {
                                 let available_buffer = match reader.fill_buf() {
                                     Ok(buf) if buf.is_empty() => {
@@ -216,7 +222,6 @@ pub fn start_monitor_loop(config: GuardConfig) {
                                         break;
                                     }
                                 };
-
                                 if let Some(newline_pos) =
                                     available_buffer.iter().position(|&b| b == b'\n')
                                 {
@@ -298,7 +303,6 @@ pub fn start_monitor_loop(config: GuardConfig) {
         }
 
         file_state_tracker.retain(|path_key, _| actively_seen_paths.contains(path_key));
-
         first_run = false;
         notify_systemd_watchdog();
         thread::sleep(Duration::from_millis(config.monitor.check_interval_ms));
@@ -335,7 +339,23 @@ fn run_uds_server(
         }
     };
 
-    let _ = fs::set_permissions(socket_path, fs::Permissions::from_mode(0o660));
+    if let Err(e) = fs::set_permissions(socket_path, fs::Permissions::from_mode(0o660)) {
+        emit_log(
+            "ERROR",
+            "uds_server",
+            None,
+            None,
+            None,
+            Some("permissions"),
+            "CRASH",
+            &format!(
+                "Failed to enforce secure access permissions on UDS socket: {}",
+                e
+            ),
+            json_enabled,
+        );
+        return;
+    }
 
     for stream in listener.incoming() {
         if let Ok(stream) = stream {
@@ -344,7 +364,6 @@ fn run_uds_server(
             let id_clone = id_extractor.clone();
             let wl_clone = whitelist.clone();
             let tbl_clone = table.clone();
-
             thread::spawn(move || {
                 handle_uds_stream(
                     stream,
@@ -370,30 +389,62 @@ fn handle_uds_stream(
     json_enabled: bool,
 ) {
     let mut reader = BufReader::new(stream);
-    let mut line = String::new();
+    let mut buf = Vec::new();
 
-    while let Ok(bytes_read) = reader.read_line(&mut line) {
-        if bytes_read == 0 {
-            break;
+    loop {
+        buf.clear();
+        // Secure Bounded Intake: Read up to 8192 bytes looking for a newline delimiter
+        let mut chunk = reader.by_ref().take(8192);
+        match chunk.read_until(b'\n', &mut buf) {
+            Ok(0) => break, // EOF
+            Ok(_) => {
+                let has_newline = buf.ends_with(&[b'\n']);
+
+                // Defense against unbounded payload buffering attacks
+                if !has_newline && buf.len() >= 8192 {
+                    emit_log(
+                        "CRITICAL",
+                        "uds_server",
+                        None,
+                        None,
+                        None,
+                        Some("stream"),
+                        "TRUNCATED",
+                        "UDS Line limit reached without delimiter. Excess payload dropped to prevent memory exhaustion.",
+                        json_enabled,
+                    );
+
+                    // Drain remaining stream bytes belonging to the malformed payload block until next newline
+                    let mut drain_buf = [0u8; 512];
+                    loop {
+                        match reader.read(&mut drain_buf) {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                if drain_buf[..n].contains(&b'\n') {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    continue;
+                }
+
+                let current_line = String::from_utf8_lossy(&buf);
+                let trimmed = current_line.trim_end();
+
+                evaluate_line_signatures(
+                    trimmed,
+                    &regex_rules,
+                    &id_extractor,
+                    &registry,
+                    &whitelist,
+                    &table,
+                    json_enabled,
+                );
+            }
+            Err(_) => break,
         }
-        let trimmed = line.trim_end();
-
-        if trimmed.len() > 8192 {
-            line.clear();
-            continue;
-        }
-
-        // Clean Deduplication: Invoking centralized line evaluator block cleanly
-        evaluate_line_signatures(
-            trimmed,
-            &regex_rules,
-            &id_extractor,
-            &registry,
-            &whitelist,
-            &table,
-            json_enabled,
-        );
-        line.clear();
     }
 }
 
@@ -439,11 +490,9 @@ fn dispatch_to_worker(
     table: &str,
     json_enabled: bool,
 ) {
-    // Replaced Match evaluation with idiomatic unwrap_or_else method call
     let mut reg = registry
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-
     let tx = reg.entry(container_id.clone()).or_insert_with(|| {
         let (worker_tx, worker_rx) = channel::<WorkerChannelMessage>();
         let cid_clone = container_id.clone();
@@ -464,7 +513,6 @@ fn dispatch_to_worker(
 
         worker_tx
     });
-
     if let Err(e) = tx.send((try_actions, final_actions, rule_name.clone())) {
         emit_log(
             "ERROR",
@@ -490,7 +538,6 @@ fn run_worker_lifecycle(
     json_enabled: bool,
 ) {
     let timeout_dur = Duration::from_secs(30);
-
     loop {
         match rx_chan.recv_timeout(timeout_dur) {
             Ok((try_cmds, final_cmds, rule)) => {
@@ -508,7 +555,6 @@ fn run_worker_lifecycle(
                 let mut reg = registry
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-
                 match rx_chan.try_recv() {
                     Ok((try_cmds, final_cmds, rule)) => {
                         drop(reg);

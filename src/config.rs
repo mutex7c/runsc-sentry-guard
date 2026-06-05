@@ -54,10 +54,8 @@ pub struct MonitorConfig {
     pub ip_whitelist: Vec<IpNet>,
     pub nftables_default_table: String,
     pub json_logging_enabled: bool,
-    // FIX: Extracted hardcoded socket path to allow Rootless/Podman support
     pub docker_socket_path: String,
-    /// Preserved for explicit systemd watchdog configuration parity in schema deployments
-    #[allow(dead_code)]
+    // FIX: Removed dead_code allowance; property is now actively consumed by the dedicated heartbeat thread.
     pub systemd_watchdog_interval_ms: u64,
 }
 

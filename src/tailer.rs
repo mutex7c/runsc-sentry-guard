@@ -34,6 +34,17 @@ pub fn start_monitor_loop(config: GuardConfig) {
     let whitelist = config.monitor.ip_whitelist.clone();
     let table = config.monitor.nftables_default_table.clone();
     let docker_socket_path = config.monitor.docker_socket_path.clone();
+    let watchdog_interval = config.monitor.systemd_watchdog_interval_ms;
+
+    // FIX: Spawn a dedicated, decoupled watchdog heartbeat thread
+    if watchdog_interval > 0 {
+        thread::spawn(move || {
+            loop {
+                notify_systemd_watchdog();
+                thread::sleep(Duration::from_millis(watchdog_interval));
+            }
+        });
+    }
 
     let worker_registry: Arc<Mutex<RegistryMap>> = Arc::new(Mutex::new(HashMap::new()));
     let regex_compiled: Arc<Vec<(String, Regex, Vec<AtomicAction>, Vec<AtomicAction>)>> = Arc::new(
@@ -315,7 +326,7 @@ pub fn start_monitor_loop(config: GuardConfig) {
 
         file_state_tracker.retain(|path_key, _| actively_seen_paths.contains(path_key));
         first_run = false;
-        notify_systemd_watchdog();
+        // FIX: Removed the redundant watchdog call from the blocking directory loop.
         thread::sleep(Duration::from_millis(config.monitor.check_interval_ms));
     }
 }

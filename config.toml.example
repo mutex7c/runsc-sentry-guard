@@ -1,4 +1,5 @@
 [monitor]
+mode = "file" # Options: "file", "socket", or "dual"
 log_dir = "/var/log/gvisor/"
 check_interval_ms = 1000
 ip_whitelist = ["127.0.0.1/32", "10.11.11.0/24", "192.168.3.0/24"]

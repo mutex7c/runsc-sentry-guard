@@ -1,3 +1,6 @@
+// Containment Mitigation Engine
+// Invokes localized host sandboxing isolation binaries and commands safely.
+
 use crate::config::AtomicAction;
 use crate::logger::emit_log;
 use ipnet::IpNet;
@@ -35,7 +38,7 @@ pub fn resolve_container_ip(container_id: &str, json_enabled: bool) -> Option<Ip
                 None,
                 Some("resolve_ip"),
                 "FAILURE",
-                "Failed to query Docker socket for IP routing metadata",
+                "Failed to query Docker socket for networking metadata.",
                 json_enabled,
             );
             None
@@ -51,14 +54,11 @@ fn execute_atomic_command(
     json_enabled: bool,
 ) -> Result<(), String> {
     match action {
-        // Insert this variant into the match action block in src/worker.rs
         AtomicAction::WebhookAlert { url } => {
             let payload = format!(
                 "{{\"text\":\"🚨 [SENTRY-GUARD] Active containment pipeline triggered for container context: {}\"}}",
                 container_id
             );
-
-            // Execute out-of-band POST network payloads securely via array slices
             let s = Command::new("curl")
                 .args(&[
                     "-X",
@@ -71,11 +71,10 @@ fn execute_atomic_command(
                 ])
                 .status()
                 .map_err(|e| e.to_string())?;
-
             if s.success() {
                 Ok(())
             } else {
-                Err("Out-of-band Webhook alert dispatch payload failed execution".into())
+                Err("Webhook dispatch returned failure code.".into())
             }
         }
 
@@ -84,14 +83,13 @@ fn execute_atomic_command(
                 .args(&["inspect", "-f", "{{.State.Running}}", container_id])
                 .output()
                 .map_err(|e| e.to_string())?;
-
-            let is_running = String::from_utf8_lossy(&output.stdout).trim() == "true";
-            if is_running {
+            if String::from_utf8_lossy(&output.stdout).trim() == "true" {
                 Ok(())
             } else {
-                Err("Target container is not actively running".into())
+                Err("Target container context reported stopped status.".into())
             }
         }
+
         AtomicAction::Pause => {
             let s = Command::new("docker")
                 .args(&["pause", container_id])
@@ -100,15 +98,22 @@ fn execute_atomic_command(
             if s.success() {
                 Ok(())
             } else {
-                Err("Docker pause failed".into())
+                Err("Docker pause manipulation rejected.".into())
             }
         }
+
         AtomicAction::Unpause => {
-            let _ = Command::new("docker")
+            let s = Command::new("docker")
                 .args(&["unpause", container_id])
-                .status();
-            Ok(())
+                .status()
+                .map_err(|e| e.to_string())?;
+            if s.success() {
+                Ok(())
+            } else {
+                Err("Docker unpause manipulation rejected.".into())
+            }
         }
+
         AtomicAction::Restart => {
             let s = Command::new("docker")
                 .args(&["restart", container_id])
@@ -117,9 +122,10 @@ fn execute_atomic_command(
             if s.success() {
                 Ok(())
             } else {
-                Err("Docker restart failed".into())
+                Err("Docker restart execution rejected.".into())
             }
         }
+
         AtomicAction::CommitSnapshot { prefix } => {
             let timestamp = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -133,9 +139,10 @@ fn execute_atomic_command(
             if s.success() {
                 Ok(())
             } else {
-                Err("Forensic commit phase failed".into())
+                Err("Forensic image snapshot generation failed.".into())
             }
         }
+
         AtomicAction::ContainerSignal { signal } => {
             let s = Command::new("docker")
                 .args(&["kill", &format!("--signal={}", signal), container_id])
@@ -144,9 +151,10 @@ fn execute_atomic_command(
             if s.success() {
                 Ok(())
             } else {
-                Err("Signal deployment failed".into())
+                Err("Linux signal allocation injection failed.".into())
             }
         }
+
         AtomicAction::NftBlacklist { set_name, timeout } => {
             if let Some(ip) = resolve_container_ip(container_id, json_enabled) {
                 if is_ip_safe(&ip, whitelist) {
@@ -158,7 +166,7 @@ fn execute_atomic_command(
                         Some(&ip.to_string()),
                         Some("nft_blacklist"),
                         "INTERCEPTED",
-                        "Target IP addresses match core infrastructure whitelist. Isolation aborted safely.",
+                        "Target IP matches core infrastructure whitelist. Isolation aborted.",
                         json_enabled,
                     );
                     return Ok(());
@@ -173,7 +181,7 @@ fn execute_atomic_command(
                     Some("nft_blacklist"),
                     "SUCCESS",
                     &format!(
-                        "Target isolated via set {} with timeout boundary {}",
+                        "Target network isolated via set {} for duration context {}",
                         set_name, timeout
                     ),
                     json_enabled,
@@ -181,6 +189,7 @@ fn execute_atomic_command(
             }
             Ok(())
         }
+
         AtomicAction::RunCustomScript { path } => {
             let s = Command::new(path)
                 .arg(container_id)
@@ -189,9 +198,10 @@ fn execute_atomic_command(
             if s.success() {
                 Ok(())
             } else {
-                Err("Custom automated extensions execution failed".into())
+                Err("Custom automated automation extension script crashed.".into())
             }
         }
+
         AtomicAction::LogJson => {
             emit_log(
                 "INFO",
@@ -201,11 +211,12 @@ fn execute_atomic_command(
                 None,
                 Some("log_json"),
                 "AUDIT",
-                "Standard programmatic signature verification recorded",
+                "Standard signature verification telemetry logged.",
                 json_enabled,
             );
             Ok(())
         }
+
         AtomicAction::LogCritical => {
             emit_log(
                 "CRITICAL",
@@ -215,7 +226,7 @@ fn execute_atomic_command(
                 None,
                 Some("log_critical"),
                 "ALERT",
-                "Security policy violation remediation loop engaged",
+                "Security policy remediation loop engaged.",
                 json_enabled,
             );
             Ok(())
@@ -230,7 +241,17 @@ fn execute_firewall_mutation(
     timeout: &str,
     table: &str,
 ) -> Result<(), String> {
-    // FIXED: Appends native timeout element parameters cleanly to native array slices
+    // Clean Fix: Import located strictly within target compilation block scope to erase linter warnings
+    use regex::Regex;
+
+    let validation_rule = Regex::new(r"^\d+[smhd]$").unwrap();
+    if !validation_rule.is_match(timeout) {
+        return Err(format!(
+            "Security Constraint Violation: Intercepted malformed firewall duration payload: '{}'",
+            timeout
+        ));
+    }
+
     let s = Command::new("nft")
         .args(&[
             "add",
@@ -241,10 +262,11 @@ fn execute_firewall_mutation(
         ])
         .status()
         .map_err(|e| e.to_string())?;
+
     if s.success() {
         Ok(())
     } else {
-        Err("Kernel nftables mutation rejected execution parameter rules".into())
+        Err("Kernel nftables transaction rejected execution parameters.".into())
     }
 }
 
@@ -285,7 +307,7 @@ pub fn execute_containment_pipeline(
                 None,
                 Some(&format!("{:?}", action)),
                 "FAILURE",
-                &format!("Remediation component failed structural context: {}", e),
+                &format!("Primary playbook action failed structural context: {}", e),
                 json_enabled,
             );
             pipeline_failed = true;
@@ -296,8 +318,21 @@ pub fn execute_containment_pipeline(
     if pipeline_failed {
         emit_json_escalation_marker(&container_id, &rule_name, json_enabled);
         for fallback in &final_actions {
-            let _ =
-                execute_atomic_command(fallback, &container_id, &whitelist, &table, json_enabled);
+            if let Err(fallback_error) =
+                execute_atomic_command(fallback, &container_id, &whitelist, &table, json_enabled)
+            {
+                emit_log(
+                    "CRITICAL",
+                    "worker_engine",
+                    Some(&rule_name),
+                    Some(&container_id),
+                    None,
+                    Some(&format!("{:?}", fallback)),
+                    "CRASH",
+                    &format!("EMERGENCY CONTAINMENT FAILURE: {}", fallback_error),
+                    json_enabled,
+                );
+            }
         }
     }
 }
@@ -311,7 +346,7 @@ fn emit_json_escalation_marker(container_id: &str, rule: &str, json_enabled: boo
         None,
         Some("escalation_routing"),
         "ENGAGED",
-        "Primary playbook broke strategy rules. Deploying mandatory failure final mitigation loop contexts.",
+        "Primary playbook failed structural strategy. Deploying fallback containment actions.",
         json_enabled,
     );
 }

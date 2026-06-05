@@ -13,6 +13,8 @@ or kernel-level hooking (e.g., eBPF) vulnerabilities.
 * **Parallel Dispatching:** The main log-tailing loop operates asynchronously, parsing log files line-by-line using tracked Inode descriptors. It acts strictly as an event router and never executes blocking incident response actions.
 * **Per-Container Serialization:** To prevent race conditions and split-brain containment actions, execution payloads targeting the *same* Container ID are queued via bounded asynchronous channels (`std::sync::mpsc`) and executed sequentially inside a dedicated worker thread.
 * **Multi-Container Parallelism:** Incidents occurring across *different* Container IDs are processed simultaneously in isolated worker threads to prevent thread starvation or global engine denial-of-service blockages.
+* **Dual-Channel Routing:** The master log ingestion architecture scales into a parallel state. The asynchronously executed dispatch loop routes entries sourced simultaneously from tracked Inode descriptors (filesystem logs) and an out-of-band streaming Unix Domain Socket, operating without introducing blockages to the runtime engines.
+
 
 ### 2.2 Fault Tolerance & Self-Healing
 * **Panic Isolation:** Runtime errors or execution panics inside an individual container worker thread are isolated via native thread boundaries. Thread containment failures will not disrupt the directory parsing loops or adjacent worker queues.
@@ -43,11 +45,12 @@ The daemon ingests a declarative TOML configuration layout mapping directly to s
 
 ### 5.1 Cyber Resilience Act (CRA) Alignment
 
-| CRA Obligation             | `runsc-sentry-guard` Design Response                                                                                                                                                 |
-|:---------------------------|:-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| **Security by Design**     | Built in native, memory-safe Rust. Eliminates standard buffer overflow, use-after-free, and command-injection vulnerabilities inherent in traditional C/C++ or Bash security tools.  |
-| **Vulnerability Handling** | Out-of-band monitoring architecture. The guard runs entirely outside the sandbox context; a compromised container cannot manipulate the security logs or see the daemon watching it. |
-| **Minimal Attack Surface** | Operates as a single compiled binary with zero external runtime package dependencies (no Python, Node, or shared interpreter layers required on the host).                           |
+| CRA Obligation             | `runsc-sentry-guard` Design Response                                                                                                                                                                                                                                                                                                                          |
+|:---------------------------|:--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| **Security by Design**     | Built in native, memory-safe Rust. Eliminates standard buffer overflow, use-after-free, and command-injection vulnerabilities inherent in traditional C/C++ or Bash security tools.                                                                                                                                                                           |
+| **Vulnerability Handling** | Out-of-band monitoring architecture. The guard runs entirely outside the sandbox context; a compromised container cannot manipulate the security logs or see the daemon watching it. The (optional) UDS configuration allows for completely diskless user-space operations, making log tampering practically impossible for a compromised container workload. |
+|
+| **Minimal Attack Surface** | Operates as a single compiled binary with zero external runtime package dependencies (no Python, Node, or shared interpreter layers required on the host).                                                                                                                                                                                                    |
 
 ### 5.2 NIS2 Directive Alignment (Supply Chain & Incident Response)
 

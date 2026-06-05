@@ -6,14 +6,15 @@ The `runsc-sentry-guard` daemon ingests a declarative TOML file layout. The inte
 
 ## 1. Global Daemon Parameters (`[monitor]`)
 
-| Parameter Name                 | Data Type Expected      | Description / Purpose                                                                    |
-|:-------------------------------|:------------------------|:-----------------------------------------------------------------------------------------|
-| `log_dir`                      | String (File Path)      | The absolute host folder path where gVisor emits its active sandbox `.boot` streams.     |
-| `check_interval_ms`            | Unsigned 64-bit Integer | The thread polling interval cadence for inspecting file modifications.                   |
-| `ip_whitelist`                 | Array of CIDR Strings   | Core infrastructure IP networks strictly protected against accidental firewall locks.    |
-| `nftables_default_table`       | String                  | The specific nftables table space namespace where containment sets are deployed.         |
-| `json_logging_enabled`         | Boolean Flag            | Toggles terminal output logs between clean plain-text and structured SIEM JSON payloads. |
-| `systemd_watchdog_interval_ms` | Unsigned 64-bit Integer | The periodic runtime heartbeat loop frequency for systemd deadlock health checks.        |
+| Parameter Name                 | Data Type Expected                         | Description / Purpose                                                                                                                           |
+|:-------------------------------|:-------------------------------------------|:------------------------------------------------------------------------------------------------------------------------------------------------|
+| `mode`                         | String (`"file"`, `"socket"`, or `"dual"`) | Dictates the ingestion strategy. `file` tails disk logs, `socket` listens out-of-band via UDS, and `dual` aggregates both loops simultaneously. |
+| `log_dir`                      | String (File Path)                         | The absolute host folder path where gVisor emits its active sandbox `.boot` streams.                                                            |
+| `check_interval_ms`            | Unsigned 64-bit Integer                    | The thread polling interval cadence for inspecting file modifications.                                                                          |
+| `ip_whitelist`                 | Array of CIDR Strings                      | Core infrastructure IP networks strictly protected against accidental firewall locks.                                                           |
+| `nftables_default_table`       | String                                     | The specific nftables table space namespace where containment sets are deployed.                                                                |
+| `json_logging_enabled`         | Boolean Flag                               | Toggles terminal output logs between clean plain-text and structured SIEM JSON payloads.                                                        |
+| `systemd_watchdog_interval_ms` | Unsigned 64-bit Integer                    | The periodic runtime heartbeat loop frequency for systemd deadlock health checks.                                                               |
 
 ## 2. Container Runtime Engine Configuration (`daemon.json`)
 

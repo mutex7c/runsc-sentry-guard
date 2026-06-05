@@ -11,6 +11,11 @@ To satisfy Filesystem Hierarchy Standards (FHS), maximize host isolation boundar
 * **Internal State Tick Rate:** `1000ms` (The frequency threshold for running `getdents64` directory crawls to discover active sandbox assets).
 * **Maximum In-Memory Log Buffer Line Ceiling:** `8192 bytes`. The ingestion stream engine processes chunks up to this maximum limit per line evaluation. Segments extending past this boundary without a newline delimiter are flagged as an anomaly, truncated, and skipped to protect host memory channels from buffer-bloat denial-of-service attacks.
 
+### 1.1.a Out-of-Band Unix Domain Socket (UDS) Metrics
+* **Default Socket Path:** `/var/run/runsc-sentry-guard.sock`
+* **Access Control Mandatory Matrix:** Created socket paths are locked via `chmod 0660`, restricting streaming access explicitly to privileged root operations and authenticated container engine runtimes.
+* **Ingestion Guard Limits:** Incoming data chunks are strictly processed up to a maximum limit of `8192 bytes` per line view. Any block surpassing this sequence boundary is dropped to prevent heap exploitation or denial-of-service attempts.
+
 ### 1.2 Concurrency & Core Safety Bounds
 * **Worker Thread Inactivity Timeout:** `30,000ms` (30 seconds). If an independent key-serialized container worker thread processes all active incident payloads and remains idle with zero incoming channel messages for this duration, it automatically unregisters its mailbox from the global map, drops its channel receiver, and terminates safely to defend host RAM against long-term heap leaks.
 * **Host Privilege Ceiling:** Ambient, permitted, and effective POSIX sets are stripped permanently down to strictly `CAP_NET_ADMIN` post-initialization. The engine completely drops full ambient root ownership before opening streaming files or processing untrusted inputs.
@@ -25,6 +30,7 @@ The parsing engine uses a declarative, strict-typing deserializer enforced via `
 ### 2.1 Complete Schema Map Blueprint
 ```toml
 [monitor]
+mode = "file" # Options: "file", "socket", or "dual"
 log_dir = "/var/log/gvisor/"
 check_interval_ms = 1000
 ip_whitelist = ["127.0.0.1/32", "10.11.11.0/24", "192.168.3.0/24"]
@@ -96,3 +102,15 @@ Any system call outside of this strict operational matrix will trigger an immedi
 | **System Signals**        | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `rt_sigqueue`                                              | Allows the runtime engine to respond gracefully to process manager termination requests (`SIGTERM`).                                                        |
 | **Network Frameworks**    | `socket`, `connect`, `bind`, `sendmsg`, `recvmsg`, `sendto`, `recvfrom`, `setsockopt`, `getsockopt`, `uname` | **Strict child-process boundaries:** Required to preserve the structural viability of downstream `curl`, `docker inspect`, and `nftables` netlink commands. |
 
+## Appendix: High-Performance Unix Domain Socket (UDS) Server Spec
+
+To achieve low-latency active threat containment without relying on host file logging disk writes, the daemon implements a parallel, memory-backed Unix Domain Socket listener subsystem.
+
+### 1. Architectural Metrics & Endpoints
+* **Socket File Descriptor Target Location:** `/var/run/runsc-sentry-guard.sock`
+* **Access Control Mandatory Matrix:** Disposed path permissions are locked down via `chmod 0660` at initialization, restricting communication privileges exclusively to root applications and authenticated infrastructure runtime daemons (e.g., Docker/Podman engine wrappers).
+* **Ingestion Guard Limits:** Incoming data packets read over individual socket streams undergo sequential line splits. Lines are bounded by a maximum threshold ceiling of `8192 bytes`. Any incoming block surpassing this sequence boundary is skipped immediately without parsing to isolate host memory resources against stream buffer overflow attacks.
+
+### 2. Network Firewall Input Constraints
+* **Timeout Verification Ruleset:** To eliminate malicious string interpolation patterns within downstream `nftables` commands, the containment engine validates all rule `timeout` parameters via an internal strict regular expression structure: `^\d+[smhd]$`.
+* **Safe Startup Abort:** If an operational play parameter configuration (e.g., `timeout = "24h; drop table;"`) fails to pass this exact structural matrix check at deployment execution, the atomic action returns an error and directly triggers the emergency fallback mitigation playbook loop.

@@ -640,3 +640,50 @@ fn emit_json_escalation_marker(container_id: &str, rule: &str, json_enabled: boo
         json_enabled,
     );
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use ipnet::IpNet;
+    use std::io::Cursor;
+    use std::net::IpAddr;
+
+    #[test]
+    fn test_is_ip_safe_evaluations() {
+        let whitelist = vec![
+            "10.0.0.0/8".parse::<IpNet>().unwrap(),
+            "192.168.1.0/24".parse::<IpNet>().unwrap(),
+        ];
+
+        let safe_ip: IpAddr = "10.5.5.5".parse().unwrap();
+        let unsafe_ip: IpAddr = "172.16.0.5".parse().unwrap();
+
+        assert!(is_ip_safe(&safe_ip, &whitelist), "Failed: 10.5.5.5 should be whitelisted");
+        assert!(!is_ip_safe(&unsafe_ip, &whitelist), "Failed: 172.16.0.5 should be blacklisted");
+    }
+
+    #[test]
+    fn test_read_bounded_line_success() {
+        let data = b"HTTP/1.1 200 OK\r\n";
+        let mut cursor = Cursor::new(data);
+
+        let result = read_bounded_line(&mut cursor, 1024).unwrap();
+        assert_eq!(result, "HTTP/1.1 200 OK\r\n");
+    }
+
+    #[test]
+    fn test_read_bounded_line_bloat_protection() {
+        // Simulating a Slowloris/Buffer-bloat attack: feeding 100 bytes without a newline delimiter.
+        // We set the ceiling to 50 bytes. The engine must abort.
+        let data = vec![b'A'; 100];
+        let mut cursor = Cursor::new(data);
+
+        let result = read_bounded_line(&mut cursor, 50);
+
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err(),
+            "Buffer-bloat protection: HTTP line exceeded maximum bounded length"
+        );
+    }
+}

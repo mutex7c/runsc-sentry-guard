@@ -112,3 +112,54 @@ pub fn load_config<P: AsRef<Path>>(path: P) -> Result<GuardConfig, String> {
 
     Ok(config)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::env;
+    use std::fs::File;
+    use std::io::Write;
+
+    #[test]
+    fn test_load_config_valid_atomic_read() {
+        let mut temp_path = env::temp_dir();
+        temp_path.push("runsc_valid_test_config.toml");
+
+        let mut file = File::create(&temp_path).unwrap();
+        let toml_data = r#"
+            [monitor]
+            mode = "file"
+            log_dir = "/var/log/gvisor/"
+            check_interval_ms = 1000
+            ip_whitelist = ["127.0.0.1/32"]
+            nftables_default_table = "inet filter"
+            json_logging_enabled = true
+            systemd_watchdog_interval_ms = 5000
+
+            [[rules]]
+            name = "test_rule"
+            file_pattern = "*.boot"
+            regex_match = "malicious_string"
+            try_actions = [{ type = "pause" }]
+            final_actions = [{ type = "log_critical" }]
+        "#;
+        file.write_all(toml_data.as_bytes()).unwrap();
+
+        let config = load_config(&temp_path).expect("Failed to parse valid configuration");
+
+        assert_eq!(config.monitor.mode, IngestionMode::File);
+        assert_eq!(config.rules.len(), 1);
+        assert_eq!(config.rules[0].name, "test_rule");
+
+        std::fs::remove_file(temp_path).unwrap();
+    }
+
+    #[test]
+    fn test_load_config_missing_file_handling() {
+        // Proving the atomic read handles non-existent files safely without crashing
+        let result = load_config("/path/that/absolutely/does/not/exist/config.toml");
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Configuration missing, inaccessible, or tampered"));
+    }
+}

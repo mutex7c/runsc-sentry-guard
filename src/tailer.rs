@@ -647,3 +647,30 @@ fn notify_systemd_watchdog() {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use regex::Regex;
+
+    #[test]
+    fn test_id_extractor_strict_boundaries() {
+        // The exact regex compiled in start_monitor_loop
+        let id_extractor = Regex::new(r"--id=\b([a-fA-F0-9]{12}|[a-fA-F0-9]{64})\b").unwrap();
+
+        // Valid Standard 64-character Docker ID
+        let valid_64 = "--id=a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
+        assert!(id_extractor.is_match(valid_64), "Regex failed to match valid 64-char ID");
+
+        // Valid Short 12-character ID
+        let valid_12 = "--id=a1b2c3d4e5f6";
+        assert!(id_extractor.is_match(valid_12), "Regex failed to match valid 12-char ID");
+
+        // Malicious Payload: Thread Exhaustion Attack Attempt (17 chars, no boundary)
+        let invalid_spoof = "--id=a1b2c3d4e5f67890a";
+        assert!(!id_extractor.is_match(invalid_spoof), "SECURITY ALERT: Regex matched an unbounded invalid spoof ID");
+
+        // Malicious Payload: Random short string
+        let invalid_short = "--id=abc";
+        assert!(!id_extractor.is_match(invalid_short), "SECURITY ALERT: Regex matched a malformed short ID");
+    }
+}

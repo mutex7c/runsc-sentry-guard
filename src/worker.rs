@@ -1,5 +1,6 @@
 // Containment Mitigation Engine
 // Invokes localized host sandboxing isolation techniques and direct socket interactions safely.
+
 use crate::config::AtomicAction;
 use crate::logger::emit_log;
 use ipnet::IpNet;
@@ -33,21 +34,17 @@ struct DockerNetworkSettings {
 #[derive(Deserialize)]
 #[allow(non_snake_case)]
 #[cfg(target_os = "linux")]
-struct DockerContainerState {
-    Running: bool,
-}
-
-#[derive(Deserialize)]
-#[allow(non_snake_case)]
-#[cfg(target_os = "linux")]
 struct DockerInspectResponse {
-    State: DockerContainerState,
     NetworkSettings: DockerNetworkSettings,
 }
 
 /// Zero-Fork Native HTTP Over Unix Domain Socket Engine (Linux Production Mode Only)
 #[cfg(target_os = "linux")]
-fn execute_docker_uds_request(method: &str, path: &str, body: Option<&str>) -> Result<String, String> {
+fn execute_docker_uds_request(
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+) -> Result<(u16, String), String> {
     use std::io::{BufReader, Read, Write};
     use std::os::unix::net::UnixStream;
 
@@ -57,18 +54,25 @@ fn execute_docker_uds_request(method: &str, path: &str, body: Option<&str>) -> R
     let request_payload = if let Some(b) = body {
         format!(
             "{} {} HTTP/1.0\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-            method, path, b.len(), b
+            method,
+            path,
+            b.len(),
+            b
         )
     } else {
         format!("{} {} HTTP/1.0\r\n\r\n", method, path)
     };
 
-    stream.write_all(request_payload.as_bytes()).map_err(|e| e.to_string())?;
+    stream
+        .write_all(request_payload.as_bytes())
+        .map_err(|e| e.to_string())?;
     stream.flush().map_err(|e| e.to_string())?;
 
     let mut response_raw = String::new();
     let mut reader = BufReader::new(stream).take(65536);
-    reader.read_to_string(&mut response_raw).map_err(|e| e.to_string())?;
+    reader
+        .read_to_string(&mut response_raw)
+        .map_err(|e| e.to_string())?;
 
     let response_parts: Vec<&str> = response_raw.splitn(2, "\r\n\r\n").collect();
     if response_parts.is_empty() {
@@ -76,15 +80,19 @@ fn execute_docker_uds_request(method: &str, path: &str, body: Option<&str>) -> R
     }
 
     let status_line = response_parts[0].lines().next().unwrap_or("");
-    if status_line.contains("200") || status_line.contains("204") || status_line.contains("201") {
-        if response_parts.len() > 1 {
-            Ok(response_parts[1].to_string())
-        } else {
-            Ok(String::new())
-        }
+    let status_code = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse::<u16>().ok())
+        .unwrap_or(500);
+
+    let payload = if response_parts.len() > 1 {
+        response_parts[1].to_string()
     } else {
-        Err(format!("Docker API returned an infrastructure fault: {}", status_line))
-    }
+        String::new()
+    };
+
+    Ok((status_code, payload))
 }
 
 // Firewall Utilities: Gated to Linux to eliminate dead-code diagnostics on development hosts
@@ -94,20 +102,37 @@ pub fn is_ip_safe(target_ip: &IpAddr, whitelist: &[IpNet]) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-pub fn resolve_container_ip(container_id: &str, json_enabled: bool) -> Option<IpAddr> {
+pub fn resolve_container_ips(container_id: &str, json_enabled: bool) -> Vec<IpAddr> {
     let endpoint = format!("/containers/{}/json", container_id);
+    let mut ips = Vec::new();
+
     match execute_docker_uds_request("GET", &endpoint, None) {
-        Ok(json_payload) => {
+        Ok((status, json_payload)) if status == 200 => {
             if let Ok(parsed) = serde_json::from_str::<DockerInspectResponse>(&json_payload) {
                 for network in parsed.NetworkSettings.Networks.values() {
                     if !network.IPAddress.is_empty() {
                         if let Ok(ip) = network.IPAddress.parse::<IpAddr>() {
-                            return Some(ip);
+                            ips.push(ip);
                         }
                     }
                 }
             }
-            None
+        }
+        Ok((status, _)) => {
+            emit_log(
+                "WARN",
+                "worker_engine",
+                None,
+                Some(container_id),
+                None,
+                Some("resolve_ip"),
+                "FAILURE",
+                &format!(
+                    "Docker socket returned HTTP {} during IP resolution.",
+                    status
+                ),
+                json_enabled,
+            );
         }
         Err(e) => {
             emit_log(
@@ -118,12 +143,15 @@ pub fn resolve_container_ip(container_id: &str, json_enabled: bool) -> Option<Ip
                 None,
                 Some("resolve_ip"),
                 "FAILURE",
-                &format!("Failed to query Docker socket for networking metadata via UDS channel: {}", e),
+                &format!(
+                    "Failed to query Docker socket for networking metadata via UDS channel: {}",
+                    e
+                ),
                 json_enabled,
             );
-            None
         }
     }
+    ips
 }
 
 fn execute_atomic_command(
@@ -142,6 +170,7 @@ fn execute_atomic_command(
                 "{{\\\"text\\\":\\\"🚨 [SENTRY-GUARD] Active containment pipeline triggered for container context: {}\\\"}}",
                 container_id
             );
+
             let s = Command::new("curl")
                 .args(&[
                     "-X",
@@ -154,6 +183,7 @@ fn execute_atomic_command(
                 ])
                 .status()
                 .map_err(|e| e.to_string())?;
+
             if s.success() {
                 Ok(())
             } else {
@@ -166,6 +196,7 @@ fn execute_atomic_command(
                 .arg(container_id)
                 .status()
                 .map_err(|e| e.to_string())?;
+
             if s.success() {
                 Ok(())
             } else {
@@ -208,34 +239,61 @@ fn execute_atomic_command(
             {
                 match infrastructure_action {
                     AtomicAction::ValidateState => {
-                        let endpoint = format!("/containers/{}/json", container_id);
-                        let json_payload = execute_docker_uds_request("GET", &endpoint, None)?;
-                        let parsed = serde_json::from_str::<DockerInspectResponse>(&json_payload)
-                            .map_err(|e| format!("Failed to parse state payload structure: {}", e))?;
-
-                        if parsed.State.Running {
-                            Ok(())
-                        } else {
-                            Err("Target container context reported a stopped status profile.".into())
-                        }
+                        // Deprecated logical check to resolve TOCTOU vulnerability
+                        emit_log(
+                            "INFO",
+                            "worker_engine",
+                            None,
+                            Some(container_id),
+                            None,
+                            Some("validate_state"),
+                            "SKIPPED",
+                            "ValidateState bypassed. Relying natively on downstream atomic Docker API mutations to prevent TOCTOU race conditions.",
+                            json_enabled,
+                        );
+                        Ok(())
                     }
 
                     AtomicAction::Pause => {
                         let endpoint = format!("/containers/{}/pause", container_id);
-                        execute_docker_uds_request("POST", &endpoint, None)?;
-                        Ok(())
+                        let (status, err_payload) =
+                            execute_docker_uds_request("POST", &endpoint, None)?;
+                        if (200..300).contains(&status) || status == 409 {
+                            Ok(())
+                        } else {
+                            Err(format!(
+                                "Pause mutation rejected (HTTP {}): {}",
+                                status, err_payload
+                            ))
+                        }
                     }
 
                     AtomicAction::Unpause => {
                         let endpoint = format!("/containers/{}/unpause", container_id);
-                        execute_docker_uds_request("POST", &endpoint, None)?;
-                        Ok(())
+                        let (status, err_payload) =
+                            execute_docker_uds_request("POST", &endpoint, None)?;
+                        if (200..300).contains(&status) || status == 409 {
+                            Ok(())
+                        } else {
+                            Err(format!(
+                                "Unpause mutation rejected (HTTP {}): {}",
+                                status, err_payload
+                            ))
+                        }
                     }
 
                     AtomicAction::Restart => {
                         let endpoint = format!("/containers/{}/restart", container_id);
-                        execute_docker_uds_request("POST", &endpoint, None)?;
-                        Ok(())
+                        let (status, err_payload) =
+                            execute_docker_uds_request("POST", &endpoint, None)?;
+                        if (200..300).contains(&status) {
+                            Ok(())
+                        } else {
+                            Err(format!(
+                                "Restart mutation rejected (HTTP {}): {}",
+                                status, err_payload
+                            ))
+                        }
                     }
 
                     AtomicAction::CommitSnapshot { prefix } => {
@@ -243,19 +301,44 @@ fn execute_atomic_command(
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_secs();
-                        let query_path = format!("/commit?container={}&repo={}-{}&tag=latest", container_id, prefix, timestamp);
-                        execute_docker_uds_request("POST", &query_path, None)?;
-                        Ok(())
+                        let query_path = format!(
+                            "/commit?container={}&repo={}-{}&tag=latest",
+                            container_id, prefix, timestamp
+                        );
+                        let (status, err_payload) =
+                            execute_docker_uds_request("POST", &query_path, None)?;
+                        if (200..300).contains(&status) {
+                            Ok(())
+                        } else {
+                            Err(format!(
+                                "CommitSnapshot rejected (HTTP {}): {}",
+                                status, err_payload
+                            ))
+                        }
                     }
 
                     AtomicAction::ContainerSignal { signal } => {
-                        let query_path = format!("/containers/{}/kill?signal={}", container_id, signal);
-                        execute_docker_uds_request("POST", &query_path, None)?;
-                        Ok(())
+                        let query_path =
+                            format!("/containers/{}/kill?signal={}", container_id, signal);
+                        let (status, err_payload) =
+                            execute_docker_uds_request("POST", &query_path, None)?;
+                        if (200..300).contains(&status) || status == 409 {
+                            Ok(())
+                        } else {
+                            Err(format!(
+                                "ContainerSignal rejected (HTTP {}): {}",
+                                status, err_payload
+                            ))
+                        }
                     }
 
                     AtomicAction::NftBlacklist { set_name, timeout } => {
-                        if let Some(ip) = resolve_container_ip(container_id, json_enabled) {
+                        let ips = resolve_container_ips(container_id, json_enabled);
+                        if ips.is_empty() {
+                            return Err("IP resolution yielded zero addresses; cannot apply nftables blacklist.".into());
+                        }
+
+                        for ip in ips {
                             if is_ip_safe(&ip, whitelist) {
                                 emit_log(
                                     "WARN",
@@ -265,10 +348,10 @@ fn execute_atomic_command(
                                     Some(&ip.to_string()),
                                     Some("nft_blacklist"),
                                     "INTERCEPTED",
-                                    "Target IP matches core infrastructure whitelist. Isolation aborted.",
+                                    "Target IP matches core infrastructure whitelist. Skipping isolation for this specific address.",
                                     json_enabled,
                                 );
-                                return Ok(());
+                                continue;
                             }
                             execute_firewall_mutation(&ip.to_string(), set_name, timeout, table)?;
                             emit_log(
@@ -296,27 +379,45 @@ fn execute_atomic_command(
             {
                 match infrastructure_action {
                     AtomicAction::ValidateState => {
-                        println!("[DEV-MOCK] Verifying runtime operational status for ID: {}", container_id);
+                        println!(
+                            "[DEV-MOCK] Verifying runtime operational status for ID: {}",
+                            container_id
+                        );
                         Ok(())
                     }
                     AtomicAction::Pause => {
-                        println!("[DEV-MOCK] Injecting out-of-band container namespace FREEZE on ID: {}", container_id);
+                        println!(
+                            "[DEV-MOCK] Injecting out-of-band container namespace FREEZE on ID: {}",
+                            container_id
+                        );
                         Ok(())
                     }
                     AtomicAction::Unpause => {
-                        println!("[DEV-MOCK] Releasing container namespace FREEZE mutation execution on ID: {}", container_id);
+                        println!(
+                            "[DEV-MOCK] Releasing container namespace FREEZE mutation execution on ID: {}",
+                            container_id
+                        );
                         Ok(())
                     }
                     AtomicAction::Restart => {
-                        println!("[DEV-MOCK] Dispatching rolling container runtime reboot signature to ID: {}", container_id);
+                        println!(
+                            "[DEV-MOCK] Dispatching rolling container runtime reboot signature to ID: {}",
+                            container_id
+                        );
                         Ok(())
                     }
                     AtomicAction::CommitSnapshot { prefix } => {
-                        println!("[DEV-MOCK] Committing container snapshot to register using tag: {}-{}", prefix, container_id);
+                        println!(
+                            "[DEV-MOCK] Committing container snapshot to register using tag: {}-{}",
+                            prefix, container_id
+                        );
                         Ok(())
                     }
                     AtomicAction::ContainerSignal { signal } => {
-                        println!("[DEV-MOCK] Injecting kernel process termination signal [{}] straight to target ID: {}", signal, container_id);
+                        println!(
+                            "[DEV-MOCK] Injecting kernel process termination signal [{}] straight to target ID: {}",
+                            signal, container_id
+                        );
                         Ok(())
                     }
                     AtomicAction::NftBlacklist { set_name, timeout } => {
@@ -379,6 +480,7 @@ pub fn execute_containment_pipeline(
     rule_name: String,
 ) {
     let mut pipeline_failed = false;
+
     for action in &try_actions {
         if let Err(e) =
             execute_atomic_command(action, &container_id, &whitelist, &table, json_enabled)
@@ -401,6 +503,7 @@ pub fn execute_containment_pipeline(
 
     if pipeline_failed {
         emit_json_escalation_marker(&container_id, &rule_name, json_enabled);
+
         for fallback in &final_actions {
             if let Err(fallback_error) =
                 execute_atomic_command(fallback, &container_id, &whitelist, &table, json_enabled)

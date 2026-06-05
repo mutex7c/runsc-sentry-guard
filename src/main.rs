@@ -138,6 +138,16 @@ fn drop_privileges(json_enabled: bool) {
         std::process::exit(1);
     }
 
+    if let Err(e) = caps::set(None, CapSet::Inheritable, &structural_capabilities) {
+        eprintln!("Failed to set Inheritable capabilities: {:?}", e);
+        std::process::exit(1);
+    }
+
+    if let Err(e) = caps::set(None, CapSet::Ambient, &structural_capabilities) {
+        eprintln!("Failed to set Ambient capabilities: {:?}", e);
+        std::process::exit(1);
+    }
+
     logger::emit_log(
         "INFO",
         "initialization",
@@ -231,6 +241,8 @@ fn init_seccomp(json_enabled: bool) {
         "getsockopt",
         "uname", // Networking
         "prctl",
+        "getsockname",
+        "getpeername",
     ];
 
     for syscall_name in system_call_whitelist {

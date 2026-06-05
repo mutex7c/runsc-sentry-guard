@@ -84,17 +84,17 @@ vectors like kernel privilege escalations.
 
 ### 3.1 Required System Calls Matrix
 
-| Syscall Group          | Linux System Calls                                                                                           | Technical System Purpose                                                                                 |
-|------------------------|--------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------|
-| **Memory Protection**  | `brk`, `mmap`, `munmap`, `mprotect`, `madvise`                                                               | Essential memory allocation and stack layout initialization for the Rust compiled binary.                |
-| **File I/O Stream**    | `openat`, `read`, `write`, `close`, `lseek`, `fstat`, `newfstatat`, `statx`, `pread64`, `pwrite64`           | Used by the `tailer` module to poll, open, and read line-by-line streaming blocks from `.boot` files.    |
-| **Directory Polling**  | `getdents64`                                                                                                 | Used by the orchestrator loop to scan `/var/log/gvisor/` for the appearance of new sandbox files.        |
-| **Process Lifecycles** | `clone`, `clone3`, `execve`, `wait4`, `exit`, `exit_group`, `futex`, `sched_yield`, `set_robust_list`        | Spawns isolated worker threads, enforces mutex synchronization, and invokes child containment commands.  |
-| **IPC & Buffers**      | `pipe`, `pipe2`, `fcntl`, `ioctl`, `writev`, `readv`                                                         | Handles internal cross-thread state routing and standard output capturing from spawned processes.        |
-| **Timers & Async**     | `epoll_create1`, `epoll_ctl`, `epoll_wait`, `nanosleep`, `clock_nanosleep`                                   | Tick checking delays and 30-second worker thread inactivity decay timeout windows.                       |
-| **Signal Handling**    | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `rt_sigqueue`                                              | Allows the binary to gracefully register and respond to standard Linux termination triggers (`SIGTERM`). |
-| **Networking & HTTP**  | `socket`, `connect`, `bind`, `sendmsg`, `recvmsg`, `sendto`, `recvfrom`, `setsockopt`, `getsockopt`, `uname` | Native UDS container engine socket connections and curl Webhook dispatching.                             |
-| **Privilege Drops**    | `prctl`                                                                                                      | Drops ambient capabilities but retain root for DAC purposes.                                             |
+| Syscall Group          | Linux System Calls                                                                                                                         | Technical System Purpose                                                                                 |
+|------------------------|--------------------------------------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------|
+| **Memory Protection**  | `brk`, `mmap`, `munmap`, `mprotect`, `madvise`                                                                                             | Essential memory allocation and stack layout initialization for the Rust compiled binary.                |
+| **File I/O Stream**    | `openat`, `read`, `write`, `close`, `lseek`, `fstat`, `newfstatat`, `statx`, `pread64`, `pwrite64`                                         | Used by the `tailer` module to poll, open, and read line-by-line streaming blocks from `.boot` files.    |
+| **Directory Polling**  | `getdents64`                                                                                                                               | Used by the orchestrator loop to scan `/var/log/gvisor/` for the appearance of new sandbox files.        |
+| **Process Lifecycles** | `clone`, `clone3`, `execve`, `wait4`, `exit`, `exit_group`, `futex`, `sched_yield`, `set_robust_list`                                      | Spawns isolated worker threads, enforces mutex synchronization, and invokes child containment commands.  |
+| **IPC & Buffers**      | `pipe`, `pipe2`, `fcntl`, `ioctl`, `writev`, `readv`                                                                                       | Handles internal cross-thread state routing and standard output capturing from spawned processes.        |
+| **Timers & Async**     | `epoll_create1`, `epoll_ctl`, `epoll_wait`, `nanosleep`, `clock_nanosleep`                                                                 | Tick checking delays and 30-second worker thread inactivity decay timeout windows.                       |
+| **Signal Handling**    | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `rt_sigqueue`                                                                            | Allows the binary to gracefully register and respond to standard Linux termination triggers (`SIGTERM`). |
+| **Networking & HTTP**  | `socket`, `connect`, `bind`, `sendmsg`, `recvmsg`, `sendto`, `recvfrom`, `setsockopt`, `getsockopt`, `uname`, `getsockname`, `getpeername` | Native UDS container engine socket connections and curl Webhook dispatching.                             |
+| **Privilege Drops**    | `prctl`                                                                                                                                    | Drops ambient capabilities but retain root for DAC purposes.                                             |
 
 ### 3.2 Example Seccomp Filter Generation Script
 
@@ -114,6 +114,6 @@ allow {
     epoll_create1, epoll_ctl, epoll_wait, nanosleep, clock_nanosleep,
     rt_sigaction, rt_sigprocmask, rt_sigreturn, rt_sigqueue,
     socket, connect, bind, sendmsg, recvmsg, sendto, recvfrom, setsockopt, getsockopt, uname,
-    prctl, setresgid, setresuid
+    prctl, getsockname, getpeername
 }
 ```

@@ -59,10 +59,7 @@ fn main() {
             // Commit rigid Berkeley Packet Filters directly into active kernel execution space
             #[cfg(target_os = "linux")]
             init_seccomp(json_enabled);
-
-            // Compliance Fix: Issue systemd orchestration READY notify packets EXACTLY once at initialization success
-            notify_systemd_ready();
-
+            
             // Hand execution layers gracefully onto multithreaded monitoring handlers
             start_monitor_loop(valid_config);
         }
@@ -286,23 +283,4 @@ fn init_seccomp(json_enabled: bool) {
         "In-app system call rules committed. Boundary hard insulated against kernel privilege escalation.",
         json_enabled,
     );
-}
-
-// Emits the systemd startup synchronization notification packet.
-fn notify_systemd_ready() {
-    if let Ok(socket_path) = std::env::var("NOTIFY_SOCKET") {
-        if !socket_path.is_empty() {
-            use std::os::unix::net::UnixDatagram;
-
-            let resolved_path = if let Some(stripped) = socket_path.strip_prefix('@') {
-                format!("\0{}", stripped)
-            } else {
-                socket_path
-            };
-
-            if let Ok(socket) = UnixDatagram::unbound() {
-                let _ = socket.send_to(b"READY=1\n", resolved_path);
-            }
-        }
-    }
 }

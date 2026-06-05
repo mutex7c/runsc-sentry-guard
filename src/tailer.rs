@@ -36,7 +36,7 @@ pub fn start_monitor_loop(config: GuardConfig) {
     let docker_socket_path = config.monitor.docker_socket_path.clone();
     let watchdog_interval = config.monitor.systemd_watchdog_interval_ms;
 
-    // FIX: Spawn a dedicated, decoupled watchdog heartbeat thread
+    // Spawn a dedicated, decoupled watchdog heartbeat thread
     if watchdog_interval > 0 {
         thread::spawn(move || {
             loop {
@@ -119,6 +119,10 @@ pub fn start_monitor_loop(config: GuardConfig) {
     );
 
     let mut scratchpad_buffer = Vec::with_capacity(8192);
+
+    if mode == &IngestionMode::File {
+        notify_systemd_ready();
+    }
 
     loop {
         let log_dir_path = Path::new(&config.monitor.log_dir);
@@ -378,6 +382,9 @@ fn run_uds_server(
         );
         return;
     }
+
+    // The UDS socket is securely bound and ready for traffic
+    notify_systemd_ready();
 
     for stream in listener.incoming() {
         if let Ok(stream) = stream {
@@ -692,5 +699,24 @@ mod tests {
 
         let invalid_short = "--id=abc";
         assert!(!id_extractor.is_match(invalid_short), "SECURITY ALERT: Regex matched a malformed short ID");
+    }
+}
+
+// Emits the systemd startup synchronization notification packet.
+fn notify_systemd_ready() {
+    if let Ok(socket_path) = std::env::var("NOTIFY_SOCKET") {
+        if !socket_path.is_empty() {
+            use std::os::unix::net::UnixDatagram;
+
+            let resolved_path = if let Some(stripped) = socket_path.strip_prefix('@') {
+                format!("\0{}", stripped)
+            } else {
+                socket_path
+            };
+
+            if let Ok(socket) = UnixDatagram::unbound() {
+                let _ = socket.send_to(b"READY=1\n", resolved_path);
+            }
+        }
     }
 }

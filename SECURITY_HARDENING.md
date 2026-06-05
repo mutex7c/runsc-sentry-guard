@@ -72,9 +72,15 @@ Load the profile using: `sudo apparmor_parser -r /etc/apparmor.d/usr.sbin.runsc-
 
 ## 3. Strict Seccomp System Call Whitelist Reference
 
-If you choose to use an explicit system-level seccomp enforcement tool (such as `minijail`, a custom libseccomp wrapper, or an outer container runtime configuration) to bind the binary, it must be restricted to the following whitelist. This matrix perfectly matches the daemon's internal BPF compiler.
+If you choose to use an explicit system-level seccomp enforcement 
+tool (such as `minijail`, a custom libseccomp wrapper, or an outer 
+container runtime configuration) to bind the binary, it must be 
+restricted to the following whitelist. This matrix perfectly matches 
+the daemon's internal BPF compiler.
 
-Any system call outside of this strict operational matrix will result in an immediate `SIGSYS` kernel termination, blocking exploitation vectors like kernel privilege escalations.
+Any system call outside of this strict operational matrix will result 
+in an immediate `SIGSYS` kernel termination, blocking exploitation 
+vectors like kernel privilege escalations.
 
 ### 3.1 Required System Calls Matrix
 
@@ -88,7 +94,7 @@ Any system call outside of this strict operational matrix will result in an imme
 | **Timers & Async**     | `epoll_create1`, `epoll_ctl`, `epoll_wait`, `nanosleep`, `clock_nanosleep`                                   | Tick checking delays and 30-second worker thread inactivity decay timeout windows.                       |
 | **Signal Handling**    | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `rt_sigqueue`                                              | Allows the binary to gracefully register and respond to standard Linux termination triggers (`SIGTERM`). |
 | **Networking & HTTP**  | `socket`, `connect`, `bind`, `sendmsg`, `recvmsg`, `sendto`, `recvfrom`, `setsockopt`, `getsockopt`, `uname` | Native UDS container engine socket connections and curl Webhook dispatching.                             |
-| **Privilege Drops**    | `prctl`, `setresgid`, `setresuid`                                                                            | Permanently strips Root UID/GID to User 65534 to eliminate Discretionary Access Control (DAC) overrides. |
+| **Privilege Drops**    | `prctl`                                                                                                      | Drops ambient capabilities but retain root for DAC purposes.                                             |
 
 ### 3.2 Example Seccomp Filter Generation Script
 

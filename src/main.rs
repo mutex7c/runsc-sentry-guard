@@ -73,32 +73,23 @@ fn main() {
     }
 }
 
-// Permanently strips effective and ambient process capabilities strictly down to CAP_NET_ADMIN and sheds UID 0.
+// Permanently strips effective and ambient process capabilities strictly down to CAP_NET_ADMIN.
 #[cfg(target_os = "linux")]
 fn drop_privileges(json_enabled: bool) {
     use caps::{CapSet, Capability};
     use std::collections::HashSet;
 
-    // FIX: Complete Privilege Shedding to neutralize DAC Override
+    // Privilege Shedding to neutralize DAC Override
     unsafe {
-        // 1. Inform kernel to preserve permitted capability boundaries across the identity shift
+
+        // Inform kernel to preserve permitted capability boundaries across the identity shift
         if libc::prctl(libc::PR_SET_KEEPCAPS, 1, 0, 0, 0) != 0 {
             eprintln!("Fatal System Error: prctl(PR_SET_KEEPCAPS) invocation rejected by kernel.");
             std::process::exit(1);
         }
-
-        // 2. Drop execution identity to `nobody` user and group (UID/GID 65534)
-        if libc::setresgid(65534, 65534, 65534) != 0 {
-            eprintln!("Fatal System Error: Execution boundary failed to drop GID to 65534.");
-            std::process::exit(1);
-        }
-        if libc::setresuid(65534, 65534, 65534) != 0 {
-            eprintln!("Fatal System Error: Execution boundary failed to drop UID to 65534.");
-            std::process::exit(1);
-        }
     }
 
-    // 3. Clear all ambiently inherited privileges
+    // Clear all ambiently inherited privileges
     if let Err(e) = caps::clear(None, CapSet::Ambient) {
         eprintln!(
             "[WARN] Failed to wipe ambient initialization capabilities: {:?}",
@@ -109,7 +100,7 @@ fn drop_privileges(json_enabled: bool) {
     let mut structural_capabilities = HashSet::new();
     structural_capabilities.insert(Capability::CAP_NET_ADMIN);
 
-    // 4. Lock Permitted set to CAP_NET_ADMIN
+    // Lock Permitted set to CAP_NET_ADMIN
     if let Err(e) = caps::set(None, CapSet::Permitted, &structural_capabilities) {
         logger::emit_log(
             "ERROR",
@@ -128,7 +119,7 @@ fn drop_privileges(json_enabled: bool) {
         std::process::exit(1);
     }
 
-    // 5. Re-assert CAP_NET_ADMIN into the Effective execution set
+    // Re-assert CAP_NET_ADMIN into the Effective execution set
     if let Err(e) = caps::set(None, CapSet::Effective, &structural_capabilities) {
         logger::emit_log(
             "ERROR",
@@ -155,7 +146,7 @@ fn drop_privileges(json_enabled: bool) {
         None,
         Some("privilege_drop"),
         "SUCCESS",
-        "Process context shed UID 0 (root) and dropped DAC overrides. Boundary safely pinned to CAP_NET_ADMIN.",
+        "Process execution boundary safely pinned to CAP_NET_ADMIN.",
         json_enabled,
     );
 }
@@ -240,8 +231,6 @@ fn init_seccomp(json_enabled: bool) {
         "getsockopt",
         "uname", // Networking
         "prctl",
-        "setresgid",
-        "setresuid", // Identity Boundary Alteration (Required for privilege drop)
     ];
 
     for syscall_name in system_call_whitelist {

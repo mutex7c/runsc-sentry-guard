@@ -2,8 +2,6 @@
 
 The `runsc-sentry-guard` daemon ingests a declarative TOML file layout. The internal engine enforces strict schema validation at initialization; any unexpected properties or malformed parameters will immediately cause a safe startup abort.
 
----
-
 ## 1. Global Daemon Parameters (`[monitor]`)
 
 | Parameter Name                 | Data Type Expected                         | Description / Purpose                                                                                                                           |
@@ -19,9 +17,7 @@ The `runsc-sentry-guard` daemon ingests a declarative TOML file layout. The inte
 
 ## 2. Container Runtime Engine Configuration (`daemon.json`)
 
-For `runsc-sentry-guard` to receive high-fidelity system 
-call telemetry out-of-band, you must configure Docker/Podman 
-to instruct the runsc / gVisor supervisor to emit strace logs down to the host file system.
+For `runsc-sentry-guard` to receive high-fidelity system call telemetry out-of-band, you must configure Docker/Podman to instruct the runsc / gVisor supervisor to emit strace logs down to the host file system.
 
 Append or merge the following configuration block into your global `/etc/docker/daemon.json` file:
 
@@ -53,32 +49,44 @@ Append or merge the following configuration block into your global `/etc/docker/
 Every detection block under `[[rules]]` maps to a sequential `try_actions` list and a defensive `final_actions` fallback block.
 
 ### `validate_state`
+
 * **Parameters:** None
 * **System Action:** Validates that the container runtime still reports the context as actively running before invoking downstream mitigation modules.
 
 ### `pause` / `unpause` / `restart`
+
 * **Parameters:** None
 * **System Action:** Directly mutates the operational execution namespace of the target container ID.
 
 ### `log_json` / `log_critical`
+
 * **Parameters:** None
 * **System Action:** Forces an immediate, immutable audit payload entry out to the host standard output stream or journal.
 
 ### `commit_snapshot`
+
 * **Parameters:** `prefix` (String)
 * **System Action:** Commits the current volatile file layers of the container into an isolated local image registry tag matching: `<prefix>-<container_id>-<timestamp>`.
 
 ### `nft_blacklist`
+
 * **Parameters:** `set_name` (String), `timeout` (String)
 * **System Action:** Adds the container's resolved internal IP address directly into an active nftables set with an automatic kernel-level expiration drop window.
 
 ### `container_signal`
+
 * **Parameters:** `signal` (String)
 * **System Action:** Dispatches a native host-driven Linux signal override (e.g., `"SIGKILL"`, `"SIGSTOP"`) straight to the targeted task execution ring.
 
+### `webhook_alert`
+
+* **Parameters:** `url` (String)
+* **System Action:** Dispatches an automated HTTP POST request via native OS `curl` to the specified endpoint (e.g., Slack, Teams, or an enterprise SIEM) containing a JSON payload detailing the targeted container ID.
+
 ### `run_custom_script`
+
 * **Parameters:** `path` (String / File Path)
-* **System Action:** Spawns a dedicated subprocess execution of an external binary file, automatically injecting the targeted `container_id` string as the absolute first positional CLI argument (`$1`).
+* **System Action:** Spawns a dedicated subprocess execution of an external binary file, automatically injecting the targeted `container_id` string as the absolute first positional CLI argument (`$1`). Executes within a 15-second bounded polling loop.
 
 ## 4. Sample Automation Script Template
 
@@ -95,10 +103,4 @@ echo "[EXT-HOOK] Active Incident response loop triggered for Context: ${TARGET_C
 
 # Example Automation Action: Dump standard container logs to out-of-band space
 docker logs "${TARGET_CONTAINER_ID}" > "/var/log/forensics/incident-${TARGET_CONTAINER_ID}.log" 2>&1
-
-# Example Automation Action: Trigger notification events to a corporate SecOps web hook
-curl -X POST -H 'Content-type: application/json' \
-     --data "{\"text\":\"🚨 Runsc-Sentry-Guard dropped custom extension payload block onto container: ${TARGET_CONTAINER_ID}\"}" \
-     https://hooks.example.com/services/T00000000/B00000000/XXXXXXXXXXXXXXXXXXXXXXXX
-
 ```

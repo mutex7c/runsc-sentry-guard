@@ -45,22 +45,30 @@ fn execute_docker_uds_request(
     path: &str,
     body: Option<&str>,
 ) -> Result<(u16, String), String> {
-    use std::io::{BufReader, Read, Write};
+    use std::io::{BufRead, BufReader, Read, Write};
     use std::os::unix::net::UnixStream;
+    use std::time::Duration;
 
     let mut stream = UnixStream::connect("/var/run/docker.sock")
         .map_err(|e| format!("Docker Socket Connection Refused: {}", e))?;
 
+    // Safe boundary against Docker Engine hangs
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+
+    // Upgraded to HTTP/1.1 with explicit Host/Connection headers to standardize chunked responses
     let request_payload = if let Some(b) = body {
         format!(
-            "{} {} HTTP/1.0\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            "{} {} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
             method,
             path,
             b.len(),
             b
         )
     } else {
-        format!("{} {} HTTP/1.0\r\n\r\n", method, path)
+        format!(
+            "{} {} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            method, path
+        )
     };
 
     stream
@@ -68,31 +76,95 @@ fn execute_docker_uds_request(
         .map_err(|e| e.to_string())?;
     stream.flush().map_err(|e| e.to_string())?;
 
-    let mut response_raw = String::new();
-    let mut reader = BufReader::new(stream).take(65536);
-    reader
-        .read_to_string(&mut response_raw)
-        .map_err(|e| e.to_string())?;
+    let mut reader = BufReader::new(stream);
 
-    let response_parts: Vec<&str> = response_raw.splitn(2, "\r\n\r\n").collect();
-    if response_parts.is_empty() {
+    // Read status line
+    let mut status_line = String::new();
+    reader
+        .read_line(&mut status_line)
+        .map_err(|e| e.to_string())?;
+    if status_line.is_empty() {
         return Err("Received completely empty frame stream from Docker daemon socket.".into());
     }
 
-    let status_line = response_parts[0].lines().next().unwrap_or("");
     let status_code = status_line
         .split_whitespace()
         .nth(1)
         .and_then(|code| code.parse::<u16>().ok())
         .unwrap_or(500);
 
-    let payload = if response_parts.len() > 1 {
-        response_parts[1].to_string()
-    } else {
-        String::new()
-    };
+    let mut is_chunked = false;
+    let mut content_length: Option<usize> = None;
 
-    Ok((status_code, payload))
+    // Parse Headers
+    loop {
+        let mut line = String::new();
+        reader.read_line(&mut line).map_err(|e| e.to_string())?;
+        let trimmed = line.trim();
+
+        if trimmed.is_empty() {
+            break; // End of headers
+        }
+
+        let lower_line = trimmed.to_lowercase();
+        if lower_line.starts_with("transfer-encoding:") && lower_line.contains("chunked") {
+            is_chunked = true;
+        }
+        if lower_line.starts_with("content-length:") {
+            let parts: Vec<&str> = trimmed.splitn(2, ':').collect();
+            if parts.len() == 2 {
+                content_length = parts[1].trim().parse::<usize>().ok();
+            }
+        }
+    }
+
+    let mut body_payload = String::new();
+
+    // Native HTTP Chunked Body Decoder
+    if is_chunked {
+        loop {
+            let mut chunk_size_str = String::new();
+            reader
+                .read_line(&mut chunk_size_str)
+                .map_err(|e| e.to_string())?;
+
+            // Strip extensions (e.g. "1A; ext-name") and whitespace
+            let trimmed_size = chunk_size_str.split(';').next().unwrap_or("").trim();
+            if trimmed_size.is_empty() {
+                continue;
+            }
+
+            let chunk_size = usize::from_str_radix(trimmed_size, 16)
+                .map_err(|e| format!("Failed to parse chunk size: {}", e))?;
+
+            if chunk_size == 0 {
+                break; // End of stream
+            }
+
+            let mut chunk_buf = vec![0; chunk_size];
+            reader
+                .read_exact(&mut chunk_buf)
+                .map_err(|e| e.to_string())?;
+            body_payload.push_str(&String::from_utf8_lossy(&chunk_buf));
+
+            // Consume trailing CRLF
+            let mut crlf = vec![0; 2];
+            let _ = reader.read_exact(&mut crlf);
+        }
+    } else if let Some(len) = content_length {
+        // Safe bounded read if content-length is declared
+        let mut buf = vec![0; len];
+        reader.read_exact(&mut buf).map_err(|e| e.to_string())?;
+        body_payload = String::from_utf8_lossy(&buf).into_owned();
+    } else {
+        // Fallback for non-chunked, un-sized responses (relying on Connection: close)
+        reader
+            .take(65536)
+            .read_to_string(&mut body_payload)
+            .map_err(|e| e.to_string())?;
+    }
+
+    Ok((status_code, body_payload))
 }
 
 // Firewall Utilities: Gated to Linux to eliminate dead-code diagnostics on development hosts

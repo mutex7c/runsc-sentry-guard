@@ -55,10 +55,13 @@ Create `/etc/apparmor.d/usr.sbin.runsc-sentry-guard`:
   /var/log/gvisor/ r,
   /var/log/gvisor/** r,
   
-  # Allow execution of Docker and Nftables control commands
+  # Allow optional host control helpers used by response playbooks
   /usr/bin/docker rcx,
   /usr/sbin/nft rcx,
-  /usr/bin/curl rcx,
+
+  # Outbound TCP for native webhook_alert HTTP(S) delivery
+  network inet stream,
+  network inet6 stream,
   
   # Socket communication lines for Docker/Podman communication
   /var/run/docker.sock rw,
@@ -82,7 +85,7 @@ Two profiles are selected automatically from the configured rule actions:
 | Profile | When Used | Notes |
 |---------|-----------|-------|
 | `core` | Rules do not spawn external response tools. | Omits `execve` and process wait syscalls while allowing file/UDS ingestion, Docker Engine UDS requests, timers, logging, and worker synchronization. |
-| `automation-compatible` | Any rule uses `nft_blacklist`, `webhook_alert`, or `run_custom_script`. | Keeps seccomp enabled while allowing the broader syscall matrix needed by inherited `nft`, `curl`, or configured script processes. |
+| `automation-compatible` | Any rule uses `nft_blacklist` or `run_custom_script`. | Keeps seccomp enabled while allowing the broader syscall matrix needed by inherited `nft` or configured script processes. |
 
 Systemd `SystemCallFilter` remains a recommended outer supervisor layer, especially for native systemd deployments. The internal filter covers non-systemd environments such as minimal Docker or Alpine-style hosts where only the daemon binary and kernel seccomp support are available.
 

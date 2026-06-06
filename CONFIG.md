@@ -16,7 +16,7 @@ The `runsc-sentry-guard` daemon ingests a declarative TOML file layout. The inte
 | `seccomp_enabled`              | Boolean Flag                               | Enables the in-process Linux seccomp-bpf syscall filter after startup validation and capability trimming. Defaults to `true` on x86_64 Linux builds and `false` on unsupported build targets when omitted. |
 | `systemd_watchdog_interval_ms` | Unsigned 64-bit Integer                    | The periodic runtime heartbeat loop frequency for systemd deadlock health checks.                                                               |
 
-When `seccomp_enabled = true`, the daemon selects its syscall matrix from configured actions. Rules that only use native socket, file, and container-state operations run under the tighter core profile. Rules containing `nft_blacklist`, `webhook_alert`, or `run_custom_script` switch to the automation-compatible profile so inherited child processes such as `nft`, `curl`, or configured scripts can start without disabling seccomp entirely.
+When `seccomp_enabled = true`, the daemon selects its syscall matrix from configured actions. Rules that only use native socket, file, webhook, and container-state operations run under the tighter core profile. Rules containing `nft_blacklist` or `run_custom_script` switch to the automation-compatible profile so inherited child processes such as `nft` or configured scripts can start without disabling seccomp entirely.
 
 > ⚠️ **SECURITY WARNING: Ingestion Modes**
 > 
@@ -95,7 +95,7 @@ Every detection block under `[[rules]]` maps to a sequential `try_actions` list 
 ### `webhook_alert`
 
 * **Parameters:** `url` (String)
-* **System Action:** Dispatches an automated HTTP POST request via native OS `curl` to the specified endpoint (e.g., Slack, Teams, or an enterprise SIEM) containing a JSON payload detailing the targeted container ID.
+* **System Action:** Dispatches an automated HTTP(S) POST request via the in-process Rust client to the specified endpoint (e.g., Slack, Teams, or an enterprise SIEM) containing a JSON payload detailing the targeted container ID.
 
 ### `run_custom_script`
 

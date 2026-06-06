@@ -34,6 +34,7 @@ The daemon ingests a declarative TOML configuration layout mapping directly to s
   * `pause` / `unpause` / `restart`: Mutates container run-states out-of-band.
   * `container_signal`: Dispatches explicit Linux kernel termination overrides (e.g., `"SIGKILL"`, `"SIGSTOP"`).
   * `nft_blacklist`: Intercepts container routing by pushing resolved IP addresses into auto-expiring firewall drop tables.
+  * `webhook_alert`: Sends native in-process HTTP(S) JSON alerts without relying on external HTTP client packages.
   * `run_custom_script`: Spawns external automation scripts, automatically injecting the targeted container ID as the first positional argument (`$1`).
   * `log_json` / `log_critical`: Directs structured audit telemetry entries out to system logging streams.
 

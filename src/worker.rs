@@ -6,6 +6,8 @@ use crate::logger::emit_log;
 use ipnet::IpNet;
 use std::io::BufRead;
 use std::process::Command;
+use std::sync::OnceLock;
+use std::time::Duration;
 
 #[cfg(target_os = "linux")]
 use serde::Deserialize;
@@ -13,8 +15,8 @@ use serde::Deserialize;
 use std::collections::HashMap;
 #[cfg(target_os = "linux")]
 use std::net::IpAddr;
-#[cfg(target_os = "linux")]
-use std::sync::OnceLock;
+
+const WEBHOOK_TIMEOUT_SECS: u64 = 5;
 
 #[derive(Deserialize)]
 #[allow(non_snake_case)]
@@ -174,6 +176,57 @@ fn execute_docker_uds_request(
     Ok((status_code, body_payload))
 }
 
+fn webhook_agent() -> &'static ureq::Agent {
+    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+
+    AGENT.get_or_init(|| {
+        ureq::Agent::config_builder()
+            .timeout_global(Some(Duration::from_secs(WEBHOOK_TIMEOUT_SECS)))
+            .build()
+            .into()
+    })
+}
+
+fn build_webhook_payload(container_id: &str) -> String {
+    serde_json::json!({
+        "text": format!(
+            "🚨 [SENTRY-GUARD] Active containment pipeline triggered for container context: {}",
+            container_id
+        )
+    })
+    .to_string()
+}
+
+fn dispatch_webhook_alert(url: &str, container_id: &str) -> Result<(), String> {
+    let payload = build_webhook_payload(container_id);
+
+    let response = webhook_agent()
+        .post(url)
+        .content_type("application/json")
+        .send(payload.as_str())
+        .map_err(|e| match e {
+            ureq::Error::StatusCode(code) => {
+                format!("Webhook dispatch rejected by endpoint (HTTP {}).", code)
+            }
+            ureq::Error::BadUri(uri) => format!("Webhook URL rejected as invalid: {}", uri),
+            ureq::Error::HostNotFound => "Webhook host resolution failed.".to_string(),
+            ureq::Error::Timeout(_) => format!(
+                "Webhook dispatch exceeded {}-second execution boundary.",
+                WEBHOOK_TIMEOUT_SECS
+            ),
+            other => format!("Webhook dispatch failed: {}", other),
+        })?;
+
+    if response.status().is_success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Webhook dispatch rejected by endpoint (HTTP {}).",
+            response.status().as_u16()
+        ))
+    }
+}
+
 #[cfg(target_os = "linux")]
 pub fn is_ip_safe(target_ip: &IpAddr, whitelist: &[IpNet]) -> bool {
     whitelist.iter().any(|network| network.contains(target_ip))
@@ -249,31 +302,7 @@ fn execute_atomic_command(
     let _ = socket_path;
 
     match action {
-        AtomicAction::WebhookAlert { url } => {
-            let payload = format!(
-                "{{\\\"text\\\":\\\"🚨 [SENTRY-GUARD] Active containment pipeline triggered for container context: {}\\\"}}",
-                container_id
-            );
-
-            let s = Command::new("curl")
-                .args(&[
-                    "-X",
-                    "POST",
-                    "-H",
-                    "Content-type: application/json",
-                    "--data",
-                    &payload,
-                    url,
-                ])
-                .status()
-                .map_err(|e| e.to_string())?;
-
-            if s.success() {
-                Ok(())
-            } else {
-                Err("Webhook dispatch returned failure code.".into())
-            }
-        }
+        AtomicAction::WebhookAlert { url } => dispatch_webhook_alert(url, container_id),
 
         AtomicAction::RunCustomScript { path } => {
             #[cfg(target_os = "linux")]
@@ -707,8 +736,60 @@ fn emit_json_escalation_marker(container_id: &str, rule: &str, json_enabled: boo
 mod tests {
     use super::*;
     use ipnet::IpNet;
-    use std::io::Cursor;
-    use std::net::IpAddr;
+    use std::io::{BufRead, BufReader, Cursor, Read, Write};
+    use std::net::{IpAddr, TcpListener, TcpStream};
+    use std::thread;
+
+    fn read_http_request(mut stream: TcpStream, response_status: &'static str) -> String {
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut request = String::new();
+        let mut content_length = 0usize;
+
+        loop {
+            let mut line = String::new();
+            let bytes_read = reader.read_line(&mut line).unwrap();
+            if bytes_read == 0 {
+                break;
+            }
+
+            if line.to_ascii_lowercase().starts_with("content-length:")
+                && let Some((_, value)) = line.split_once(':')
+            {
+                content_length = value.trim().parse().unwrap();
+            }
+
+            request.push_str(&line);
+
+            if line == "\r\n" {
+                break;
+            }
+        }
+
+        if content_length > 0 {
+            let mut body = vec![0; content_length];
+            reader.read_exact(&mut body).unwrap();
+            request.push_str(&String::from_utf8(body).unwrap());
+        }
+
+        let response = format!(
+            "HTTP/1.1 {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            response_status
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+        request
+    }
+
+    fn spawn_webhook_server(response_status: &'static str) -> (String, thread::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/alert", listener.local_addr().unwrap());
+
+        let handle = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            read_http_request(stream, response_status)
+        });
+
+        (url, handle)
+    }
 
     #[test]
     fn test_is_ip_safe_evaluations() {
@@ -751,5 +832,69 @@ mod tests {
             result.unwrap_err(),
             "Buffer-bloat protection: HTTP line exceeded maximum bounded length"
         );
+    }
+
+    #[test]
+    fn test_webhook_payload_is_valid_json() {
+        let payload = build_webhook_payload("abcdef123456");
+        let parsed: serde_json::Value = serde_json::from_str(&payload).unwrap();
+
+        assert_eq!(
+            parsed["text"].as_str().unwrap(),
+            "🚨 [SENTRY-GUARD] Active containment pipeline triggered for container context: abcdef123456"
+        );
+    }
+
+    #[test]
+    fn test_webhook_alert_dispatches_native_json_post() {
+        let (url, handle) = spawn_webhook_server("204 No Content");
+        let action = AtomicAction::WebhookAlert { url };
+        let whitelist: Vec<IpNet> = Vec::new();
+
+        let result = execute_atomic_command(
+            &action,
+            "abcdef123456",
+            &whitelist,
+            "inet security_ops",
+            false,
+            "/tmp/no-container-socket",
+            "trigger",
+        );
+
+        assert!(result.is_ok(), "webhook dispatch failed: {:?}", result);
+
+        let request = handle.join().unwrap();
+        let lower_request = request.to_ascii_lowercase();
+
+        assert!(request.starts_with("POST /alert HTTP/1.1"));
+        assert!(lower_request.contains("content-type: application/json"));
+
+        let body = request.split("\r\n\r\n").nth(1).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(
+            parsed["text"].as_str().unwrap(),
+            "🚨 [SENTRY-GUARD] Active containment pipeline triggered for container context: abcdef123456"
+        );
+    }
+
+    #[test]
+    fn test_webhook_alert_reports_http_failure() {
+        let (url, handle) = spawn_webhook_server("500 Internal Server Error");
+        let action = AtomicAction::WebhookAlert { url };
+        let whitelist: Vec<IpNet> = Vec::new();
+
+        let error = execute_atomic_command(
+            &action,
+            "abcdef123456",
+            &whitelist,
+            "inet security_ops",
+            false,
+            "/tmp/no-container-socket",
+            "trigger",
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "Webhook dispatch rejected by endpoint (HTTP 500).");
+        let _ = handle.join().unwrap();
     }
 }

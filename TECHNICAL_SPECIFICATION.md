@@ -57,7 +57,7 @@ prefix = "forensic-snapshot"
 
 [[rules.try_actions]]
 type = "webhook_alert"
-url = "[https://hooks.example.com/services/T0000/B0000/XXXX](https://hooks.example.com/services/T0000/B0000/XXXX)"
+url = "https://hooks.example.com/services/T0000/B0000/XXXX"
 
 [[rules.try_actions]]
 type = "nft_blacklist"
@@ -99,8 +99,8 @@ The active profile is selected from the validated rule actions:
 
 | Profile | Selection Rule | Boundary |
 |---------|----------------|----------|
-| `core` | No rule uses `nft_blacklist`, `webhook_alert`, or `run_custom_script`. | Allows the daemon's Rust runtime, file/UDS ingestion, Docker Engine UDS requests, nftables-free actions, logging, timers, and worker thread synchronization. It does not allow `execve` or process wait syscalls. |
-| `automation-compatible` | Any rule uses `nft_blacklist`, `webhook_alert`, or `run_custom_script`. | Extends the core matrix with the process, file, signal, networking, and dynamic-loader syscalls needed by inherited child processes such as `nft`, `curl`, and configured response scripts. Seccomp remains active; it is not delegated solely to systemd. |
+| `core` | No rule uses `nft_blacklist` or `run_custom_script`. | Allows the daemon's Rust runtime, file/UDS ingestion, Docker Engine UDS requests, native HTTP(S) webhook delivery, nftables-free actions, logging, timers, and worker thread synchronization. It does not allow `execve` or process wait syscalls. |
+| `automation-compatible` | Any rule uses `nft_blacklist` or `run_custom_script`. | Extends the core matrix with the process, file, signal, networking, and dynamic-loader syscalls needed by inherited child processes such as `nft` and configured response scripts. Seccomp remains active; it is not delegated solely to systemd. |
 
 Docker state inspection and container lifecycle mutations use the configured Docker/Podman Unix Domain Socket directly. The daemon does not spawn `docker inspect`, `docker pause`, or related Docker CLI subprocesses.
 
@@ -117,7 +117,7 @@ The authoritative syscall allowlists live in `src/seccomp.rs`. The functional gr
 | **IPC Streams & Buffers** | `pipe`, `pipe2`, `eventfd2`, `fcntl`, `ioctl`, `readv`, `writev` | Standard IO setup, runtime coordination, and inherited child process descriptors. |
 | **Asynchronous Timers** | `epoll_create1`, `epoll_ctl`, `epoll_wait`, `epoll_pwait`, `nanosleep`, `clock_nanosleep`, `clock_gettime` | Polling cadence, socket waits, watchdog timing, and worker idle expiration. |
 | **System Signals** | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `tgkill`, `tkill` | Runtime signal handling, thread cancellation paths, and supervised termination. |
-| **Network Frameworks** | `socket`, `socketpair`, `connect`, `bind`, `listen`, `accept4`, `sendmsg`, `recvmsg`, `sendto`, `recvfrom`, `setsockopt`, `getsockopt`, `getsockname`, `getpeername` | Docker/Podman UDS requests, UDS ingestion, systemd notify datagrams, curl webhook delivery, and nftables netlink transactions. |
+| **Network Frameworks** | `socket`, `socketpair`, `connect`, `bind`, `listen`, `accept4`, `sendmsg`, `recvmsg`, `sendto`, `recvfrom`, `setsockopt`, `getsockopt`, `getsockname`, `getpeername` | Docker/Podman UDS requests, UDS ingestion, systemd notify datagrams, native webhook delivery, and nftables netlink transactions. |
 
 High-risk kernel mutation and introspection syscalls are intentionally omitted from both profiles, including `mount`, `umount2`, `pivot_root`, `chroot`, `setns`, `unshare`, `ptrace`, `bpf`, `perf_event_open`, `userfaultfd`, `io_uring_setup`, module loading, kexec, keyring mutation, reboot, and swap controls.
 

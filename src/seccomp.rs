@@ -26,14 +26,14 @@ pub fn install_for_config(config: &GuardConfig) -> Result<RuntimeSeccompProfile,
 }
 
 fn profile_for_config(config: &GuardConfig) -> RuntimeSeccompProfile {
-    let needs_external_process = config.rules.iter().any(|rule| {
+    let needs_automation_profile = config.rules.iter().any(|rule| {
         rule.try_actions
             .iter()
             .chain(rule.final_actions.iter())
             .any(action_requires_automation_profile)
     });
 
-    if needs_external_process {
+    if needs_automation_profile {
         RuntimeSeccompProfile::AutomationCompatible
     } else {
         RuntimeSeccompProfile::Core
@@ -43,9 +43,7 @@ fn profile_for_config(config: &GuardConfig) -> RuntimeSeccompProfile {
 fn action_requires_automation_profile(action: &AtomicAction) -> bool {
     matches!(
         action,
-        AtomicAction::NftBlacklist { .. }
-            | AtomicAction::RunCustomScript { .. }
-            | AtomicAction::WebhookAlert { .. }
+        AtomicAction::NftBlacklist { .. } | AtomicAction::RunCustomScript { .. }
     )
 }
 
@@ -426,6 +424,11 @@ mod tests {
     fn core_profile_selected_without_child_process_actions() {
         let config = guard_with_actions(vec![AtomicAction::ValidateState, AtomicAction::Pause]);
         assert_eq!(profile_for_config(&config), RuntimeSeccompProfile::Core);
+
+        let config = guard_with_actions(vec![AtomicAction::WebhookAlert {
+            url: "https://hooks.example.invalid".to_string(),
+        }]);
+        assert_eq!(profile_for_config(&config), RuntimeSeccompProfile::Core);
     }
 
     #[test]
@@ -441,14 +444,6 @@ mod tests {
         let config = guard_with_actions(vec![AtomicAction::NftBlacklist {
             set_name: "container_blacklist".to_string(),
             timeout: "24h".to_string(),
-        }]);
-        assert_eq!(
-            profile_for_config(&config),
-            RuntimeSeccompProfile::AutomationCompatible
-        );
-
-        let config = guard_with_actions(vec![AtomicAction::WebhookAlert {
-            url: "https://hooks.example.invalid".to_string(),
         }]);
         assert_eq!(
             profile_for_config(&config),

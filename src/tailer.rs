@@ -337,7 +337,7 @@ pub fn start_monitor_loop(config: GuardConfig) {
                                 &table,
                                 json_enabled,
                                 &docker_socket_path,
-                                true
+                                true,
                             );
                         }
 
@@ -519,7 +519,7 @@ fn handle_uds_stream(
                     &table,
                     json_enabled,
                     &docker_socket_path,
-                    false
+                    false,
                 );
             }
             Err(_) => break,
@@ -624,7 +624,12 @@ fn dispatch_to_worker(
         worker_tx
     });
 
-    match tx.try_send((try_actions, final_actions, rule_name.clone(), trigger_message)) {
+    match tx.try_send((
+        try_actions,
+        final_actions,
+        rule_name.clone(),
+        trigger_message,
+    )) {
         Ok(_) => {}
         Err(TrySendError::Full(_)) => {
             emit_log(
@@ -739,16 +744,28 @@ mod tests {
         let id_extractor = Regex::new(r"--id=\b([a-fA-F0-9]{12}|[a-fA-F0-9]{64})\b").unwrap();
 
         let valid_64 = "--id=a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
-        assert!(id_extractor.is_match(valid_64), "Regex failed to match valid 64-char ID");
+        assert!(
+            id_extractor.is_match(valid_64),
+            "Regex failed to match valid 64-char ID"
+        );
 
         let valid_12 = "--id=a1b2c3d4e5f6";
-        assert!(id_extractor.is_match(valid_12), "Regex failed to match valid 12-char ID");
+        assert!(
+            id_extractor.is_match(valid_12),
+            "Regex failed to match valid 12-char ID"
+        );
 
         let invalid_spoof = "--id=a1b2c3d4e5f67890a";
-        assert!(!id_extractor.is_match(invalid_spoof), "SECURITY ALERT: Regex matched an unbounded invalid spoof ID");
+        assert!(
+            !id_extractor.is_match(invalid_spoof),
+            "SECURITY ALERT: Regex matched an unbounded invalid spoof ID"
+        );
 
         let invalid_short = "--id=abc";
-        assert!(!id_extractor.is_match(invalid_short), "SECURITY ALERT: Regex matched a malformed short ID");
+        assert!(
+            !id_extractor.is_match(invalid_short),
+            "SECURITY ALERT: Regex matched a malformed short ID"
+        );
     }
 }
 

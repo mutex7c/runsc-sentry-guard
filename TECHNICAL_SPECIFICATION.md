@@ -37,6 +37,7 @@ check_interval_ms = 1000
 ip_whitelist = ["127.0.0.1/32", "10.11.11.0/24", "192.168.3.0/24"]
 nftables_default_table = "inet security_ops"
 json_logging_enabled = true
+seccomp_enabled = true
 systemd_watchdog_interval_ms = 5000
 
 [[rules]]
@@ -84,24 +85,41 @@ timeout = "168h"
 
 *Note: The configuration schema supports `type = "kill"` as a functional runtime alias, mapping seamlessly onto the internal `ContainerSignal` data structure via Serde token aliases.*
 
-## 3. Native In-Application Seccomp Sandbox Filter Blueprint
+## 3. Native In-Application Seccomp-BPF Runtime
 
-To enforce defense-in-depth security independent of external system configuration layers, the daemon’s main loop compiles a rigid Berkeley Packet Filter (BPF) system call whitelist directly into the active kernel ring immediately upon boot.
+The daemon installs an internal Linux seccomp-bpf filter by default on x86_64 Linux builds, the architecture currently covered by the native syscall table. The filter is loaded after configuration validation and POSIX capability trimming, but before the monitor loop creates watchdog, UDS, or per-container worker threads. All later daemon threads and child processes inherit this kernel-enforced boundary.
 
-Any system call outside of this strict operational matrix will trigger an immediate `SIGSYS` kernel termination trap, locking down the daemon process if it experiences memory corruption or unauthorized code injection.
+The configuration flag `seccomp_enabled` defaults to `true` on x86_64 Linux and `false` on unsupported build targets when omitted. Setting it to `false` disables only the in-process filter and emits a startup warning; systemd and AppArmor hardening remain separate supervisor/MAC controls. Explicitly setting it to `true` on an unsupported architecture fails closed during startup.
 
-### 3.1 Strict System Call Whitelist Matrix
+Any syscall outside the selected allowlist returns a `SIGSYS` seccomp trap. An unexpected syscall ABI architecture triggers immediate process termination.
 
-| Syscall Functional Domain | Explicit Whitelisted Linux System Calls                                                                      | Technical Engine Purpose / Execution Context                                                                                                                |
-|---------------------------|--------------------------------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| **Memory Protection**     | `brk`, `mmap`, `munmap`, `mprotect`, `madvise`                                                               | Required by the Rust allocator layer to manage stack setups and initialize page allocations safely.                                                         |
-| **Secure File Handling**  | `openat`, `read`, `write`, `close`, `lseek`, `fstat`, `newfstatat`, `statx`, `pread64`, `pwrite64`           | Utilized by the file tailer loop to map directory file descriptors and parse bounded chunks of `.boot` streams.                                             |
-| **Directory Traversals**  | `getdents64`                                                                                                 | Required by the master orchestrator directory crawler loop to scan for new log files.                                                                       |
-| **Process Lifecycles**    | `clone`, `clone3`, `execve`, `wait4`, `exit`, `exit_group`, `futex`, `sched_yield`, `set_robust_list`        | Spawns isolated worker threads, enforces mutex synchronization, and invokes child containment commands.                                                     |
-| **IPC Streams & Buffers** | `pipe`, `pipe2`, `fcntl`, `ioctl`, `writev`, `readv`                                                         | Handles asynchronous standard stream redirections and coordinates thread mailboxes securely.                                                                |
-| **Asynchronous Timers**   | `epoll_create1`, `epoll_ctl`, `epoll_wait`, `nanosleep`, `clock_nanosleep`                                   | Used to tick checking delays and calculate the 30-second worker thread inactivity decay timeout window.                                                     |
-| **System Signals**        | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `rt_sigqueue`                                              | Allows the runtime engine to respond gracefully to process manager termination requests (`SIGTERM`).                                                        |
-| **Network Frameworks**    | `socket`, `connect`, `bind`, `sendmsg`, `recvmsg`, `sendto`, `recvfrom`, `setsockopt`, `getsockopt`, `uname` | **Strict child-process boundaries:** Required to preserve the structural viability of downstream `curl`, `docker inspect`, and `nftables` netlink commands. |
+### 3.1 Runtime Profile Selection
+
+The active profile is selected from the validated rule actions:
+
+| Profile | Selection Rule | Boundary |
+|---------|----------------|----------|
+| `core` | No rule uses `nft_blacklist`, `webhook_alert`, or `run_custom_script`. | Allows the daemon's Rust runtime, file/UDS ingestion, Docker Engine UDS requests, nftables-free actions, logging, timers, and worker thread synchronization. It does not allow `execve` or process wait syscalls. |
+| `automation-compatible` | Any rule uses `nft_blacklist`, `webhook_alert`, or `run_custom_script`. | Extends the core matrix with the process, file, signal, networking, and dynamic-loader syscalls needed by inherited child processes such as `nft`, `curl`, and configured response scripts. Seccomp remains active; it is not delegated solely to systemd. |
+
+Docker state inspection and container lifecycle mutations use the configured Docker/Podman Unix Domain Socket directly. The daemon does not spawn `docker inspect`, `docker pause`, or related Docker CLI subprocesses.
+
+### 3.2 Seccomp Syscall Matrix
+
+The authoritative syscall allowlists live in `src/seccomp.rs`. The functional groups are:
+
+| Syscall Functional Domain | Representative Linux System Calls | Technical Engine Purpose / Execution Context |
+|---------------------------|-----------------------------------|----------------------------------------------|
+| **Memory Protection** | `brk`, `mmap`, `munmap`, `mprotect`, `mremap`, `madvise` | Rust allocator, thread stacks, dynamic loader mappings, and safe page lifecycle management. |
+| **Secure File Handling** | `openat`, `openat2`, `read`, `write`, `close`, `close_range`, `lseek`, `fstat`, `newfstatat`, `statx`, `pread64`, `pwrite64` | Directory scanning, `.boot` stream reads, configuration access, inherited child binary loading, and bounded IO. |
+| **Directory Traversals** | `getdents`, `getdents64` | Master file-mode crawler and dynamic loader directory reads. |
+| **Thread & Process Lifecycles** | `clone`, `clone3`, `exit`, `exit_group`, `futex`, `set_tid_address`, `set_robust_list`, `rseq` | Worker threads, synchronization, and clean process shutdown. The automation-compatible profile additionally permits `execve`, `execveat`, `fork`, `vfork`, `wait4`, and `waitid`. |
+| **IPC Streams & Buffers** | `pipe`, `pipe2`, `eventfd2`, `fcntl`, `ioctl`, `readv`, `writev` | Standard IO setup, runtime coordination, and inherited child process descriptors. |
+| **Asynchronous Timers** | `epoll_create1`, `epoll_ctl`, `epoll_wait`, `epoll_pwait`, `nanosleep`, `clock_nanosleep`, `clock_gettime` | Polling cadence, socket waits, watchdog timing, and worker idle expiration. |
+| **System Signals** | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `tgkill`, `tkill` | Runtime signal handling, thread cancellation paths, and supervised termination. |
+| **Network Frameworks** | `socket`, `socketpair`, `connect`, `bind`, `listen`, `accept4`, `sendmsg`, `recvmsg`, `sendto`, `recvfrom`, `setsockopt`, `getsockopt`, `getsockname`, `getpeername` | Docker/Podman UDS requests, UDS ingestion, systemd notify datagrams, curl webhook delivery, and nftables netlink transactions. |
+
+High-risk kernel mutation and introspection syscalls are intentionally omitted from both profiles, including `mount`, `umount2`, `pivot_root`, `chroot`, `setns`, `unshare`, `ptrace`, `bpf`, `perf_event_open`, `userfaultfd`, `io_uring_setup`, module loading, kexec, keyring mutation, reboot, and swap controls.
 
 ## Appendix: High-Performance Unix Domain Socket (UDS) Server Spec
 

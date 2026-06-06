@@ -55,8 +55,14 @@ pub struct MonitorConfig {
     pub nftables_default_table: String,
     pub json_logging_enabled: bool,
     pub docker_socket_path: String,
+    #[serde(default = "default_seccomp_enabled")]
+    pub seccomp_enabled: bool,
     // FIX: Removed dead_code allowance; property is now actively consumed by the dedicated heartbeat thread.
     pub systemd_watchdog_interval_ms: u64,
+}
+
+fn default_seccomp_enabled() -> bool {
+    cfg!(all(target_os = "linux", target_arch = "x86_64"))
 }
 
 // Threat Identification Rules Mapping Signatures to Incident Containment Playbooks.
@@ -149,6 +155,7 @@ mod tests {
 
         assert_eq!(config.monitor.mode, IngestionMode::File);
         assert_eq!(config.monitor.docker_socket_path, "/var/run/docker.sock");
+        assert!(config.monitor.seccomp_enabled);
         assert_eq!(config.rules.len(), 1);
         assert_eq!(config.rules[0].name, "test_rule");
 
@@ -159,6 +166,10 @@ mod tests {
     fn test_load_config_missing_file_handling() {
         let result = load_config("/path/that/absolutely/does/not/exist/config.toml");
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Configuration missing, inaccessible, or tampered"));
+        assert!(
+            result
+                .unwrap_err()
+                .contains("Configuration missing, inaccessible, or tampered")
+        );
     }
 }

@@ -4,6 +4,7 @@
 use crate::config::AtomicAction;
 use crate::logger::emit_log;
 use ipnet::IpNet;
+use std::io::BufRead;
 use std::process::Command;
 
 #[cfg(target_os = "linux")]
@@ -281,7 +282,10 @@ fn execute_atomic_command(
                 if ips.is_empty() {
                     "UNKNOWN_IP".to_string()
                 } else {
-                    ips.iter().map(|ip| ip.to_string()).collect::<Vec<_>>().join(",")
+                    ips.iter()
+                        .map(|ip| ip.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
                 }
             };
 
@@ -361,11 +365,14 @@ fn execute_atomic_command(
                 match infrastructure_action {
                     AtomicAction::ValidateState => {
                         let endpoint = format!("/containers/{}/json", container_id);
-                        let (status, json_payload) = execute_docker_uds_request("GET", &endpoint, None, socket_path)?;
+                        let (status, json_payload) =
+                            execute_docker_uds_request("GET", &endpoint, None, socket_path)?;
 
                         if status == 200 {
                             // Verify the container is actually still running, not just dead/exited
-                            if json_payload.contains("\"Running\": true") || json_payload.contains("\"Running\":true") {
+                            if json_payload.contains("\"Running\": true")
+                                || json_payload.contains("\"Running\":true")
+                            {
                                 emit_log(
                                     "INFO",
                                     "worker_engine",
@@ -382,7 +389,10 @@ fn execute_atomic_command(
                                 Err("Container is no longer in a running state. Aborting containment to prevent TOCTOU misfires.".into())
                             }
                         } else {
-                            Err(format!("State validation rejected (HTTP {}). Container likely terminated.", status))
+                            Err(format!(
+                                "State validation rejected (HTTP {}). Container likely terminated.",
+                                status
+                            ))
                         }
                     }
 

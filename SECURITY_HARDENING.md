@@ -27,10 +27,13 @@ CapabilityBoundingSet=CAP_NET_ADMIN
 AmbientCapabilities=CAP_NET_ADMIN
 NoNewPrivileges=true
 
-# System Call Filters (Built-in Seccomp engine)
+# Supervisor System Call Filters
+SystemCallArchitectures=native
 SystemCallFilter=@system-service
-SystemCallFilter=~@privileged @resources @mount
+SystemCallFilter=~@mount @module @raw-io @reboot @swap
 ```
+
+Avoid a blanket `SystemCallFilter=~@privileged` rule for this daemon. That group includes `capset`, which is required during early startup while the process trims itself down to `CAP_NET_ADMIN`; the internal seccomp-bpf filter is installed immediately after that step.
 
 ## 2. AppArmor Security Profile
 
@@ -70,13 +73,17 @@ Create `/etc/apparmor.d/usr.sbin.runsc-sentry-guard`:
 
 Load the profile using: `sudo apparmor_parser -r /etc/apparmor.d/usr.sbin.runsc-sentry-guard`
 
-## 3. Seccomp Architecture Note
+## 3. Internal Seccomp-BPF Architecture
 
-Earlier alpha versions of this daemon attempted to compile an internal `libseccomp` BPF 
-filter natively. This was removed to support external mitigation playbooks 
-(like spawning `curl` and `nft`), which require broad, unpredictable system 
-call matrices (DNS resolution, SSL loading, Netlink sockets).
+The daemon now installs an in-process Linux seccomp-bpf filter by default on x86_64 Linux builds via `seccomp_enabled = true`. The filter is loaded after configuration validation and capability trimming, before monitor threads or worker threads are created, so all later daemon threads inherit the same kernel boundary. Unsupported architectures default to `seccomp_enabled = false`; explicitly enabling seccomp there fails closed during startup until an architecture-specific syscall table is added.
 
-Syscall sandboxing is now exclusively delegated to the Systemd `SystemCallFilter` profiles 
-defined in the provided service unit.
-```
+Two profiles are selected automatically from the configured rule actions:
+
+| Profile | When Used | Notes |
+|---------|-----------|-------|
+| `core` | Rules do not spawn external response tools. | Omits `execve` and process wait syscalls while allowing file/UDS ingestion, Docker Engine UDS requests, timers, logging, and worker synchronization. |
+| `automation-compatible` | Any rule uses `nft_blacklist`, `webhook_alert`, or `run_custom_script`. | Keeps seccomp enabled while allowing the broader syscall matrix needed by inherited `nft`, `curl`, or configured script processes. |
+
+Systemd `SystemCallFilter` remains a recommended outer supervisor layer, especially for native systemd deployments. The internal filter covers non-systemd environments such as minimal Docker or Alpine-style hosts where only the daemon binary and kernel seccomp support are available.
+
+To disable the internal filter for emergency compatibility testing, set `seccomp_enabled = false` in `[monitor]`. Production deployments should leave it enabled and adjust response playbooks rather than relying on a disabled syscall boundary.

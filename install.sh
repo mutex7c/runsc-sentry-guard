@@ -84,6 +84,9 @@ ProtectControlGroups=yes
 ProtectKernelModules=yes
 ProtectKernelTunables=yes
 PrivateTmp=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@mount @module @raw-io @reboot @swap
 
 [Install]
 WantedBy=multi-user.target

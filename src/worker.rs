@@ -360,18 +360,30 @@ fn execute_atomic_command(
             {
                 match infrastructure_action {
                     AtomicAction::ValidateState => {
-                        emit_log(
-                            "INFO",
-                            "worker_engine",
-                            None,
-                            Some(container_id),
-                            None,
-                            Some("validate_state"),
-                            "SKIPPED",
-                            "ValidateState bypassed. Relying natively on downstream atomic Docker API mutations to prevent TOCTOU race conditions.",
-                            json_enabled,
-                        );
-                        Ok(())
+                        let endpoint = format!("/containers/{}/json", container_id);
+                        let (status, json_payload) = execute_docker_uds_request("GET", &endpoint, None, socket_path)?;
+
+                        if status == 200 {
+                            // Verify the container is actually still running, not just dead/exited
+                            if json_payload.contains("\"Running\": true") || json_payload.contains("\"Running\":true") {
+                                emit_log(
+                                    "INFO",
+                                    "worker_engine",
+                                    None,
+                                    Some(container_id),
+                                    None,
+                                    Some("validate_state"),
+                                    "SUCCESS",
+                                    "Container state verified as active. Proceeding with containment pipeline.",
+                                    json_enabled,
+                                );
+                                Ok(())
+                            } else {
+                                Err("Container is no longer in a running state. Aborting containment to prevent TOCTOU misfires.".into())
+                            }
+                        } else {
+                            Err(format!("State validation rejected (HTTP {}). Container likely terminated.", status))
+                        }
                     }
 
                     AtomicAction::Pause => {

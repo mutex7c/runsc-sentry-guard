@@ -152,6 +152,30 @@ pub fn start_monitor_loop(config: GuardConfig) {
             }
         }
 
+        // File Spoofing Mitigation: Strict Directory Ownership & Permission Audit
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if let Ok(metadata) = log_dir_path.metadata() {
+                // Ensure UID 0 (root) ownership and block world-writable (0o002) access
+                if metadata.uid() != 0 || (metadata.mode() & 0o002) != 0 {
+                    emit_log(
+                        "CRITICAL",
+                        "orchestrator",
+                        None,
+                        None,
+                        None,
+                        Some("directory_audit"),
+                        "HALTED",
+                        "Log directory is not owned by root or is world-writable. File mode suspended to prevent spoofing.",
+                        json_enabled,
+                    );
+                    thread::sleep(Duration::from_millis(config.monitor.check_interval_ms));
+                    continue;
+                }
+            }
+        }
+
         let mut actively_seen_paths = HashSet::new();
 
         if let Ok(entries) = fs::read_dir(log_dir_path) {
@@ -313,6 +337,7 @@ pub fn start_monitor_loop(config: GuardConfig) {
                                 &table,
                                 json_enabled,
                                 &docker_socket_path,
+                                true
                             );
                         }
 
@@ -494,6 +519,7 @@ fn handle_uds_stream(
                     &table,
                     json_enabled,
                     &docker_socket_path,
+                    false
                 );
             }
             Err(_) => break,
@@ -510,6 +536,7 @@ fn evaluate_line_signatures(
     table: &str,
     json_enabled: bool,
     docker_socket_path: &str,
+    is_from_file: bool,
 ) {
     for (rule_name, rx, try_act, final_act) in rules.iter() {
         if rx.is_match(line) {
@@ -517,10 +544,16 @@ fn evaluate_line_signatures(
                 if let Some(matched_id) = caps.get(1) {
                     let container_id = matched_id.as_str().to_string();
 
+                    // TOCTOU Mitigation: Force ValidateState for all disk-based telemetry
+                    let mut active_try = try_act.clone();
+                    if is_from_file && active_try.first() != Some(&AtomicAction::ValidateState) {
+                        active_try.insert(0, AtomicAction::ValidateState);
+                    }
+
                     dispatch_to_worker(
                         registry,
                         container_id,
-                        try_act.clone(),
+                        active_try,
                         final_act.clone(),
                         rule_name.clone(),
                         whitelist,

@@ -15,6 +15,17 @@ The `runsc-sentry-guard` daemon ingests a declarative TOML file layout. The inte
 | `json_logging_enabled`         | Boolean Flag                               | Toggles terminal output logs between clean plain-text and structured SIEM JSON payloads.                                                        |
 | `systemd_watchdog_interval_ms` | Unsigned 64-bit Integer                    | The periodic runtime heartbeat loop frequency for systemd deadlock health checks.                                                               |
 
+> ⚠️ **SECURITY WARNING: Ingestion Modes**
+> 
+> While `mode = "file"` is supported for legacy setups or lightweight testing environments, 
+> it inherently relies on host disk polling. This introduces a slight latency window 
+> (Time-of-Check to Time-of-Use) and a theoretical log spoofing risk if an attacker manages 
+> to compromise the `/var/log/gvisor/` directory permissions.
+>
+> The daemon enforces strict directory auditing and mandatory state validation to mitigate 
+> this, but **for all production deployments, `mode = "socket"` is strictly recommended** 
+> to guarantee sub-millisecond, tamper-proof, out-of-band mitigation.
+ 
 ## 2. Container Runtime Engine Configuration (`daemon.json`)
 
 For `runsc-sentry-guard` to receive high-fidelity system call telemetry out-of-band, you must configure Docker/Podman to instruct the runsc / gVisor supervisor to emit strace logs down to the host file system.

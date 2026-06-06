@@ -8,6 +8,7 @@ use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -25,7 +26,8 @@ struct LogDescriptor {
     position: u64,
 }
 
-type WorkerChannelMessage = (Vec<AtomicAction>, Vec<AtomicAction>, String);
+// Added the trigger string to the worker channel message
+type WorkerChannelMessage = (Vec<AtomicAction>, Vec<AtomicAction>, String, String);
 type RegistryMap = HashMap<String, SyncSender<WorkerChannelMessage>>;
 
 pub fn start_monitor_loop(config: GuardConfig) {
@@ -330,7 +332,6 @@ pub fn start_monitor_loop(config: GuardConfig) {
 
         file_state_tracker.retain(|path_key, _| actively_seen_paths.contains(path_key));
         first_run = false;
-        // FIX: Removed the redundant watchdog call from the blocking directory loop.
         thread::sleep(Duration::from_millis(config.monitor.check_interval_ms));
     }
 }
@@ -386,8 +387,19 @@ fn run_uds_server(
     // The UDS socket is securely bound and ready for traffic
     notify_systemd_ready();
 
+    // Prevent Unbounded OS Thread Creation DoS
+    let active_connections = Arc::new(AtomicUsize::new(0));
+    const MAX_UDS_CONNECTIONS: usize = 50;
+
     for stream in listener.incoming() {
         if let Ok(stream) = stream {
+            if active_connections.load(Ordering::SeqCst) >= MAX_UDS_CONNECTIONS {
+                continue;
+            }
+
+            active_connections.fetch_add(1, Ordering::SeqCst);
+            let conn_tracker = Arc::clone(&active_connections);
+
             let reg_clone = Arc::clone(&registry);
             let rules_clone = Arc::clone(&regex_rules);
             let id_clone = id_extractor.clone();
@@ -406,6 +418,7 @@ fn run_uds_server(
                     json_enabled,
                     ds_path_clone,
                 );
+                conn_tracker.fetch_sub(1, Ordering::SeqCst);
             });
         }
     }
@@ -514,6 +527,7 @@ fn evaluate_line_signatures(
                         table,
                         json_enabled,
                         docker_socket_path,
+                        line.to_string(),
                     );
                 }
             }
@@ -531,6 +545,7 @@ fn dispatch_to_worker(
     table: &str,
     json_enabled: bool,
     docker_socket_path: &str,
+    trigger_message: String,
 ) {
     const MAX_WORKERS: usize = 100;
 
@@ -576,7 +591,7 @@ fn dispatch_to_worker(
         worker_tx
     });
 
-    match tx.try_send((try_actions, final_actions, rule_name.clone())) {
+    match tx.try_send((try_actions, final_actions, rule_name.clone(), trigger_message)) {
         Ok(_) => {}
         Err(TrySendError::Full(_)) => {
             emit_log(
@@ -620,7 +635,7 @@ fn run_worker_lifecycle(
 
     loop {
         match rx_chan.recv_timeout(timeout_dur) {
-            Ok((try_cmds, final_cmds, rule)) => {
+            Ok((try_cmds, final_cmds, rule, trigger_msg)) => {
                 execute_containment_pipeline(
                     container_id.clone(),
                     try_cmds,
@@ -630,6 +645,7 @@ fn run_worker_lifecycle(
                     json_enabled,
                     rule,
                     docker_socket_path.clone(),
+                    trigger_msg,
                 );
             }
             Err(_) => {
@@ -638,7 +654,7 @@ fn run_worker_lifecycle(
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
 
                 match rx_chan.try_recv() {
-                    Ok((try_cmds, final_cmds, rule)) => {
+                    Ok((try_cmds, final_cmds, rule, trigger_msg)) => {
                         drop(reg);
 
                         execute_containment_pipeline(
@@ -650,6 +666,7 @@ fn run_worker_lifecycle(
                             json_enabled,
                             rule,
                             docker_socket_path.clone(),
+                            trigger_msg,
                         );
                     }
                     Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => {

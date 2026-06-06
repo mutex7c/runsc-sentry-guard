@@ -242,6 +242,7 @@ fn execute_atomic_command(
     table: &str,
     json_enabled: bool,
     socket_path: &str,
+    trigger_message: &str,
 ) -> Result<(), String> {
     let _ = whitelist;
     let _ = socket_path;
@@ -274,8 +275,23 @@ fn execute_atomic_command(
         }
 
         AtomicAction::RunCustomScript { path } => {
+            #[cfg(target_os = "linux")]
+            let resolved_ip = {
+                let ips = resolve_container_ips(container_id, json_enabled, socket_path);
+                if ips.is_empty() {
+                    "UNKNOWN_IP".to_string()
+                } else {
+                    ips.iter().map(|ip| ip.to_string()).collect::<Vec<_>>().join(",")
+                }
+            };
+
+            #[cfg(not(target_os = "linux"))]
+            let resolved_ip = "127.0.0.1".to_string();
+
             let mut child = Command::new(path)
                 .arg(container_id)
+                .arg(&resolved_ip)
+                .arg(trigger_message)
                 .spawn()
                 .map_err(|e| format!("Failed to spawn automation extension subprocess: {}", e))?;
 
@@ -592,6 +608,7 @@ pub fn execute_containment_pipeline(
     json_enabled: bool,
     rule_name: String,
     socket_path: String,
+    trigger_message: String,
 ) {
     let mut pipeline_failed = false;
 
@@ -603,6 +620,7 @@ pub fn execute_containment_pipeline(
             &table,
             json_enabled,
             &socket_path,
+            &trigger_message,
         ) {
             emit_log(
                 "WARN",
@@ -631,6 +649,7 @@ pub fn execute_containment_pipeline(
                 &table,
                 json_enabled,
                 &socket_path,
+                &trigger_message,
             ) {
                 emit_log(
                     "CRITICAL",

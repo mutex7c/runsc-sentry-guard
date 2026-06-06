@@ -70,50 +70,13 @@ Create `/etc/apparmor.d/usr.sbin.runsc-sentry-guard`:
 
 Load the profile using: `sudo apparmor_parser -r /etc/apparmor.d/usr.sbin.runsc-sentry-guard`
 
-## 3. Strict Seccomp System Call Whitelist Reference
+## 3. Seccomp Architecture Note
 
-If you choose to use an explicit system-level seccomp enforcement 
-tool (such as `minijail`, a custom libseccomp wrapper, or an outer 
-container runtime configuration) to bind the binary, it must be 
-restricted to the following whitelist. This matrix perfectly matches 
-the daemon's internal BPF compiler.
+Earlier alpha versions of this daemon attempted to compile an internal `libseccomp` BPF 
+filter natively. This was removed to support external mitigation playbooks 
+(like spawning `curl` and `nft`), which require broad, unpredictable system 
+call matrices (DNS resolution, SSL loading, Netlink sockets).
 
-Any system call outside of this strict operational matrix will result 
-in an immediate `SIGSYS` kernel termination, blocking exploitation 
-vectors like kernel privilege escalations.
-
-### 3.1 Required System Calls Matrix
-
-| Syscall Group          | Linux System Calls                                                                                                                         | Technical System Purpose                                                                                 |
-|------------------------|--------------------------------------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------|
-| **Memory Protection**  | `brk`, `mmap`, `munmap`, `mprotect`, `madvise`                                                                                             | Essential memory allocation and stack layout initialization for the Rust compiled binary.                |
-| **File I/O Stream**    | `openat`, `read`, `write`, `close`, `lseek`, `fstat`, `newfstatat`, `statx`, `pread64`, `pwrite64`                                         | Used by the `tailer` module to poll, open, and read line-by-line streaming blocks from `.boot` files.    |
-| **Directory Polling**  | `getdents64`                                                                                                                               | Used by the orchestrator loop to scan `/var/log/gvisor/` for the appearance of new sandbox files.        |
-| **Process Lifecycles** | `clone`, `clone3`, `execve`, `wait4`, `exit`, `exit_group`, `futex`, `sched_yield`, `set_robust_list`                                      | Spawns isolated worker threads, enforces mutex synchronization, and invokes child containment commands.  |
-| **IPC & Buffers**      | `pipe`, `pipe2`, `fcntl`, `ioctl`, `writev`, `readv`                                                                                       | Handles internal cross-thread state routing and standard output capturing from spawned processes.        |
-| **Timers & Async**     | `epoll_create1`, `epoll_ctl`, `epoll_wait`, `nanosleep`, `clock_nanosleep`                                                                 | Tick checking delays and 30-second worker thread inactivity decay timeout windows.                       |
-| **Signal Handling**    | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `rt_sigqueue`                                                                            | Allows the binary to gracefully register and respond to standard Linux termination triggers (`SIGTERM`). |
-| **Networking & HTTP**  | `socket`, `connect`, `bind`, `sendmsg`, `recvmsg`, `sendto`, `recvfrom`, `setsockopt`, `getsockopt`, `uname`, `getsockname`, `getpeername` | Native UDS container engine socket connections and curl Webhook dispatching.                             |
-| **Privilege Drops**    | `prctl`                                                                                                                                    | Drops ambient capabilities but retain root for DAC purposes.                                             |
-
-### 3.2 Example Seccomp Filter Generation Script
-
-To generate a raw BPF file or test these constraints using a standard `libseccomp` profile compiler, ensure your rule blueprint mirrors this logic layout:
-
-```text
-# Default Policy: Deny everything that isn't explicitly permitted
-action KILL;
-
-# Permitted execution profiles
-allow {
-    brk, mmap, munmap, mprotect, madvise,
-    openat, read, write, close, lseek, fstat, newfstatat, statx, pread64, pwrite64,
-    getdents64,
-    clone, clone3, execve, wait4, exit, exit_group, futex, sched_yield, set_robust_list,
-    pipe, pipe2, fcntl, ioctl, writev, readv,
-    epoll_create1, epoll_ctl, epoll_wait, nanosleep, clock_nanosleep,
-    rt_sigaction, rt_sigprocmask, rt_sigreturn, rt_sigqueue,
-    socket, connect, bind, sendmsg, recvmsg, sendto, recvfrom, setsockopt, getsockopt, uname,
-    prctl, getsockname, getpeername
-}
+Syscall sandboxing is now exclusively delegated to the Systemd `SystemCallFilter` profiles 
+defined in the provided service unit.
 ```

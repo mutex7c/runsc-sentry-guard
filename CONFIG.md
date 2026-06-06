@@ -86,7 +86,7 @@ Every detection block under `[[rules]]` maps to a sequential `try_actions` list 
 ### `run_custom_script`
 
 * **Parameters:** `path` (String / File Path)
-* **System Action:** Spawns a dedicated subprocess execution of an external binary file, automatically injecting the targeted `container_id` string as the absolute first positional CLI argument (`$1`). Executes within a 15-second bounded polling loop.
+* **System Action:** Spawns a dedicated subprocess execution of an external binary file, automatically injecting runtime context as positional arguments: `$1` (Container ID), `$2` (Resolved Target IP), and `$3` (Raw Trigger Log Message). Executes within a 15-second bounded polling loop.
 
 ## 4. Sample Automation Script Template
 
@@ -96,10 +96,14 @@ When invoking `run_custom_script`, ensure the script begins with a standard shel
 #!/bin/bash
 set -euo pipefail
 
-# Capture the positional argument emitted by the daemon loop
+# Capture the positional arguments emitted by the daemon loop
 TARGET_CONTAINER_ID="${1}"
+INTRUDER_IP="${2}"
+RAW_LOG_TRIGGER="${3}"
 
 echo "[EXT-HOOK] Active Incident response loop triggered for Context: ${TARGET_CONTAINER_ID}"
+echo "[EXT-HOOK] Offending IP Address: ${INTRUDER_IP}"
+echo "[EXT-HOOK] Raw Log Signature Match: ${RAW_LOG_TRIGGER}"
 
 # Example Automation Action: Dump standard container logs to out-of-band space
 docker logs "${TARGET_CONTAINER_ID}" > "/var/log/forensics/incident-${TARGET_CONTAINER_ID}.log" 2>&1

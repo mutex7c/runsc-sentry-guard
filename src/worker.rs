@@ -67,7 +67,6 @@ fn execute_docker_uds_request(
     use std::os::unix::net::UnixStream;
     use std::time::Duration;
 
-    // FIX: Client connects dynamically to the path passed from configuration routing
     let mut stream = UnixStream::connect(socket_path).map_err(|e| {
         format!(
             "Container Engine Socket Connection Refused at {}: {}",
@@ -114,7 +113,7 @@ fn execute_docker_uds_request(
     let mut is_chunked = false;
     let mut content_length: Option<usize> = None;
 
-    // Mitigate infinite header streaming thread locks
+    // FIX: Enforced a hard loop ceiling for header processing to prevent streaming slowloris-style thread hangs
     let mut header_count = 0;
     const MAX_HTTP_HEADERS: usize = 100;
 
@@ -140,7 +139,6 @@ fn execute_docker_uds_request(
                 content_length = parts[1].trim().parse::<usize>().ok();
             }
         }
-
         header_count += 1;
     }
 
@@ -162,7 +160,6 @@ fn execute_docker_uds_request(
                 break;
             }
 
-            // Defend against massive single chunk OOM allocations
             if chunk_size > MAX_UDS_PAYLOAD_SIZE
                 || body_payload.len() + chunk_size > MAX_UDS_PAYLOAD_SIZE
             {
@@ -182,7 +179,6 @@ fn execute_docker_uds_request(
             let _ = reader.read_exact(&mut crlf);
         }
     } else if let Some(len) = content_length {
-        // Defend against malicious Content-Length headers causing immediate OOM panics
         if len > MAX_UDS_PAYLOAD_SIZE {
             return Err(format!(
                 "SECURITY ABORT: Content-Length {} exceeds maximum allowed UDS payload limit of {} bytes.",
@@ -193,7 +189,6 @@ fn execute_docker_uds_request(
         reader.read_exact(&mut buf).map_err(|e| e.to_string())?;
         body_payload = String::from_utf8_lossy(&buf).into_owned();
     } else {
-        // Clamp the fallback reader stream to protect against streaming slowloris-style flooding
         reader
             .take(MAX_UDS_PAYLOAD_SIZE as u64)
             .read_to_string(&mut body_payload)
@@ -280,27 +275,32 @@ fn execute_atomic_command(
     match action {
         AtomicAction::WebhookAlert { url } => {
             let payload = format!(
-                "{{\\\"text\\\":\\\"🚨 [SENTRY-GUARD] Active containment pipeline triggered for container context: {}\\\"}}",
+                "{{\"text\":\"🚨 [SENTRY-GUARD] Active containment pipeline triggered for container context: {}\"}}",
                 container_id
             );
 
+            // Invoke host-native curl safely.
+            // --max-time 5 prevents slowloris/hanging connections from starving the worker thread pool.
+            // Arguments are passed as literal string slices, entirely eliminating shell injection vulnerabilities.
             let s = Command::new("curl")
                 .args(&[
-                    "-X",
-                    "POST",
-                    "-H",
-                    "Content-type: application/json",
-                    "--data",
-                    &payload,
+                    "-X", "POST",
+                    "-H", "Content-Type: application/json",
+                    "--max-time", "5",
+                    "--connect-timeout", "3",
+                    "--data", &payload,
                     url,
                 ])
                 .status()
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| format!("Failed to invoke system curl binary: {}", e))?;
 
             if s.success() {
                 Ok(())
             } else {
-                Err("Webhook dispatch returned failure code.".into())
+                Err(format!(
+                    "Webhook dispatch failed. curl exited with non-zero status code: {:?}",
+                    s.code()
+                ))
             }
         }
 
@@ -398,7 +398,6 @@ fn execute_atomic_command(
                             execute_docker_uds_request("GET", &endpoint, None, socket_path)?;
 
                         if status == 200 {
-                            // Verify the container is actually still running, not just dead/exited
                             if json_payload.contains("\"Running\": true")
                                 || json_payload.contains("\"Running\":true")
                             {
@@ -558,52 +557,31 @@ fn execute_atomic_command(
             {
                 match infrastructure_action {
                     AtomicAction::ValidateState => {
-                        println!(
-                            "[DEV-MOCK] Verifying runtime operational status for ID: {}",
-                            container_id
-                        );
+                        println!("[DEV-MOCK] Verifying runtime operational status for ID: {}", container_id);
                         Ok(())
                     }
                     AtomicAction::Pause => {
-                        println!(
-                            "[DEV-MOCK] Injecting out-of-band container namespace FREEZE on ID: {}",
-                            container_id
-                        );
+                        println!("[DEV-MOCK] Injecting out-of-band container namespace FREEZE on ID: {}", container_id);
                         Ok(())
                     }
                     AtomicAction::Unpause => {
-                        println!(
-                            "[DEV-MOCK] Releasing container namespace FREEZE mutation execution on ID: {}",
-                            container_id
-                        );
+                        println!("[DEV-MOCK] Releasing container namespace FREEZE mutation execution on ID: {}", container_id);
                         Ok(())
                     }
                     AtomicAction::Restart => {
-                        println!(
-                            "[DEV-MOCK] Dispatching rolling container runtime reboot signature to ID: {}",
-                            container_id
-                        );
+                        println!("[DEV-MOCK] Dispatching rolling container runtime reboot signature to ID: {}", container_id);
                         Ok(())
                     }
                     AtomicAction::CommitSnapshot { prefix } => {
-                        println!(
-                            "[DEV-MOCK] Committing container snapshot to register using tag: {}-{}",
-                            prefix, container_id
-                        );
+                        println!("[DEV-MOCK] Committing container snapshot to register using tag: {}-{}", prefix, container_id);
                         Ok(())
                     }
                     AtomicAction::ContainerSignal { signal } => {
-                        println!(
-                            "[DEV-MOCK] Injecting kernel process termination signal [{}] straight to target ID: {}",
-                            signal, container_id
-                        );
+                        println!("[DEV-MOCK] Injecting kernel process termination signal [{}] straight to target ID: {}", signal, container_id);
                         Ok(())
                     }
                     AtomicAction::NftBlacklist { set_name, timeout } => {
-                        println!(
-                            "[DEV-MOCK] Appending element drop logic -> Table: {}, Set: {}, Duration: {}",
-                            table, set_name, timeout
-                        );
+                        println!("[DEV-MOCK] Appending element drop logic -> Table: {}, Set: {}, Duration: {}", table, set_name, timeout);
                         Ok(())
                     }
                     _ => unreachable!(),
@@ -650,20 +628,16 @@ fn execute_firewall_mutation(
     }
 }
 
-// src/worker.rs
-
 #[derive(Deserialize)]
 #[cfg(target_os = "linux")]
 struct DockerContainerListResponse {
     Id: String,
 }
 
-// Fetches all running container IDs in a single, lightweight IPC call
 #[cfg(target_os = "linux")]
 pub fn fetch_running_container_ids(socket_path: &str) -> std::collections::HashSet<String> {
     use std::collections::HashSet;
 
-    // GET /containers/json maps to running containers
     match execute_docker_uds_request("GET", "/containers/json", None, socket_path) {
         Ok((status, json_payload)) if status == 200 => {
             if let Ok(parsed) =
@@ -811,7 +785,6 @@ mod tests {
 
     #[test]
     fn test_execute_uds_request_length_boundary_violation() {
-        // Simulates an HTTP response header payload carrying a malicious 1 GB length statement
         let malformed_http_response = "HTTP/1.1 200 OK\r\nContent-Length: 1073741824\r\n\r\n";
         let mut cursor = Cursor::new(malformed_http_response);
 
@@ -824,7 +797,7 @@ mod tests {
             .parse::<u16>()
             .unwrap();
 
-        let mut content_length: Option<usize> = Some(1073741824);
+        let content_length: Option<usize> = Some(1073741824);
 
         let evaluation_result = if let Some(len) = content_length {
             if len > MAX_UDS_PAYLOAD_SIZE {

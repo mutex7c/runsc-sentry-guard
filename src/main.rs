@@ -66,23 +66,21 @@ fn main() {
     }
 }
 
-// Permanently strips effective and ambient process capabilities strictly down to CAP_NET_ADMIN.
+// Permanently strips root identity (UID 0) and clips process capabilities strictly down to CAP_NET_ADMIN.
 #[cfg(target_os = "linux")]
 fn drop_privileges(json_enabled: bool) {
     use caps::{CapSet, Capability};
     use std::collections::HashSet;
 
-    // Privilege Shedding to neutralize DAC Override
+    // Phase 1: Inform kernel to preserve permitted capability boundaries across the identity shift
     unsafe {
-
-        // Inform kernel to preserve permitted capability boundaries across the identity shift
         if libc::prctl(libc::PR_SET_KEEPCAPS, 1, 0, 0, 0) != 0 {
             eprintln!("Fatal System Error: prctl(PR_SET_KEEPCAPS) invocation rejected by kernel.");
             std::process::exit(1);
         }
     }
 
-    // Clear all ambiently inherited privileges
+    // Clear all ambiently inherited privileges prior to seeding constraints
     if let Err(e) = caps::clear(None, CapSet::Ambient) {
         eprintln!(
             "[WARN] Failed to wipe ambient initialization capabilities: {:?}",
@@ -93,7 +91,7 @@ fn drop_privileges(json_enabled: bool) {
     let mut structural_capabilities = HashSet::new();
     structural_capabilities.insert(Capability::CAP_NET_ADMIN);
 
-    // Lock Permitted set to CAP_NET_ADMIN
+    // Phase 2: Secure Permitted and Inheritable caps while still running as root
     if let Err(e) = caps::set(None, CapSet::Permitted, &structural_capabilities) {
         logger::emit_log(
             "ERROR",
@@ -112,7 +110,34 @@ fn drop_privileges(json_enabled: bool) {
         std::process::exit(1);
     }
 
-    // Re-assert CAP_NET_ADMIN into the Effective execution set
+    if let Err(e) = caps::set(None, CapSet::Inheritable, &structural_capabilities) {
+        eprintln!("Failed to set Inheritable capabilities: {:?}", e);
+        std::process::exit(1);
+    }
+
+    // Phase 3: Shed root user identity (UID 0) permanently by transitioning to 'nobody' (65534)
+    unsafe {
+        let target_uid = 65534; // nobody
+        let target_gid = 65534; // nobody
+
+        if libc::setresgid(target_gid, target_gid, target_gid) != 0 ||
+            libc::setresuid(target_uid, target_uid, target_uid) != 0 {
+            logger::emit_log(
+                "ERROR",
+                "initialization",
+                None,
+                None,
+                None,
+                Some("privilege_drop"),
+                "CRASH",
+                "Fatal security failure: Identity shift to unprivileged user (nobody) rejected.",
+                json_enabled,
+            );
+            std::process::exit(1);
+        }
+    }
+
+    // Phase 4: Re-assert CAP_NET_ADMIN into Effective and Ambient sets (cleared natively on UID swap)
     if let Err(e) = caps::set(None, CapSet::Effective, &structural_capabilities) {
         logger::emit_log(
             "ERROR",
@@ -123,7 +148,7 @@ fn drop_privileges(json_enabled: bool) {
             Some("privilege_drop"),
             "CRASH",
             &format!(
-                "Fatal security boundary breakdown lowering effective sets: {:?}",
+                "Fatal security boundary breakdown establishing effective sets post identity shift: {:?}",
                 e
             ),
             json_enabled,
@@ -131,13 +156,8 @@ fn drop_privileges(json_enabled: bool) {
         std::process::exit(1);
     }
 
-    if let Err(e) = caps::set(None, CapSet::Inheritable, &structural_capabilities) {
-        eprintln!("Failed to set Inheritable capabilities: {:?}", e);
-        std::process::exit(1);
-    }
-
     if let Err(e) = caps::set(None, CapSet::Ambient, &structural_capabilities) {
-        eprintln!("Failed to set Ambient capabilities: {:?}", e);
+        eprintln!("Failed to re-assert Ambient capabilities post identity shift: {:?}", e);
         std::process::exit(1);
     }
 
@@ -149,7 +169,7 @@ fn drop_privileges(json_enabled: bool) {
         None,
         Some("privilege_drop"),
         "SUCCESS",
-        "Process execution boundary safely pinned to CAP_NET_ADMIN.",
+        "Process identity dropped to nobody (UID 65534); security scope pinned strictly to CAP_NET_ADMIN.",
         json_enabled,
     );
 }

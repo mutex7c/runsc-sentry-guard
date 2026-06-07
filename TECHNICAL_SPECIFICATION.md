@@ -89,11 +89,9 @@ timeout = "168h"
 
 *Note: The configuration schema supports `type = "kill"` as a functional runtime alias, mapping seamlessly onto the internal `ContainerSignal` data structure via Serde token aliases.*
 
-## 3. Native In-Application Seccomp Sandbox Filter Blueprint
+## 3. System Call Sandboxing Control
 
-To enforce defense-in-depth security independent of external system configuration layers, the daemon’s main loop compiles a rigid Berkeley Packet Filter (BPF) system call whitelist directly into the active kernel ring immediately upon boot.
-
-Any system call outside of this strict operational matrix will trigger an immediate `SIGSYS` kernel termination trap, locking down the daemon process if it experiences memory corruption or unauthorized code injection.
+To support dynamic external mitigation playbooks (such as executing netlink hooks or spawning out-of-band notification subprocesses), in-application seccomp compilation has been deprecated. Process boundary restrictions and system call sandboxing are exclusively delegated to the host's process supervisor via systemd `SystemCallFilter` profiles.
 
 ### 3.1 Strict System Call Whitelist Matrix
 

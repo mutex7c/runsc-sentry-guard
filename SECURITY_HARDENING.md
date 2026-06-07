@@ -33,7 +33,7 @@ SystemCallFilter=@system-service
 SystemCallFilter=~@mount @module @raw-io @reboot @swap
 ```
 
-Avoid a blanket `SystemCallFilter=~@privileged` rule for this daemon. That group includes `capset`, which is required during early startup while the process trims itself down to `CAP_NET_ADMIN`; the internal seccomp-bpf filter is installed immediately after that step.
+Avoid adding a blanket `SystemCallFilter=~@privileged` rule unless every configured response playbook has been tested under it. That systemd group blocks identity, capability, and privileged helper syscalls that external response tools or custom scripts may legitimately need. Use the tighter internal seccomp-bpf profile selection as the daemon's default syscall boundary.
 
 ## 2. AppArmor Security Profile
 
@@ -87,3 +87,18 @@ Two profiles are selected automatically from the configured rule actions:
 Systemd `SystemCallFilter` remains a recommended outer supervisor layer, especially for native systemd deployments. The internal filter covers non-systemd environments such as minimal Docker or Alpine-style hosts where only the daemon binary and kernel seccomp support are available.
 
 To disable the internal filter for emergency compatibility testing, set `seccomp_enabled = false` in `[monitor]`. Production deployments should leave it enabled and adjust response playbooks rather than relying on a disabled syscall boundary.
+
+## 4. Architectural Note: Execution Identity & DAC
+
+Earlier alpha versions of this daemon attempted to perform an internal identity shift
+upon boot—dropping from `root` to an unprivileged user (`nobody`) while attempting
+to retain `CAP_NET_ADMIN` internally.
+
+However, Linux Discretionary Access Control (DAC) requires standard `root` group
+ownership to interact with the container engine Unix Domain Socket (`/var/run/docker.sock`)
+and to reliably read privileged sandbox streams (`/var/log/gvisor/`). Attempting to strip DAC overrides fundamentally broke the daemon's core ingestion and state-validation mechanisms.
+
+Consequently, internal capability manipulation has been explicitly removed. The
+daemon **must** execute as standard `root` (UID 0). All capability bounding
+(restricting the process strictly to `CAP_NET_ADMIN`) and file-system jailing
+must be delegated to the `systemd` supervisor or AppArmor profiles as defined above.

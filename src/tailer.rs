@@ -1,21 +1,26 @@
 // Ingestion Pipeline Engine
 // Operates high-performance file tailers and parallel UDS socket tracking pipelines cleanly.
+// Features active DoS-resistant TOCTOU mitigations and SO_PEERCRED trust boundaries.
 
 use regex::Regex;
-use std::collections::{HashMap, HashSet};
-use std::fs::{self, OpenOptions};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock}; // RwLock handles matrix validation and registry mapping
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
+use std::ffi::{CString, OsStr};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
+use std::os::unix::io::{AsRawFd, FromRawFd};
 
 use crate::config::{AtomicAction, GuardConfig, IngestionMode};
 use crate::logger::emit_log;
@@ -26,9 +31,21 @@ struct LogDescriptor {
     position: u64,
 }
 
-// Added the trigger string to the worker channel message
 type WorkerChannelMessage = (Vec<AtomicAction>, Vec<AtomicAction>, String, String);
 type RegistryMap = HashMap<String, SyncSender<WorkerChannelMessage>>;
+
+// Anti-DoS State Engine controlling the TOCTOU synchronous lookup fallback
+#[allow(dead_code)]
+struct AntiDosState {
+    negative_cache: HashSet<String>,
+    negative_queue: VecDeque<String>,
+    tokens: u32,
+    last_refill: Instant,
+}
+
+#[allow(dead_code)]
+const MAX_NEGATIVE_CACHE: usize = 1000;
+const MAX_LOOKUP_TOKENS: u32 = 10; // Max API queries per second for unknown IDs
 
 pub fn start_monitor_loop(config: GuardConfig) {
     let mode = &config.monitor.mode;
@@ -48,7 +65,133 @@ pub fn start_monitor_loop(config: GuardConfig) {
         });
     }
 
-    let worker_registry: Arc<Mutex<RegistryMap>> = Arc::new(Mutex::new(HashMap::new()));
+    // Initialize the shared thread-safe container ID cache
+    let active_containers = Arc::new(RwLock::new(HashSet::<String>::new()));
+
+    // Initialize the DoS mitigation state
+    let anti_dos_state = Arc::new(Mutex::new(AntiDosState {
+        negative_cache: HashSet::new(),
+        negative_queue: VecDeque::new(),
+        tokens: MAX_LOOKUP_TOKENS,
+        last_refill: Instant::now(),
+    }));
+
+    // Detached event-driven background thread utilizing zero-delay socket streaming context
+    #[cfg(target_os = "linux")]
+    {
+        let cache_clone = Arc::clone(&active_containers);
+        let ds_path = docker_socket_path.clone();
+
+        thread::spawn(move || {
+            use std::io::Write;
+
+            // 1. Initial Seeding Call to eliminate cold-start visibility race windows
+            let initial_ids = crate::worker::fetch_running_container_ids(&ds_path);
+            if let Ok(mut guard) = cache_clone.write() {
+                *guard = initial_ids;
+            }
+
+            // Target container filter query string explicitly tracking asset creation and destruction
+            let stream_endpoint = "/events?filters=%7B%22type%22%3A%5B%22container%22%5D%2C%22event%22%3A%5B%22start%22%2C%22die%22%5D%7D";
+
+            loop {
+                if let Ok(mut stream) = UnixStream::connect(&ds_path) {
+                    let request = format!(
+                        "GET {} HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n",
+                        stream_endpoint
+                    );
+
+                    if stream.write_all(request.as_bytes()).is_ok() {
+                        let mut reader = BufReader::new(stream);
+                        let mut status_ok = false;
+                        let mut is_chunked = false;
+                        let mut header_count = 0;
+
+                        // Parse HTTP response headers safely up to a strict line ceiling
+                        while header_count < 100 {
+                            let mut header_line = String::new();
+                            if reader.read_line(&mut header_line).is_err() {
+                                break;
+                            }
+                            let trimmed = header_line.trim();
+                            if trimmed.is_empty() {
+                                break;
+                            }
+                            if header_line.starts_with("HTTP/1.1 200")
+                                || header_line.starts_with("HTTP/1.0 200")
+                            {
+                                status_ok = true;
+                            }
+                            let lower = trimmed.to_lowercase();
+                            if lower.starts_with("transfer-encoding:") && lower.contains("chunked")
+                            {
+                                is_chunked = true;
+                            }
+                            header_count += 1;
+                        }
+
+                        // Stream processing loop with native HTTP chunk-unwrapping
+                        if status_ok && is_chunked {
+                            let mut chunk_size_buf = String::new();
+
+                            loop {
+                                chunk_size_buf.clear();
+                                if reader.read_line(&mut chunk_size_buf).is_err() {
+                                    break;
+                                }
+                                let trimmed_size = chunk_size_buf.trim();
+                                if trimmed_size.is_empty() {
+                                    continue;
+                                }
+
+                                // Convert hex chunk sizes directly to byte lengths
+                                let chunk_size = match usize::from_str_radix(trimmed_size, 16) {
+                                    Ok(size) => size,
+                                    Err(_) => break,
+                                };
+
+                                if chunk_size == 0 {
+                                    break; // Stream termination boundary reached
+                                }
+
+                                let mut chunk_buf = vec![0u8; chunk_size];
+                                if reader.read_exact(&mut chunk_buf).is_err() {
+                                    break;
+                                }
+
+                                // Consume trailing carriage return line feeds bound to chunk limits
+                                let mut crlf = [0u8; 2];
+                                if reader.read_exact(&mut crlf).is_err() {
+                                    break;
+                                }
+
+                                let payload_str = String::from_utf8_lossy(&chunk_buf);
+                                for line in payload_str.lines() {
+                                    if let Ok(event) = serde_json::from_str::<
+                                        crate::worker::DockerEventPayload,
+                                    >(line)
+                                    {
+                                        if let Ok(mut guard) = cache_clone.write() {
+                                            if event.action == "start" {
+                                                guard.insert(event.actor.id);
+                                            } else if event.action == "die" {
+                                                guard.remove(&event.actor.id);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // Secure connection retry backing delay handling socket crashes gracefully
+                thread::sleep(Duration::from_secs(1));
+            }
+        });
+    }
+
+    let worker_registry: Arc<RwLock<RegistryMap>> = Arc::new(RwLock::new(HashMap::new()));
+
     let regex_compiled: Arc<Vec<(String, Regex, Vec<AtomicAction>, Vec<AtomicAction>)>> = Arc::new(
         config
             .rules
@@ -77,6 +220,8 @@ pub fn start_monitor_loop(config: GuardConfig) {
         let uds_whitelist = whitelist.clone();
         let uds_table = table.clone();
         let uds_socket_path = docker_socket_path.clone();
+        let uds_cache = Arc::clone(&active_containers);
+        let uds_anti_dos = Arc::clone(&anti_dos_state);
 
         thread::spawn(move || {
             run_uds_server(
@@ -87,6 +232,8 @@ pub fn start_monitor_loop(config: GuardConfig) {
                 uds_table,
                 json_enabled,
                 uds_socket_path,
+                uds_cache,
+                uds_anti_dos,
             );
         });
     }
@@ -119,8 +266,6 @@ pub fn start_monitor_loop(config: GuardConfig) {
         "Master directory tailer and Unix socket pipelines active.",
         json_enabled,
     );
-
-    let mut scratchpad_buffer = Vec::with_capacity(8192);
 
     if mode == &IngestionMode::File {
         notify_systemd_ready();
@@ -157,7 +302,6 @@ pub fn start_monitor_loop(config: GuardConfig) {
         {
             use std::os::unix::fs::MetadataExt;
             if let Ok(metadata) = log_dir_path.metadata() {
-                // Ensure UID 0 (root) ownership and block world-writable (0o002) access
                 if metadata.uid() != 0 || (metadata.mode() & 0o002) != 0 {
                     emit_log(
                         "CRITICAL",
@@ -216,10 +360,7 @@ pub fn start_monitor_loop(config: GuardConfig) {
                     }
 
                     #[cfg(unix)]
-                    let file_result = OpenOptions::new()
-                        .read(true)
-                        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                        .open(&path);
+                    let file_result = open_log_safe(log_dir_path, path.file_name().unwrap());
 
                     #[cfg(not(unix))]
                     let file_result = fs::File::open(&path);
@@ -252,93 +393,72 @@ pub fn start_monitor_loop(config: GuardConfig) {
                             continue;
                         }
 
+                        // 64 KB Line-bounded streaming evaluator. Defeats truncation padding while preventing context leakage.
+                        const MAX_LINE_SIZE: usize = 65536;
+                        let mut stream_buffer = vec![0u8; MAX_LINE_SIZE * 2];
+                        let mut buffer_len = 0;
+
                         loop {
-                            scratchpad_buffer.clear();
-                            let mut reached_eof = false;
-                            let mut exceeded_limit = false;
+                            let bytes_read = match reader.read(&mut stream_buffer[buffer_len..]) {
+                                Ok(0) => break,
+                                Ok(n) => n,
+                                Err(_) => break,
+                            };
 
-                            loop {
-                                let available_buffer = match reader.fill_buf() {
-                                    Ok(buf) if buf.is_empty() => {
-                                        reached_eof = true;
-                                        break;
-                                    }
-                                    Ok(buf) => buf,
-                                    Err(_) => {
-                                        reached_eof = true;
-                                        break;
-                                    }
-                                };
+                            buffer_len += bytes_read;
+                            let mut start_pos = 0;
 
-                                if let Some(newline_pos) =
-                                    available_buffer.iter().position(|&b| b == b'\n')
-                                {
-                                    let consume_len = newline_pos + 1;
+                            // Process complete discrete lines found inside the buffer segment
+                            while let Some(newline_offset) = stream_buffer[start_pos..buffer_len]
+                                .iter()
+                                .position(|&b| b == b'\n')
+                            {
+                                let end_pos = start_pos + newline_offset;
+                                let line_slice =
+                                    String::from_utf8_lossy(&stream_buffer[start_pos..end_pos]);
+                                let trimmed = line_slice.trim_end();
 
-                                    if scratchpad_buffer.len() + consume_len > 8192 {
-                                        exceeded_limit = true;
-                                        let allowed = 8192 - scratchpad_buffer.len();
-                                        scratchpad_buffer
-                                            .extend_from_slice(&available_buffer[..allowed]);
-                                        reader.consume(allowed);
-                                    } else {
-                                        scratchpad_buffer
-                                            .extend_from_slice(&available_buffer[..consume_len]);
-                                        reader.consume(consume_len);
-                                    }
-                                    break;
-                                } else {
-                                    let chunk_len = available_buffer.len();
-
-                                    if scratchpad_buffer.len() + chunk_len > 8192 {
-                                        exceeded_limit = true;
-                                        let allowed = 8192 - scratchpad_buffer.len();
-                                        scratchpad_buffer
-                                            .extend_from_slice(&available_buffer[..allowed]);
-                                        reader.consume(allowed);
-                                        break;
-                                    } else {
-                                        scratchpad_buffer.extend_from_slice(available_buffer);
-                                        reader.consume(chunk_len);
-                                    }
+                                if !trimmed.is_empty() {
+                                    evaluate_line_signatures(
+                                        trimmed,
+                                        &regex_compiled,
+                                        &id_extractor,
+                                        &worker_registry,
+                                        &whitelist,
+                                        &table,
+                                        json_enabled,
+                                        &docker_socket_path,
+                                        true,
+                                        &active_containers,
+                                        &anti_dos_state,
+                                    );
                                 }
+                                start_pos = end_pos + 1;
                             }
 
-                            if reached_eof && scratchpad_buffer.is_empty() {
-                                break;
+                            // Shift incomplete trail fragments to the buffer head
+                            if start_pos < buffer_len {
+                                let remainder_len = buffer_len - start_pos;
+                                if remainder_len >= MAX_LINE_SIZE {
+                                    emit_log(
+                                        "CRITICAL",
+                                        "orchestrator",
+                                        None,
+                                        None,
+                                        None,
+                                        Some("stream"),
+                                        "OVERFLOW_FLUSHED",
+                                        "Line length exceeded 64KB security threshold. Flushing stream segment to guarantee stability.",
+                                        json_enabled,
+                                    );
+                                    buffer_len = 0;
+                                } else {
+                                    stream_buffer.copy_within(start_pos..buffer_len, 0);
+                                    buffer_len = remainder_len;
+                                }
+                            } else {
+                                buffer_len = 0;
                             }
-
-                            let current_line = String::from_utf8_lossy(&scratchpad_buffer);
-                            let trimmed_line = current_line.trim_end();
-
-                            if exceeded_limit {
-                                emit_log(
-                                    "CRITICAL",
-                                    "orchestrator",
-                                    None,
-                                    None,
-                                    None,
-                                    Some("stream"),
-                                    "TRUNCATED",
-                                    "Line limit hit. Payload ignored and remainder discarded to prevent sensor blinding.",
-                                    json_enabled,
-                                );
-                                let mut discard = Vec::new();
-                                let _ = reader.read_until(b'\n', &mut discard);
-                                continue;
-                            }
-
-                            evaluate_line_signatures(
-                                trimmed_line,
-                                &regex_compiled,
-                                &id_extractor,
-                                &worker_registry,
-                                &whitelist,
-                                &table,
-                                json_enabled,
-                                &docker_socket_path,
-                                true,
-                            );
                         }
 
                         if let Ok(pos) = reader.stream_position() {
@@ -362,13 +482,15 @@ pub fn start_monitor_loop(config: GuardConfig) {
 }
 
 fn run_uds_server(
-    registry: Arc<Mutex<RegistryMap>>,
+    registry: Arc<RwLock<RegistryMap>>,
     regex_rules: Arc<Vec<(String, Regex, Vec<AtomicAction>, Vec<AtomicAction>)>>,
     id_extractor: Regex,
     whitelist: Vec<ipnet::IpNet>,
     table: String,
     json_enabled: bool,
     docker_socket_path: String,
+    active_containers: Arc<RwLock<HashSet<String>>>,
+    anti_dos_state: Arc<Mutex<AntiDosState>>,
 ) {
     let socket_path = "/var/run/runsc-sentry-guard.sock";
     let _ = fs::remove_file(socket_path);
@@ -409,15 +531,37 @@ fn run_uds_server(
         return;
     }
 
-    // The UDS socket is securely bound and ready for traffic
     notify_systemd_ready();
 
-    // Prevent Unbounded OS Thread Creation DoS
     let active_connections = Arc::new(AtomicUsize::new(0));
     const MAX_UDS_CONNECTIONS: usize = 50;
 
     for stream in listener.incoming() {
         if let Ok(stream) = stream {
+            // SECURITY: Extract Peer Credentials to prevent unauthorized local processes from flooding the queue
+            #[cfg(target_os = "linux")]
+            match peer_uid(&stream) {
+                Ok(0) => {}
+                Ok(uid) => {
+                    emit_log(
+                        "WARN",
+                        "uds_server",
+                        None,
+                        None,
+                        None,
+                        Some("trust_boundary"),
+                        "REJECTED",
+                        &format!(
+                            "Unauthorized UID {} attempted UDS connection. Payload dropped.",
+                            uid
+                        ),
+                        json_enabled,
+                    );
+                    continue;
+                }
+                Err(_) => continue,
+            }
+
             if active_connections.load(Ordering::SeqCst) >= MAX_UDS_CONNECTIONS {
                 continue;
             }
@@ -431,8 +575,11 @@ fn run_uds_server(
             let wl_clone = whitelist.clone();
             let tbl_clone = table.clone();
             let ds_path_clone = docker_socket_path.clone();
+            let cache_clone = Arc::clone(&active_containers);
+            let dos_clone = Arc::clone(&anti_dos_state);
 
             thread::spawn(move || {
+                let _guard = ConnectionGuard(conn_tracker);
                 handle_uds_stream(
                     stream,
                     reg_clone,
@@ -442,8 +589,9 @@ fn run_uds_server(
                     tbl_clone,
                     json_enabled,
                     ds_path_clone,
+                    cache_clone,
+                    dos_clone,
                 );
-                conn_tracker.fetch_sub(1, Ordering::SeqCst);
             });
         }
     }
@@ -451,13 +599,15 @@ fn run_uds_server(
 
 fn handle_uds_stream(
     stream: UnixStream,
-    registry: Arc<Mutex<RegistryMap>>,
+    registry: Arc<RwLock<RegistryMap>>,
     regex_rules: Arc<Vec<(String, Regex, Vec<AtomicAction>, Vec<AtomicAction>)>>,
     id_extractor: Regex,
     whitelist: Vec<ipnet::IpNet>,
     table: String,
     json_enabled: bool,
     docker_socket_path: String,
+    active_containers: Arc<RwLock<HashSet<String>>>,
+    anti_dos_state: Arc<Mutex<AntiDosState>>,
 ) {
     if let Err(e) = stream.set_read_timeout(Some(Duration::from_millis(100))) {
         emit_log(
@@ -479,7 +629,6 @@ fn handle_uds_stream(
 
     loop {
         buf.clear();
-
         let mut chunk = reader.by_ref().take(8192);
 
         match chunk.read_until(b'\n', &mut buf) {
@@ -520,6 +669,8 @@ fn handle_uds_stream(
                     json_enabled,
                     &docker_socket_path,
                     false,
+                    &active_containers,
+                    &anti_dos_state,
                 );
             }
             Err(_) => break,
@@ -527,24 +678,130 @@ fn handle_uds_stream(
     }
 }
 
+// Synchronous Fast-Path to close the TOCTOU gap
+#[cfg(target_os = "linux")]
+fn is_container_active_sync(container_id: &str, socket_path: &str) -> bool {
+    use std::io::{BufRead, Write};
+
+    if let Ok(mut stream) = UnixStream::connect(socket_path) {
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+        let request = format!("GET /containers/{}/json HTTP/1.0\r\n\r\n", container_id);
+
+        if stream.write_all(request.as_bytes()).is_ok() {
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            if reader.read_line(&mut line).is_ok() {
+                // If Docker returns an HTTP 200, the container actively exists
+                return line.contains(" 200 ");
+            }
+        }
+    }
+    false
+}
+
 fn evaluate_line_signatures(
     line: &str,
     rules: &[(String, Regex, Vec<AtomicAction>, Vec<AtomicAction>)],
     id_extractor: &Regex,
-    registry: &Arc<Mutex<RegistryMap>>,
+    registry: &Arc<RwLock<RegistryMap>>,
     whitelist: &[ipnet::IpNet],
     table: &str,
     json_enabled: bool,
     docker_socket_path: &str,
     is_from_file: bool,
+    active_containers: &Arc<RwLock<HashSet<String>>>,
+    anti_dos_state: &Arc<Mutex<AntiDosState>>,
 ) {
+    // Explicitly consume variables on non-Linux targets to silence compiler warnings
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = active_containers;
+        let _ = anti_dos_state;
+    }
+
     for (rule_name, rx, try_act, final_act) in rules.iter() {
         if rx.is_match(line) {
             if let Some(caps) = id_extractor.captures(line) {
                 if let Some(matched_id) = caps.get(1) {
                     let container_id = matched_id.as_str().to_string();
 
-                    // TOCTOU Mitigation: Force ValidateState for all disk-based telemetry
+                    #[cfg(target_os = "linux")]
+                    {
+                        // Check primary active cache
+                        let mut is_valid = {
+                            let active_guard =
+                                active_containers.read().unwrap_or_else(|p| p.into_inner());
+                            active_guard.contains(&container_id)
+                                || active_guard
+                                    .iter()
+                                    .any(|long_id| long_id.starts_with(&container_id))
+                        };
+
+                        // Fallback: Synchronous Verification mapped behind Negative Cache & Rate Limits
+                        if !is_valid {
+                            let mut dos_guard =
+                                anti_dos_state.lock().unwrap_or_else(|p| p.into_inner());
+
+                            // Token Replenishment
+                            let now = Instant::now();
+                            if now.duration_since(dos_guard.last_refill).as_secs() >= 1 {
+                                dos_guard.tokens = MAX_LOOKUP_TOKENS;
+                                dos_guard.last_refill = now;
+                            }
+
+                            // Bypass check if attacker is hitting known bad IDs
+                            if dos_guard.negative_cache.contains(&container_id) {
+                                continue;
+                            }
+
+                            if dos_guard.tokens > 0 {
+                                dos_guard.tokens -= 1;
+                                drop(dos_guard); // Free lock immediately during active I/O
+
+                                let actually_exists =
+                                    is_container_active_sync(&container_id, docker_socket_path);
+
+                                if actually_exists {
+                                    let mut active_write = active_containers
+                                        .write()
+                                        .unwrap_or_else(|p| p.into_inner());
+                                    active_write.insert(container_id.clone());
+                                    is_valid = true;
+                                } else {
+                                    let mut dos_write =
+                                        anti_dos_state.lock().unwrap_or_else(|p| p.into_inner());
+
+                                    // Maintain bounded LRU capacity for Negative Cache
+                                    if dos_write.negative_cache.len() >= MAX_NEGATIVE_CACHE {
+                                        if let Some(oldest) = dos_write.negative_queue.pop_front() {
+                                            dos_write.negative_cache.remove(&oldest);
+                                        }
+                                    }
+                                    dos_write.negative_cache.insert(container_id.clone());
+                                    dos_write.negative_queue.push_back(container_id.clone());
+                                }
+                            } else {
+                                // ID Exhaustion flood detected. Drop payload cleanly to protect the engine.
+                                emit_log(
+                                    "WARN",
+                                    "orchestrator",
+                                    None,
+                                    None,
+                                    None,
+                                    Some("api_rate_limit"),
+                                    "DROPPED",
+                                    "Container lookup token pool exhausted. Payload discarded.",
+                                    json_enabled,
+                                );
+                                continue;
+                            }
+                        }
+
+                        if !is_valid {
+                            continue;
+                        }
+                    }
+
                     let mut active_try = try_act.clone();
                     if is_from_file && active_try.first() != Some(&AtomicAction::ValidateState) {
                         active_try.insert(0, AtomicAction::ValidateState);
@@ -569,7 +826,7 @@ fn evaluate_line_signatures(
 }
 
 fn dispatch_to_worker(
-    registry: &Arc<Mutex<RegistryMap>>,
+    registry: &Arc<RwLock<RegistryMap>>,
     container_id: String,
     try_actions: Vec<AtomicAction>,
     final_actions: Vec<AtomicAction>,
@@ -582,11 +839,24 @@ fn dispatch_to_worker(
 ) {
     const MAX_WORKERS: usize = 100;
 
-    let mut reg = registry
-        .lock()
+    // FAST PATH: Acquire parallel, non-blocking read lock to pass telemetry frames on active mailboxes
+    {
+        let reg_read = registry
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(tx) = reg_read.get(&container_id) {
+            let _ = tx.try_send((try_actions, final_actions, rule_name, trigger_message));
+            return;
+        }
+    }
+
+    // SLOW PATH: Channel context does not exist. Acquire exclusive write lock to initialize pipeline workers.
+    let mut reg_write = registry
+        .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-    if !reg.contains_key(&container_id) && reg.len() >= MAX_WORKERS {
+    // Double-Checked Locking Pattern validation check
+    if !reg_write.contains_key(&container_id) && reg_write.len() >= MAX_WORKERS {
         emit_log(
             "CRITICAL",
             "orchestrator",
@@ -601,7 +871,7 @@ fn dispatch_to_worker(
         return;
     }
 
-    let tx = reg.entry(container_id.clone()).or_insert_with(|| {
+    let tx = reg_write.entry(container_id.clone()).or_insert_with(|| {
         let (worker_tx, worker_rx) = sync_channel::<WorkerChannelMessage>(64);
         let cid_clone = container_id.clone();
         let wl_clone = whitelist.to_vec();
@@ -663,7 +933,7 @@ fn dispatch_to_worker(
 fn run_worker_lifecycle(
     container_id: String,
     rx_chan: Receiver<WorkerChannelMessage>,
-    registry: Arc<Mutex<RegistryMap>>,
+    registry: Arc<RwLock<RegistryMap>>,
     whitelist: Vec<ipnet::IpNet>,
     table: String,
     json_enabled: bool,
@@ -687,8 +957,9 @@ fn run_worker_lifecycle(
                 );
             }
             Err(_) => {
+                // Decay phase: Acquire exclusive write lock strictly on worker termination
                 let mut reg = registry
-                    .lock()
+                    .write()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
 
                 match rx_chan.try_recv() {
@@ -769,7 +1040,6 @@ mod tests {
     }
 }
 
-// Emits the systemd startup synchronization notification packet.
 fn notify_systemd_ready() {
     if let Ok(socket_path) = std::env::var("NOTIFY_SOCKET") {
         if !socket_path.is_empty() {
@@ -785,5 +1055,73 @@ fn notify_systemd_ready() {
                 let _ = socket.send_to(b"READY=1\n", resolved_path);
             }
         }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn peer_uid(stream: &UnixStream) -> std::io::Result<libc::uid_t> {
+    let mut cred = std::mem::MaybeUninit::<libc::ucred>::uninit();
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            cred.as_mut_ptr().cast(),
+            &mut len,
+        )
+    };
+
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    if len < std::mem::size_of::<libc::ucred>() as libc::socklen_t {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "short SO_PEERCRED response",
+        ));
+    }
+
+    Ok(unsafe { cred.assume_init() }.uid)
+}
+
+struct ConnectionGuard(Arc<AtomicUsize>);
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+#[cfg(unix)]
+fn open_log_safe(dir_path: &Path, file_name: &OsStr) -> std::io::Result<fs::File> {
+    let dir_c = CString::new(dir_path.as_os_str().as_bytes())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let file_c = CString::new(file_name.as_bytes())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+
+    unsafe {
+        let dir_fd = libc::open(
+            dir_c.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        );
+        if dir_fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        let file_fd = libc::openat(
+            dir_fd,
+            file_c.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        );
+        libc::close(dir_fd);
+
+        if file_fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        Ok(fs::File::from_raw_fd(file_fd))
     }
 }

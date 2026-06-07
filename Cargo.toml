@@ -1,11 +1,12 @@
 [package]
 name = "runsc-sentry-guard"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 edition = "2024"
 authors = ["mutex7c <mutex7c@users.noreply.github.com>"]
 description = "An ultra-lightweight active incident response daemon for runsc (gVisor) sandboxes."
 homepage = "https://github.com/mutex7c/runsc-sentry-guard"
 repository = "https://github.com/mutex7c/runsc-sentry-guard"
+license = "MIT"
 
 [dependencies]
 serde = { version = "1.0.228", features = ["derive"] }

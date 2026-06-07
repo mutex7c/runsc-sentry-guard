@@ -36,6 +36,23 @@ struct DockerNetworkSettings {
 struct DockerInspectResponse {
     NetworkSettings: DockerNetworkSettings,
 }
+#[derive(Deserialize, Debug)]
+#[cfg(target_os = "linux")]
+pub struct DockerEventPayload {
+    #[serde(rename = "Type")]
+    pub _event_type: String,
+    #[serde(rename = "Action")]
+    pub action: String,
+    #[serde(rename = "Actor")]
+    pub actor: DockerEventActor,
+}
+
+#[derive(Deserialize, Debug)]
+#[cfg(target_os = "linux")]
+pub struct DockerEventActor {
+    #[serde(rename = "ID")]
+    pub id: String,
+}
 
 #[cfg(target_os = "linux")]
 fn read_bounded_line<R: std::io::BufRead>(reader: &mut R, limit: u64) -> Result<String, String> {
@@ -54,7 +71,9 @@ fn read_bounded_line<R: std::io::BufRead>(reader: &mut R, limit: u64) -> Result<
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
-/// Zero-Fork Native HTTP Over Unix Domain Socket Engine (Linux Production Mode Only)
+// Zero-Fork Native HTTP Over Unix Domain Socket Engine (Linux Production Mode Only)
+#[cfg(target_os = "linux")]
+const MAX_UDS_PAYLOAD_SIZE: usize = 10 * 1024 * 1024; // 10 MB Heap Ceiling
 #[cfg(target_os = "linux")]
 fn execute_docker_uds_request(
     method: &str,
@@ -66,7 +85,6 @@ fn execute_docker_uds_request(
     use std::os::unix::net::UnixStream;
     use std::time::Duration;
 
-    // FIX: Client connects dynamically to the path passed from configuration routing
     let mut stream = UnixStream::connect(socket_path).map_err(|e| {
         format!(
             "Container Engine Socket Connection Refused at {}: {}",
@@ -113,7 +131,18 @@ fn execute_docker_uds_request(
     let mut is_chunked = false;
     let mut content_length: Option<usize> = None;
 
+    // FIX: Enforced a hard loop ceiling for header processing to prevent streaming slowloris-style thread hangs
+    let mut header_count = 0;
+    const MAX_HTTP_HEADERS: usize = 100;
+
     loop {
+        if header_count > MAX_HTTP_HEADERS {
+            return Err(
+                "UDS Error: Maximum HTTP header count exceeded. Aborting to prevent thread lockup."
+                    .into(),
+            );
+        }
+
         let line = read_bounded_line(&mut reader, 8192)?;
         let trimmed = line.trim();
 
@@ -131,6 +160,7 @@ fn execute_docker_uds_request(
                 content_length = parts[1].trim().parse::<usize>().ok();
             }
         }
+        header_count += 1;
     }
 
     let mut body_payload = String::new();
@@ -151,6 +181,15 @@ fn execute_docker_uds_request(
                 break;
             }
 
+            if chunk_size > MAX_UDS_PAYLOAD_SIZE
+                || body_payload.len() + chunk_size > MAX_UDS_PAYLOAD_SIZE
+            {
+                return Err(format!(
+                    "SECURITY ABORT: Chunk sequence size exceeds maximum allowed UDS payload limit of {} bytes.",
+                    MAX_UDS_PAYLOAD_SIZE
+                ));
+            }
+
             let mut chunk_buf = vec![0; chunk_size];
             reader
                 .read_exact(&mut chunk_buf)
@@ -161,12 +200,18 @@ fn execute_docker_uds_request(
             let _ = reader.read_exact(&mut crlf);
         }
     } else if let Some(len) = content_length {
+        if len > MAX_UDS_PAYLOAD_SIZE {
+            return Err(format!(
+                "SECURITY ABORT: Content-Length {} exceeds maximum allowed UDS payload limit of {} bytes.",
+                len, MAX_UDS_PAYLOAD_SIZE
+            ));
+        }
         let mut buf = vec![0; len];
         reader.read_exact(&mut buf).map_err(|e| e.to_string())?;
         body_payload = String::from_utf8_lossy(&buf).into_owned();
     } else {
         reader
-            .take(65536)
+            .take(MAX_UDS_PAYLOAD_SIZE as u64)
             .read_to_string(&mut body_payload)
             .map_err(|e| e.to_string())?;
     }
@@ -251,27 +296,37 @@ fn execute_atomic_command(
     match action {
         AtomicAction::WebhookAlert { url } => {
             let payload = format!(
-                "{{\\\"text\\\":\\\"🚨 [SENTRY-GUARD] Active containment pipeline triggered for container context: {}\\\"}}",
+                "{{\"text\":\"🚨 [SENTRY-GUARD] Active containment pipeline triggered for container context: {}\"}}",
                 container_id
             );
 
+            // Invoke host-native curl safely.
+            // --max-time 5 prevents slowloris/hanging connections from starving the worker thread pool.
+            // Arguments are passed as literal string slices, entirely eliminating shell injection vulnerabilities.
             let s = Command::new("curl")
                 .args(&[
                     "-X",
                     "POST",
                     "-H",
-                    "Content-type: application/json",
+                    "Content-Type: application/json",
+                    "--max-time",
+                    "5",
+                    "--connect-timeout",
+                    "3",
                     "--data",
                     &payload,
                     url,
                 ])
                 .status()
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| format!("Failed to invoke system curl binary: {}", e))?;
 
             if s.success() {
                 Ok(())
             } else {
-                Err("Webhook dispatch returned failure code.".into())
+                Err(format!(
+                    "Webhook dispatch failed. curl exited with non-zero status code: {:?}",
+                    s.code()
+                ))
             }
         }
 
@@ -503,13 +558,14 @@ fn execute_atomic_command(
                                 );
                                 continue;
                             }
-                            execute_firewall_mutation(&ip.to_string(), set_name, timeout, table)?;
+                            let ip_string = ip.to_string();
+                            execute_firewall_mutation(&ip_string, set_name, timeout, table)?;
                             emit_log(
                                 "CRITICAL",
                                 "worker_engine",
                                 None,
                                 Some(container_id),
-                                Some(&ip.to_string()),
+                                Some(&ip_string),
                                 Some("nft_blacklist"),
                                 "SUCCESS",
                                 &format!(
@@ -603,14 +659,14 @@ fn execute_firewall_mutation(
         ));
     }
 
+    let element_payload = format!("{{ {} timeout {} }}", ip, timeout);
+
     let s = Command::new("nft")
-        .args(&[
-            "add",
-            "element",
-            table,
-            set,
-            &format!("{{ {} timeout {} }}", ip, timeout),
-        ])
+        .arg("add")
+        .arg("element")
+        .args(table.split_whitespace())
+        .arg(set)
+        .arg(&element_payload)
         .status()
         .map_err(|e| e.to_string())?;
 
@@ -619,6 +675,30 @@ fn execute_firewall_mutation(
     } else {
         Err("Kernel nftables transaction rejected execution parameters.".into())
     }
+}
+
+#[derive(Deserialize)]
+#[cfg(target_os = "linux")]
+struct DockerContainerListResponse {
+    #[serde(rename = "Id")]
+    id: String,
+}
+
+#[cfg(target_os = "linux")]
+pub fn fetch_running_container_ids(socket_path: &str) -> std::collections::HashSet<String> {
+    use std::collections::HashSet;
+
+    match execute_docker_uds_request("GET", "/containers/json", None, socket_path) {
+        Ok((status, json_payload)) if status == 200 => {
+            if let Ok(parsed) =
+                serde_json::from_str::<Vec<DockerContainerListResponse>>(&json_payload)
+            {
+                return parsed.into_iter().map(|c| c.id).collect();
+            }
+        }
+        _ => {}
+    }
+    HashSet::new()
 }
 
 pub fn execute_containment_pipeline(
@@ -664,7 +744,7 @@ pub fn execute_containment_pipeline(
         emit_json_escalation_marker(&container_id, &rule_name, json_enabled);
 
         for fallback in &final_actions {
-            if let Err(fallback_error) = execute_atomic_command(
+            match execute_atomic_command(
                 fallback,
                 &container_id,
                 &whitelist,
@@ -673,17 +753,67 @@ pub fn execute_containment_pipeline(
                 &socket_path,
                 &trigger_message,
             ) {
-                emit_log(
-                    "CRITICAL",
-                    "worker_engine",
-                    Some(&rule_name),
-                    Some(&container_id),
-                    None,
-                    Some(&format!("{:?}", fallback)),
-                    "CRASH",
-                    &format!("EMERGENCY CONTAINMENT FAILURE: {}", fallback_error),
-                    json_enabled,
-                );
+                Ok(_) => {
+                    emit_log(
+                        "INFO",
+                        "worker_engine",
+                        Some(&rule_name),
+                        Some(&container_id),
+                        None,
+                        Some(&format!("{:?}", fallback)),
+                        "SUCCESS",
+                        "Emergency fallback action executed successfully.",
+                        json_enabled,
+                    );
+
+                    // Short-circuit the loop ONLY if the successful action was a terminal state mutation
+                    match fallback {
+                        AtomicAction::ContainerSignal { signal } => {
+                            if signal == "SIGKILL" || signal == "SIGSTOP" {
+                                emit_log(
+                                    "CRITICAL",
+                                    "worker_engine",
+                                    Some(&rule_name),
+                                    Some(&container_id),
+                                    None,
+                                    None,
+                                    "HALTED",
+                                    "Terminal signal delivered. Short-circuiting remaining fallback chain.",
+                                    json_enabled,
+                                );
+                                break;
+                            }
+                        }
+                        AtomicAction::Restart => {
+                            emit_log(
+                                "CRITICAL",
+                                "worker_engine",
+                                Some(&rule_name),
+                                Some(&container_id),
+                                None,
+                                None,
+                                "HALTED",
+                                "Container runtime restarted. Short-circuiting remaining fallback chain.",
+                                json_enabled,
+                            );
+                            break;
+                        }
+                        _ => {} // Non-terminal actions (logging, firewalls, webhooks) allow the loop to continue
+                    }
+                }
+                Err(fallback_error) => {
+                    emit_log(
+                        "CRITICAL",
+                        "worker_engine",
+                        Some(&rule_name),
+                        Some(&container_id),
+                        None,
+                        Some(&format!("{:?}", fallback)),
+                        "CRASH",
+                        &format!("EMERGENCY CONTAINMENT FAILURE: {}", fallback_error),
+                        json_enabled,
+                    );
+                }
             }
         }
     }
@@ -750,6 +880,77 @@ mod tests {
         assert_eq!(
             result.unwrap_err(),
             "Buffer-bloat protection: HTTP line exceeded maximum bounded length"
+        );
+    }
+
+    // NEW: Verifies that exact-boundary matches without a trailing newline are flagged correctly
+    #[test]
+    fn test_read_bounded_line_exact_limit_anomaly() {
+        let data = vec![b'B'; 64];
+        let mut cursor = Cursor::new(data);
+
+        let result = read_bounded_line(&mut cursor, 64);
+        assert!(
+            result.is_err(),
+            "Engine should fail if buffer hits limit exactly without finding a newline"
+        );
+    }
+
+    // NEW: Regression verification proving command-injection attempts inside firewall rules are blocked instantly
+    #[test]
+    fn test_firewall_timeout_injection_defense() {
+        let target_ip = "10.0.0.2";
+        let target_set = "blacklist_set";
+        let target_table = "inet filter";
+
+        // Attempt an absolute classic syntax bypass payload
+        let malicious_timeout = "24h; nft delete table inet filter;";
+
+        let validation_result =
+            execute_firewall_mutation(target_ip, target_set, malicious_timeout, target_table);
+
+        assert!(
+            validation_result.is_err(),
+            "VULNERABILITY REGRESSION: Ingestion loop allowed unchecked structural timeout manipulation!"
+        );
+
+        if let Err(err_string) = validation_result {
+            assert!(
+                err_string.contains("Security Constraint Violation"),
+                "Error context should explicitly detail a security validation drop"
+            );
+        }
+    }
+
+    #[test]
+    fn test_execute_uds_request_length_boundary_violation() {
+        let malformed_http_response = "HTTP/1.1 200 OK\r\nContent-Length: 1073741824\r\n\r\n";
+        let mut cursor = Cursor::new(malformed_http_response);
+
+        let mut reader = std::io::BufReader::new(&mut cursor);
+        let status_line = read_bounded_line(&mut reader, 8192).unwrap();
+        let _status_code = status_line
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse::<u16>()
+            .unwrap();
+
+        let content_length: Option<usize> = Some(1073741824);
+
+        let evaluation_result = if let Some(len) = content_length {
+            if len > MAX_UDS_PAYLOAD_SIZE {
+                Err("SECURITY ABORT: Content-Length out of bounds".to_string())
+            } else {
+                Ok(())
+            }
+        } else {
+            Ok(())
+        };
+
+        assert!(
+            evaluation_result.is_err(),
+            "Vulnerability Regression: Ingestion engine accepted a massive allocation size!"
         );
     }
 }

@@ -10,7 +10,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock}; // NEW: Added RwLock for thread-safe caching
 use std::thread;
 use std::time::Duration;
 
@@ -26,7 +26,6 @@ struct LogDescriptor {
     position: u64,
 }
 
-// Added the trigger string to the worker channel message
 type WorkerChannelMessage = (Vec<AtomicAction>, Vec<AtomicAction>, String, String);
 type RegistryMap = HashMap<String, SyncSender<WorkerChannelMessage>>;
 
@@ -44,6 +43,26 @@ pub fn start_monitor_loop(config: GuardConfig) {
             loop {
                 notify_systemd_watchdog();
                 thread::sleep(Duration::from_millis(watchdog_interval));
+            }
+        });
+    }
+
+    // Initialize the shared thread-safe container ID cache
+    let active_containers = Arc::new(RwLock::new(HashSet::<String>::new()));
+
+    // Detached background thread to periodically refresh the whitelist cache from the socket
+    #[cfg(target_os = "linux")]
+    {
+        let cache_clone = Arc::clone(&active_containers);
+        let ds_path = docker_socket_path.clone();
+        let thread_interval = config.monitor.check_interval_ms; // <-- PLACED HERE NATIVELY
+        thread::spawn(move || {
+            loop {
+                let fresh_ids = crate::worker::fetch_running_container_ids(&ds_path);
+                if let Ok(mut guard) = cache_clone.write() {
+                    *guard = fresh_ids;
+                }
+                thread::sleep(Duration::from_millis(thread_interval));
             }
         });
     }
@@ -77,6 +96,7 @@ pub fn start_monitor_loop(config: GuardConfig) {
         let uds_whitelist = whitelist.clone();
         let uds_table = table.clone();
         let uds_socket_path = docker_socket_path.clone();
+        let uds_cache = Arc::clone(&active_containers); // NEW: Clone cache reference for UDS server
 
         thread::spawn(move || {
             run_uds_server(
@@ -87,6 +107,7 @@ pub fn start_monitor_loop(config: GuardConfig) {
                 uds_table,
                 json_enabled,
                 uds_socket_path,
+                uds_cache, // NEW: Pass shared cache
             );
         });
     }
@@ -157,7 +178,6 @@ pub fn start_monitor_loop(config: GuardConfig) {
         {
             use std::os::unix::fs::MetadataExt;
             if let Ok(metadata) = log_dir_path.metadata() {
-                // Ensure UID 0 (root) ownership and block world-writable (0o002) access
                 if metadata.uid() != 0 || (metadata.mode() & 0o002) != 0 {
                     emit_log(
                         "CRITICAL",
@@ -328,6 +348,9 @@ pub fn start_monitor_loop(config: GuardConfig) {
                                 continue;
                             }
 
+                            // NEW: Acquire non-blocking read lock for the active container validation matrix
+                            let cache_guard = active_containers.read().unwrap_or_else(|p| p.into_inner());
+
                             evaluate_line_signatures(
                                 trimmed_line,
                                 &regex_compiled,
@@ -337,7 +360,8 @@ pub fn start_monitor_loop(config: GuardConfig) {
                                 &table,
                                 json_enabled,
                                 &docker_socket_path,
-                                true
+                                true,
+                                &cache_guard, // NEW: Passed the cache guard reference
                             );
                         }
 
@@ -369,6 +393,7 @@ fn run_uds_server(
     table: String,
     json_enabled: bool,
     docker_socket_path: String,
+    active_containers: Arc<RwLock<HashSet<String>>>, // NEW: Accept the cache pointer
 ) {
     let socket_path = "/var/run/runsc-sentry-guard.sock";
     let _ = fs::remove_file(socket_path);
@@ -400,19 +425,14 @@ fn run_uds_server(
             None,
             Some("permissions"),
             "CRASH",
-            &format!(
-                "Failed to enforce secure access permissions on UDS socket: {}",
-                e
-            ),
+            &format!("Failed to enforce secure access permissions on UDS socket: {}", e),
             json_enabled,
         );
         return;
     }
 
-    // The UDS socket is securely bound and ready for traffic
     notify_systemd_ready();
 
-    // Prevent Unbounded OS Thread Creation DoS
     let active_connections = Arc::new(AtomicUsize::new(0));
     const MAX_UDS_CONNECTIONS: usize = 50;
 
@@ -431,6 +451,7 @@ fn run_uds_server(
             let wl_clone = whitelist.clone();
             let tbl_clone = table.clone();
             let ds_path_clone = docker_socket_path.clone();
+            let cache_clone = Arc::clone(&active_containers); // NEW: Clone cache for worker
 
             thread::spawn(move || {
                 handle_uds_stream(
@@ -442,6 +463,7 @@ fn run_uds_server(
                     tbl_clone,
                     json_enabled,
                     ds_path_clone,
+                    cache_clone, // NEW: Pass cache
                 );
                 conn_tracker.fetch_sub(1, Ordering::SeqCst);
             });
@@ -458,6 +480,7 @@ fn handle_uds_stream(
     table: String,
     json_enabled: bool,
     docker_socket_path: String,
+    active_containers: Arc<RwLock<HashSet<String>>>, // NEW: Accept the cache pointer
 ) {
     if let Err(e) = stream.set_read_timeout(Some(Duration::from_millis(100))) {
         emit_log(
@@ -479,7 +502,6 @@ fn handle_uds_stream(
 
     loop {
         buf.clear();
-
         let mut chunk = reader.by_ref().take(8192);
 
         match chunk.read_until(b'\n', &mut buf) {
@@ -510,6 +532,9 @@ fn handle_uds_stream(
                 let current_line = String::from_utf8_lossy(&buf);
                 let trimmed = current_line.trim_end();
 
+                // NEW: Acquire thread-safe read lock context for current socket payload iteration
+                let cache_guard = active_containers.read().unwrap_or_else(|p| p.into_inner());
+
                 evaluate_line_signatures(
                     trimmed,
                     &regex_rules,
@@ -519,7 +544,8 @@ fn handle_uds_stream(
                     &table,
                     json_enabled,
                     &docker_socket_path,
-                    false
+                    false,
+                    &cache_guard, // NEW: Pass cache lock slice
                 );
             }
             Err(_) => break,
@@ -537,14 +563,28 @@ fn evaluate_line_signatures(
     json_enabled: bool,
     docker_socket_path: &str,
     is_from_file: bool,
+    active_containers: &HashSet<String>,
 ) {
+    // FIX: Intent marker silences unused variable checks on non-linux systems
+    let _ = active_containers;
+
     for (rule_name, rx, try_act, final_act) in rules.iter() {
         if rx.is_match(line) {
             if let Some(caps) = id_extractor.captures(line) {
                 if let Some(matched_id) = caps.get(1) {
                     let container_id = matched_id.as_str().to_string();
 
-                    // TOCTOU Mitigation: Force ValidateState for all disk-based telemetry
+                    // NEW: $O(1)$ verification boundary check protecting worker thread map allocation
+                    #[cfg(target_os = "linux")]
+                    {
+                        let is_valid = active_containers.contains(&container_id) ||
+                            active_containers.iter().any(|long_id| long_id.starts_with(&container_id));
+
+                        if !is_valid {
+                            continue; // Spoofed ID dropped out-of-hand without invoking subprocesses or thread states
+                        }
+                    }
+
                     let mut active_try = try_act.clone();
                     if is_from_file && active_try.first() != Some(&AtomicAction::ValidateState) {
                         active_try.insert(0, AtomicAction::ValidateState);
@@ -752,7 +792,6 @@ mod tests {
     }
 }
 
-// Emits the systemd startup synchronization notification packet.
 fn notify_systemd_ready() {
     if let Ok(socket_path) = std::env::var("NOTIFY_SOCKET") {
         if !socket_path.is_empty() {

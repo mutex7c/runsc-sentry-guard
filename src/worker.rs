@@ -153,7 +153,9 @@ fn execute_docker_uds_request(
             }
 
             // Defend against massive single chunk OOM allocations
-            if chunk_size > MAX_UDS_PAYLOAD_SIZE || body_payload.len() + chunk_size > MAX_UDS_PAYLOAD_SIZE {
+            if chunk_size > MAX_UDS_PAYLOAD_SIZE
+                || body_payload.len() + chunk_size > MAX_UDS_PAYLOAD_SIZE
+            {
                 return Err(format!(
                     "SECURITY ABORT: Chunk sequence size exceeds maximum allowed UDS payload limit of {} bytes.",
                     MAX_UDS_PAYLOAD_SIZE
@@ -299,7 +301,10 @@ fn execute_atomic_command(
                 if ips.is_empty() {
                     "UNKNOWN_IP".to_string()
                 } else {
-                    ips.iter().map(|ip| ip.to_string()).collect::<Vec<_>>().join(",")
+                    ips.iter()
+                        .map(|ip| ip.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
                 }
             };
 
@@ -379,11 +384,14 @@ fn execute_atomic_command(
                 match infrastructure_action {
                     AtomicAction::ValidateState => {
                         let endpoint = format!("/containers/{}/json", container_id);
-                        let (status, json_payload) = execute_docker_uds_request("GET", &endpoint, None, socket_path)?;
+                        let (status, json_payload) =
+                            execute_docker_uds_request("GET", &endpoint, None, socket_path)?;
 
                         if status == 200 {
                             // Verify the container is actually still running, not just dead/exited
-                            if json_payload.contains("\"Running\": true") || json_payload.contains("\"Running\":true") {
+                            if json_payload.contains("\"Running\": true")
+                                || json_payload.contains("\"Running\":true")
+                            {
                                 emit_log(
                                     "INFO",
                                     "worker_engine",
@@ -400,7 +408,10 @@ fn execute_atomic_command(
                                 Err("Container is no longer in a running state. Aborting containment to prevent TOCTOU misfires.".into())
                             }
                         } else {
-                            Err(format!("State validation rejected (HTTP {}). Container likely terminated.", status))
+                            Err(format!(
+                                "State validation rejected (HTTP {}). Container likely terminated.",
+                                status
+                            ))
                         }
                     }
 
@@ -629,6 +640,33 @@ fn execute_firewall_mutation(
     }
 }
 
+// src/worker.rs
+
+#[derive(Deserialize)]
+#[cfg(target_os = "linux")]
+struct DockerContainerListResponse {
+    Id: String,
+}
+
+// Fetches all running container IDs in a single, lightweight IPC call
+#[cfg(target_os = "linux")]
+pub fn fetch_running_container_ids(socket_path: &str) -> std::collections::HashSet<String> {
+    use std::collections::HashSet;
+
+    // GET /containers/json maps to running containers
+    match execute_docker_uds_request("GET", "/containers/json", None, socket_path) {
+        Ok((status, json_payload)) if status == 200 => {
+            if let Ok(parsed) =
+                serde_json::from_str::<Vec<DockerContainerListResponse>>(&json_payload)
+            {
+                return parsed.into_iter().map(|c| c.Id).collect();
+            }
+        }
+        _ => {}
+    }
+    HashSet::new()
+}
+
 pub fn execute_containment_pipeline(
     container_id: String,
     try_actions: Vec<AtomicAction>,
@@ -769,7 +807,12 @@ mod tests {
 
         let mut reader = std::io::BufReader::new(&mut cursor);
         let status_line = read_bounded_line(&mut reader, 8192).unwrap();
-        let status_code = status_line.split_whitespace().nth(1).unwrap().parse::<u16>().unwrap();
+        let status_code = status_line
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse::<u16>()
+            .unwrap();
 
         let mut content_length: Option<usize> = Some(1073741824);
 
@@ -783,6 +826,9 @@ mod tests {
             Ok(())
         };
 
-        assert!(evaluation_result.is_err(), "Vulnerability Regression: Ingestion engine accepted a massive allocation size!");
+        assert!(
+            evaluation_result.is_err(),
+            "Vulnerability Regression: Ingestion engine accepted a massive allocation size!"
+        );
     }
 }

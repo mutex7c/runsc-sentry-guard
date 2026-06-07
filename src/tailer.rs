@@ -10,7 +10,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
-use std::sync::{Arc, Mutex, RwLock}; // NEW: Added RwLock for thread-safe caching
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
 
@@ -55,7 +55,7 @@ pub fn start_monitor_loop(config: GuardConfig) {
     {
         let cache_clone = Arc::clone(&active_containers);
         let ds_path = docker_socket_path.clone();
-        let thread_interval = config.monitor.check_interval_ms; // <-- PLACED HERE NATIVELY
+        let thread_interval = config.monitor.check_interval_ms;
         thread::spawn(move || {
             loop {
                 let fresh_ids = crate::worker::fetch_running_container_ids(&ds_path);
@@ -96,7 +96,7 @@ pub fn start_monitor_loop(config: GuardConfig) {
         let uds_whitelist = whitelist.clone();
         let uds_table = table.clone();
         let uds_socket_path = docker_socket_path.clone();
-        let uds_cache = Arc::clone(&active_containers); // NEW: Clone cache reference for UDS server
+        let uds_cache = Arc::clone(&active_containers);
 
         thread::spawn(move || {
             run_uds_server(
@@ -107,7 +107,7 @@ pub fn start_monitor_loop(config: GuardConfig) {
                 uds_table,
                 json_enabled,
                 uds_socket_path,
-                uds_cache, // NEW: Pass shared cache
+                uds_cache,
             );
         });
     }
@@ -140,8 +140,6 @@ pub fn start_monitor_loop(config: GuardConfig) {
         "Master directory tailer and Unix socket pipelines active.",
         json_enabled,
     );
-
-    let mut scratchpad_buffer = Vec::with_capacity(8192);
 
     if mode == &IngestionMode::File {
         notify_systemd_ready();
@@ -272,97 +270,73 @@ pub fn start_monitor_loop(config: GuardConfig) {
                             continue;
                         }
 
+                        // 64 KB Line-bounded streaming evaluator. Defeats truncation padding while preventing context leakage.
+                        const MAX_LINE_SIZE: usize = 65536;
+                        let mut stream_buffer = vec![0u8; MAX_LINE_SIZE * 2];
+                        let mut buffer_len = 0;
+
                         loop {
-                            scratchpad_buffer.clear();
-                            let mut reached_eof = false;
-                            let mut exceeded_limit = false;
+                            let bytes_read = match reader.read(&mut stream_buffer[buffer_len..]) {
+                                Ok(0) => break,
+                                Ok(n) => n,
+                                Err(_) => break,
+                            };
 
-                            loop {
-                                let available_buffer = match reader.fill_buf() {
-                                    Ok(buf) if buf.is_empty() => {
-                                        reached_eof = true;
-                                        break;
-                                    }
-                                    Ok(buf) => buf,
-                                    Err(_) => {
-                                        reached_eof = true;
-                                        break;
-                                    }
-                                };
+                            buffer_len += bytes_read;
+                            let mut start_pos = 0;
 
-                                if let Some(newline_pos) =
-                                    available_buffer.iter().position(|&b| b == b'\n')
-                                {
-                                    let consume_len = newline_pos + 1;
+                            // Process complete discrete lines found inside the buffer segment
+                            while let Some(newline_offset) = stream_buffer[start_pos..buffer_len]
+                                .iter()
+                                .position(|&b| b == b'\n')
+                            {
+                                let end_pos = start_pos + newline_offset;
+                                let line_slice =
+                                    String::from_utf8_lossy(&stream_buffer[start_pos..end_pos]);
+                                let trimmed = line_slice.trim_end();
 
-                                    if scratchpad_buffer.len() + consume_len > 8192 {
-                                        exceeded_limit = true;
-                                        let allowed = 8192 - scratchpad_buffer.len();
-                                        scratchpad_buffer
-                                            .extend_from_slice(&available_buffer[..allowed]);
-                                        reader.consume(allowed);
-                                    } else {
-                                        scratchpad_buffer
-                                            .extend_from_slice(&available_buffer[..consume_len]);
-                                        reader.consume(consume_len);
-                                    }
-                                    break;
-                                } else {
-                                    let chunk_len = available_buffer.len();
-
-                                    if scratchpad_buffer.len() + chunk_len > 8192 {
-                                        exceeded_limit = true;
-                                        let allowed = 8192 - scratchpad_buffer.len();
-                                        scratchpad_buffer
-                                            .extend_from_slice(&available_buffer[..allowed]);
-                                        reader.consume(allowed);
-                                        break;
-                                    } else {
-                                        scratchpad_buffer.extend_from_slice(available_buffer);
-                                        reader.consume(chunk_len);
-                                    }
+                                if !trimmed.is_empty() {
+                                    let cache_guard =
+                                        active_containers.read().unwrap_or_else(|p| p.into_inner());
+                                    evaluate_line_signatures(
+                                        trimmed,
+                                        &regex_compiled,
+                                        &id_extractor,
+                                        &worker_registry,
+                                        &whitelist,
+                                        &table,
+                                        json_enabled,
+                                        &docker_socket_path,
+                                        true,
+                                        &cache_guard,
+                                    );
                                 }
+                                start_pos = end_pos + 1;
                             }
 
-                            if reached_eof && scratchpad_buffer.is_empty() {
-                                break;
+                            // Shift incomplete trail fragments to the buffer head
+                            if start_pos < buffer_len {
+                                let remainder_len = buffer_len - start_pos;
+                                if remainder_len >= MAX_LINE_SIZE {
+                                    emit_log(
+                                        "CRITICAL",
+                                        "orchestrator",
+                                        None,
+                                        None,
+                                        None,
+                                        Some("stream"),
+                                        "OVERFLOW_FLUSHED",
+                                        "Line length exceeded 64KB security threshold. Flushing stream segment to guarantee stability.",
+                                        json_enabled,
+                                    );
+                                    buffer_len = 0;
+                                } else {
+                                    stream_buffer.copy_within(start_pos..buffer_len, 0);
+                                    buffer_len = remainder_len;
+                                }
+                            } else {
+                                buffer_len = 0;
                             }
-
-                            let current_line = String::from_utf8_lossy(&scratchpad_buffer);
-                            let trimmed_line = current_line.trim_end();
-
-                            if exceeded_limit {
-                                emit_log(
-                                    "CRITICAL",
-                                    "orchestrator",
-                                    None,
-                                    None,
-                                    None,
-                                    Some("stream"),
-                                    "TRUNCATED",
-                                    "Line limit hit. Payload ignored and remainder discarded to prevent sensor blinding.",
-                                    json_enabled,
-                                );
-                                let mut discard = Vec::new();
-                                let _ = reader.read_until(b'\n', &mut discard);
-                                continue;
-                            }
-
-                            // NEW: Acquire non-blocking read lock for the active container validation matrix
-                            let cache_guard = active_containers.read().unwrap_or_else(|p| p.into_inner());
-
-                            evaluate_line_signatures(
-                                trimmed_line,
-                                &regex_compiled,
-                                &id_extractor,
-                                &worker_registry,
-                                &whitelist,
-                                &table,
-                                json_enabled,
-                                &docker_socket_path,
-                                true,
-                                &cache_guard, // NEW: Passed the cache guard reference
-                            );
                         }
 
                         if let Ok(pos) = reader.stream_position() {
@@ -393,7 +367,7 @@ fn run_uds_server(
     table: String,
     json_enabled: bool,
     docker_socket_path: String,
-    active_containers: Arc<RwLock<HashSet<String>>>, // NEW: Accept the cache pointer
+    active_containers: Arc<RwLock<HashSet<String>>>,
 ) {
     let socket_path = "/var/run/runsc-sentry-guard.sock";
     let _ = fs::remove_file(socket_path);
@@ -425,7 +399,10 @@ fn run_uds_server(
             None,
             Some("permissions"),
             "CRASH",
-            &format!("Failed to enforce secure access permissions on UDS socket: {}", e),
+            &format!(
+                "Failed to enforce secure access permissions on UDS socket: {}",
+                e
+            ),
             json_enabled,
         );
         return;
@@ -451,7 +428,7 @@ fn run_uds_server(
             let wl_clone = whitelist.clone();
             let tbl_clone = table.clone();
             let ds_path_clone = docker_socket_path.clone();
-            let cache_clone = Arc::clone(&active_containers); // NEW: Clone cache for worker
+            let cache_clone = Arc::clone(&active_containers);
 
             thread::spawn(move || {
                 handle_uds_stream(
@@ -463,7 +440,7 @@ fn run_uds_server(
                     tbl_clone,
                     json_enabled,
                     ds_path_clone,
-                    cache_clone, // NEW: Pass cache
+                    cache_clone,
                 );
                 conn_tracker.fetch_sub(1, Ordering::SeqCst);
             });
@@ -480,7 +457,7 @@ fn handle_uds_stream(
     table: String,
     json_enabled: bool,
     docker_socket_path: String,
-    active_containers: Arc<RwLock<HashSet<String>>>, // NEW: Accept the cache pointer
+    active_containers: Arc<RwLock<HashSet<String>>>,
 ) {
     if let Err(e) = stream.set_read_timeout(Some(Duration::from_millis(100))) {
         emit_log(
@@ -532,7 +509,6 @@ fn handle_uds_stream(
                 let current_line = String::from_utf8_lossy(&buf);
                 let trimmed = current_line.trim_end();
 
-                // NEW: Acquire thread-safe read lock context for current socket payload iteration
                 let cache_guard = active_containers.read().unwrap_or_else(|p| p.into_inner());
 
                 evaluate_line_signatures(
@@ -545,7 +521,7 @@ fn handle_uds_stream(
                     json_enabled,
                     &docker_socket_path,
                     false,
-                    &cache_guard, // NEW: Pass cache lock slice
+                    &cache_guard,
                 );
             }
             Err(_) => break,
@@ -565,7 +541,6 @@ fn evaluate_line_signatures(
     is_from_file: bool,
     active_containers: &HashSet<String>,
 ) {
-    // FIX: Intent marker silences unused variable checks on non-linux systems
     let _ = active_containers;
 
     for (rule_name, rx, try_act, final_act) in rules.iter() {
@@ -574,14 +549,15 @@ fn evaluate_line_signatures(
                 if let Some(matched_id) = caps.get(1) {
                     let container_id = matched_id.as_str().to_string();
 
-                    // NEW: $O(1)$ verification boundary check protecting worker thread map allocation
                     #[cfg(target_os = "linux")]
                     {
-                        let is_valid = active_containers.contains(&container_id) ||
-                            active_containers.iter().any(|long_id| long_id.starts_with(&container_id));
+                        let is_valid = active_containers.contains(&container_id)
+                            || active_containers
+                                .iter()
+                                .any(|long_id| long_id.starts_with(&container_id));
 
                         if !is_valid {
-                            continue; // Spoofed ID dropped out-of-hand without invoking subprocesses or thread states
+                            continue;
                         }
                     }
 
@@ -664,7 +640,12 @@ fn dispatch_to_worker(
         worker_tx
     });
 
-    match tx.try_send((try_actions, final_actions, rule_name.clone(), trigger_message)) {
+    match tx.try_send((
+        try_actions,
+        final_actions,
+        rule_name.clone(),
+        trigger_message,
+    )) {
         Ok(_) => {}
         Err(TrySendError::Full(_)) => {
             emit_log(
@@ -779,16 +760,28 @@ mod tests {
         let id_extractor = Regex::new(r"--id=\b([a-fA-F0-9]{12}|[a-fA-F0-9]{64})\b").unwrap();
 
         let valid_64 = "--id=a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
-        assert!(id_extractor.is_match(valid_64), "Regex failed to match valid 64-char ID");
+        assert!(
+            id_extractor.is_match(valid_64),
+            "Regex failed to match valid 64-char ID"
+        );
 
         let valid_12 = "--id=a1b2c3d4e5f6";
-        assert!(id_extractor.is_match(valid_12), "Regex failed to match valid 12-char ID");
+        assert!(
+            id_extractor.is_match(valid_12),
+            "Regex failed to match valid 12-char ID"
+        );
 
         let invalid_spoof = "--id=a1b2c3d4e5f67890a";
-        assert!(!id_extractor.is_match(invalid_spoof), "SECURITY ALERT: Regex matched an unbounded invalid spoof ID");
+        assert!(
+            !id_extractor.is_match(invalid_spoof),
+            "SECURITY ALERT: Regex matched an unbounded invalid spoof ID"
+        );
 
         let invalid_short = "--id=abc";
-        assert!(!id_extractor.is_match(invalid_short), "SECURITY ALERT: Regex matched a malformed short ID");
+        assert!(
+            !id_extractor.is_match(invalid_short),
+            "SECURITY ALERT: Regex matched a malformed short ID"
+        );
     }
 }
 

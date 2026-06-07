@@ -114,7 +114,15 @@ fn execute_docker_uds_request(
     let mut is_chunked = false;
     let mut content_length: Option<usize> = None;
 
+    // Mitigate infinite header streaming thread locks
+    let mut header_count = 0;
+    const MAX_HTTP_HEADERS: usize = 100;
+
     loop {
+        if header_count > MAX_HTTP_HEADERS {
+            return Err("UDS Error: Maximum HTTP header count exceeded. Aborting to prevent thread lockup.".into());
+        }
+
         let line = read_bounded_line(&mut reader, 8192)?;
         let trimmed = line.trim();
 
@@ -132,6 +140,8 @@ fn execute_docker_uds_request(
                 content_length = parts[1].trim().parse::<usize>().ok();
             }
         }
+
+        header_count += 1;
     }
 
     let mut body_payload = String::new();

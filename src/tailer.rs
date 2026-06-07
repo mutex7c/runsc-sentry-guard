@@ -3,27 +3,27 @@
 
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
-use std::fs; // CLEANED: Removed unused OpenOptions
+use std::fs;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock}; // RwLock handles matrix validation and registry mapping
 use std::thread;
 use std::time::Duration;
-use crate::config::{AtomicAction, GuardConfig, IngestionMode};
-use crate::logger::emit_log;
-use crate::worker::execute_containment_pipeline;
 
-// Consolidated Unix imports to top scope to eliminate path prefixes
 #[cfg(unix)]
 use std::ffi::{CString, OsStr};
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
 use std::os::unix::io::FromRawFd;
+
+use crate::config::{AtomicAction, GuardConfig, IngestionMode};
+use crate::logger::emit_log;
+use crate::worker::execute_containment_pipeline;
 
 struct LogDescriptor {
     inode: u64,
@@ -71,7 +71,9 @@ pub fn start_monitor_loop(config: GuardConfig) {
         });
     }
 
-    let worker_registry: Arc<Mutex<RegistryMap>> = Arc::new(Mutex::new(HashMap::new()));
+    // PERF FIX: Upgraded from Mutex to RwLock to support lock-free concurrent message dispatching
+    let worker_registry: Arc<RwLock<RegistryMap>> = Arc::new(RwLock::new(HashMap::new()));
+
     let regex_compiled: Arc<Vec<(String, Regex, Vec<AtomicAction>, Vec<AtomicAction>)>> = Arc::new(
         config
             .rules
@@ -360,17 +362,8 @@ pub fn start_monitor_loop(config: GuardConfig) {
     }
 }
 
-// RAII connection guard to guarantee atomics decrement even under thread panics
-struct ConnectionGuard(Arc<AtomicUsize>);
-
-impl Drop for ConnectionGuard {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
-    }
-}
-
 fn run_uds_server(
-    registry: Arc<Mutex<RegistryMap>>,
+    registry: Arc<RwLock<RegistryMap>>, // UPGRADED: Core typing context shifted to RwLock
     regex_rules: Arc<Vec<(String, Regex, Vec<AtomicAction>, Vec<AtomicAction>)>>,
     id_extractor: Regex,
     whitelist: Vec<ipnet::IpNet>,
@@ -453,7 +446,6 @@ fn run_uds_server(
                     ds_path_clone,
                     cache_clone,
                 );
-               
             });
         }
     }
@@ -461,7 +453,7 @@ fn run_uds_server(
 
 fn handle_uds_stream(
     stream: UnixStream,
-    registry: Arc<Mutex<RegistryMap>>,
+    registry: Arc<RwLock<RegistryMap>>, // UPGRADED: Core typing context shifted to RwLock
     regex_rules: Arc<Vec<(String, Regex, Vec<AtomicAction>, Vec<AtomicAction>)>>,
     id_extractor: Regex,
     whitelist: Vec<ipnet::IpNet>,
@@ -544,7 +536,7 @@ fn evaluate_line_signatures(
     line: &str,
     rules: &[(String, Regex, Vec<AtomicAction>, Vec<AtomicAction>)],
     id_extractor: &Regex,
-    registry: &Arc<Mutex<RegistryMap>>,
+    registry: &Arc<RwLock<RegistryMap>>, // UPGRADED: Core typing context shifted to RwLock
     whitelist: &[ipnet::IpNet],
     table: &str,
     json_enabled: bool,
@@ -596,7 +588,7 @@ fn evaluate_line_signatures(
 }
 
 fn dispatch_to_worker(
-    registry: &Arc<Mutex<RegistryMap>>,
+    registry: &Arc<RwLock<RegistryMap>>, // UPGRADED: Core typing context shifted to RwLock
     container_id: String,
     try_actions: Vec<AtomicAction>,
     final_actions: Vec<AtomicAction>,
@@ -609,11 +601,22 @@ fn dispatch_to_worker(
 ) {
     const MAX_WORKERS: usize = 100;
 
-    let mut reg = registry
-        .lock()
+    // FAST PATH: Acquire parallel, non-blocking read lock to pass telemetry frames on active mailboxes
+    {
+        let reg_read = registry.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(tx) = reg_read.get(&container_id) {
+            let _ = tx.try_send((try_actions, final_actions, rule_name, trigger_message));
+            return;
+        }
+    }
+
+    // SLOW PATH: Channel context does not exist. Acquire exclusive write lock to initialize pipeline workers.
+    let mut reg_write = registry
+        .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-    if !reg.contains_key(&container_id) && reg.len() >= MAX_WORKERS {
+    // Double-Checked Locking Pattern validation check
+    if !reg_write.contains_key(&container_id) && reg_write.len() >= MAX_WORKERS {
         emit_log(
             "CRITICAL",
             "orchestrator",
@@ -628,7 +631,7 @@ fn dispatch_to_worker(
         return;
     }
 
-    let tx = reg.entry(container_id.clone()).or_insert_with(|| {
+    let tx = reg_write.entry(container_id.clone()).or_insert_with(|| {
         let (worker_tx, worker_rx) = sync_channel::<WorkerChannelMessage>(64);
         let cid_clone = container_id.clone();
         let wl_clone = whitelist.to_vec();
@@ -690,7 +693,7 @@ fn dispatch_to_worker(
 fn run_worker_lifecycle(
     container_id: String,
     rx_chan: Receiver<WorkerChannelMessage>,
-    registry: Arc<Mutex<RegistryMap>>,
+    registry: Arc<RwLock<RegistryMap>>, // UPGRADED: Core typing context shifted to RwLock
     whitelist: Vec<ipnet::IpNet>,
     table: String,
     json_enabled: bool,
@@ -714,8 +717,9 @@ fn run_worker_lifecycle(
                 );
             }
             Err(_) => {
+                // Decay phase: Acquire exclusive write lock strictly on worker termination
                 let mut reg = registry
-                    .lock()
+                    .write()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
 
                 match rx_chan.try_recv() {
@@ -814,7 +818,14 @@ fn notify_systemd_ready() {
     }
 }
 
-// CLEANED: Paths cleanly use relative file scope imports without prefixes
+struct ConnectionGuard(Arc<AtomicUsize>);
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 #[cfg(unix)]
 fn open_log_safe(dir_path: &Path, file_name: &OsStr) -> std::io::Result<fs::File> {
     let dir_c = CString::new(dir_path.as_os_str().as_bytes())

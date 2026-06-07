@@ -3,7 +3,7 @@
 
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, OpenOptions};
+use std::fs; // CLEANED: Removed unused OpenOptions
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -13,13 +13,17 @@ use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_cha
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
-
-#[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
-
 use crate::config::{AtomicAction, GuardConfig, IngestionMode};
 use crate::logger::emit_log;
 use crate::worker::execute_containment_pipeline;
+
+// Consolidated Unix imports to top scope to eliminate path prefixes
+#[cfg(unix)]
+use std::ffi::{CString, OsStr};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
+use std::os::unix::io::FromRawFd;
 
 struct LogDescriptor {
     inode: u64,
@@ -234,10 +238,7 @@ pub fn start_monitor_loop(config: GuardConfig) {
                     }
 
                     #[cfg(unix)]
-                    let file_result = OpenOptions::new()
-                        .read(true)
-                        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                        .open(&path);
+                    let file_result = open_log_safe(log_dir_path, path.file_name().unwrap());
 
                     #[cfg(not(unix))]
                     let file_result = fs::File::open(&path);
@@ -553,8 +554,8 @@ fn evaluate_line_signatures(
                     {
                         let is_valid = active_containers.contains(&container_id)
                             || active_containers
-                                .iter()
-                                .any(|long_id| long_id.starts_with(&container_id));
+                            .iter()
+                            .any(|long_id| long_id.starts_with(&container_id));
 
                         if !is_valid {
                             continue;
@@ -800,5 +801,37 @@ fn notify_systemd_ready() {
                 let _ = socket.send_to(b"READY=1\n", resolved_path);
             }
         }
+    }
+}
+
+// CLEANED: Paths cleanly use relative file scope imports without prefixes
+#[cfg(unix)]
+fn open_log_safe(dir_path: &Path, file_name: &OsStr) -> std::io::Result<fs::File> {
+    let dir_c = CString::new(dir_path.as_os_str().as_bytes())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let file_c = CString::new(file_name.as_bytes())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+
+    unsafe {
+        let dir_fd = libc::open(
+            dir_c.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        );
+        if dir_fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        let file_fd = libc::openat(
+            dir_fd,
+            file_c.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        );
+        libc::close(dir_fd);
+
+        if file_fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        Ok(fs::File::from_raw_fd(file_fd))
     }
 }

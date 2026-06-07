@@ -1,8 +1,9 @@
 // Ingestion Pipeline Engine
 // Operates high-performance file tailers and parallel UDS socket tracking pipelines cleanly.
+// Features active DoS-resistant TOCTOU mitigations and SO_PEERCRED trust boundaries.
 
 use regex::Regex;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::os::unix::fs::PermissionsExt;
@@ -10,9 +11,9 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
-use std::sync::{Arc, RwLock}; // RwLock handles matrix validation and registry mapping
+use std::sync::{Arc, Mutex, RwLock}; // RwLock handles matrix validation and registry mapping
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use std::ffi::{CString, OsStr};
@@ -32,6 +33,19 @@ struct LogDescriptor {
 
 type WorkerChannelMessage = (Vec<AtomicAction>, Vec<AtomicAction>, String, String);
 type RegistryMap = HashMap<String, SyncSender<WorkerChannelMessage>>;
+
+// Anti-DoS State Engine controlling the TOCTOU synchronous lookup fallback
+#[allow(dead_code)]
+struct AntiDosState {
+    negative_cache: HashSet<String>,
+    negative_queue: VecDeque<String>,
+    tokens: u32,
+    last_refill: Instant,
+}
+
+#[allow(dead_code)]
+const MAX_NEGATIVE_CACHE: usize = 1000;
+const MAX_LOOKUP_TOKENS: u32 = 10; // Max API queries per second for unknown IDs
 
 pub fn start_monitor_loop(config: GuardConfig) {
     let mode = &config.monitor.mode;
@@ -53,6 +67,14 @@ pub fn start_monitor_loop(config: GuardConfig) {
 
     // Initialize the shared thread-safe container ID cache
     let active_containers = Arc::new(RwLock::new(HashSet::<String>::new()));
+
+    // Initialize the DoS mitigation state
+    let anti_dos_state = Arc::new(Mutex::new(AntiDosState {
+        negative_cache: HashSet::new(),
+        negative_queue: VecDeque::new(),
+        tokens: MAX_LOOKUP_TOKENS,
+        last_refill: Instant::now(),
+    }));
 
     // Detached event-driven background thread utilizing zero-delay socket streaming context
     #[cfg(target_os = "linux")]
@@ -168,7 +190,6 @@ pub fn start_monitor_loop(config: GuardConfig) {
         });
     }
 
-    // PERF FIX: Upgraded from Mutex to RwLock to support lock-free concurrent message dispatching
     let worker_registry: Arc<RwLock<RegistryMap>> = Arc::new(RwLock::new(HashMap::new()));
 
     let regex_compiled: Arc<Vec<(String, Regex, Vec<AtomicAction>, Vec<AtomicAction>)>> = Arc::new(
@@ -200,6 +221,7 @@ pub fn start_monitor_loop(config: GuardConfig) {
         let uds_table = table.clone();
         let uds_socket_path = docker_socket_path.clone();
         let uds_cache = Arc::clone(&active_containers);
+        let uds_anti_dos = Arc::clone(&anti_dos_state);
 
         thread::spawn(move || {
             run_uds_server(
@@ -211,6 +233,7 @@ pub fn start_monitor_loop(config: GuardConfig) {
                 json_enabled,
                 uds_socket_path,
                 uds_cache,
+                uds_anti_dos,
             );
         });
     }
@@ -396,8 +419,6 @@ pub fn start_monitor_loop(config: GuardConfig) {
                                 let trimmed = line_slice.trim_end();
 
                                 if !trimmed.is_empty() {
-                                    let cache_guard =
-                                        active_containers.read().unwrap_or_else(|p| p.into_inner());
                                     evaluate_line_signatures(
                                         trimmed,
                                         &regex_compiled,
@@ -408,7 +429,8 @@ pub fn start_monitor_loop(config: GuardConfig) {
                                         json_enabled,
                                         &docker_socket_path,
                                         true,
-                                        &cache_guard,
+                                        &active_containers,
+                                        &anti_dos_state,
                                     );
                                 }
                                 start_pos = end_pos + 1;
@@ -460,7 +482,7 @@ pub fn start_monitor_loop(config: GuardConfig) {
 }
 
 fn run_uds_server(
-    registry: Arc<RwLock<RegistryMap>>, // UPGRADED: Core typing context shifted to RwLock
+    registry: Arc<RwLock<RegistryMap>>,
     regex_rules: Arc<Vec<(String, Regex, Vec<AtomicAction>, Vec<AtomicAction>)>>,
     id_extractor: Regex,
     whitelist: Vec<ipnet::IpNet>,
@@ -468,6 +490,7 @@ fn run_uds_server(
     json_enabled: bool,
     docker_socket_path: String,
     active_containers: Arc<RwLock<HashSet<String>>>,
+    anti_dos_state: Arc<Mutex<AntiDosState>>,
 ) {
     let socket_path = "/var/run/runsc-sentry-guard.sock";
     let _ = fs::remove_file(socket_path);
@@ -515,6 +538,31 @@ fn run_uds_server(
 
     for stream in listener.incoming() {
         if let Ok(stream) = stream {
+
+            // SECURITY: Extract Peer Credentials to prevent unauthorized local processes from flooding the queue
+            #[cfg(target_os = "linux")]
+            {
+                if let Ok(cred) = stream.peer_cred() {
+                    // Reject connection if not root (or map specifically to 'docker' group if required)
+                    if cred.uid() != 0 {
+                        emit_log(
+                            "WARN",
+                            "uds_server",
+                            None,
+                            None,
+                            None,
+                            Some("trust_boundary"),
+                            "REJECTED",
+                            &format!("Unauthorized UID {} attempted UDS connection. Payload dropped.", cred.uid()),
+                            json_enabled,
+                        );
+                        continue;
+                    }
+                } else {
+                    continue; // Drop unverified origins safely
+                }
+            }
+
             if active_connections.load(Ordering::SeqCst) >= MAX_UDS_CONNECTIONS {
                 continue;
             }
@@ -529,6 +577,7 @@ fn run_uds_server(
             let tbl_clone = table.clone();
             let ds_path_clone = docker_socket_path.clone();
             let cache_clone = Arc::clone(&active_containers);
+            let dos_clone = Arc::clone(&anti_dos_state);
 
             thread::spawn(move || {
                 let _guard = ConnectionGuard(conn_tracker);
@@ -542,6 +591,7 @@ fn run_uds_server(
                     json_enabled,
                     ds_path_clone,
                     cache_clone,
+                    dos_clone,
                 );
             });
         }
@@ -550,7 +600,7 @@ fn run_uds_server(
 
 fn handle_uds_stream(
     stream: UnixStream,
-    registry: Arc<RwLock<RegistryMap>>, // UPGRADED: Core typing context shifted to RwLock
+    registry: Arc<RwLock<RegistryMap>>,
     regex_rules: Arc<Vec<(String, Regex, Vec<AtomicAction>, Vec<AtomicAction>)>>,
     id_extractor: Regex,
     whitelist: Vec<ipnet::IpNet>,
@@ -558,6 +608,7 @@ fn handle_uds_stream(
     json_enabled: bool,
     docker_socket_path: String,
     active_containers: Arc<RwLock<HashSet<String>>>,
+    anti_dos_state: Arc<Mutex<AntiDosState>>,
 ) {
     if let Err(e) = stream.set_read_timeout(Some(Duration::from_millis(100))) {
         emit_log(
@@ -609,8 +660,6 @@ fn handle_uds_stream(
                 let current_line = String::from_utf8_lossy(&buf);
                 let trimmed = current_line.trim_end();
 
-                let cache_guard = active_containers.read().unwrap_or_else(|p| p.into_inner());
-
                 evaluate_line_signatures(
                     trimmed,
                     &regex_rules,
@@ -621,7 +670,8 @@ fn handle_uds_stream(
                     json_enabled,
                     &docker_socket_path,
                     false,
-                    &cache_guard,
+                    &active_containers,
+                    &anti_dos_state,
                 );
             }
             Err(_) => break,
@@ -629,19 +679,46 @@ fn handle_uds_stream(
     }
 }
 
+// Synchronous Fast-Path to close the TOCTOU gap
+#[cfg(target_os = "linux")]
+fn is_container_active_sync(container_id: &str, socket_path: &str) -> bool {
+    use std::io::{BufRead, Write};
+
+    if let Ok(mut stream) = UnixStream::connect(socket_path) {
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+        let request = format!("GET /containers/{}/json HTTP/1.0\r\n\r\n", container_id);
+
+        if stream.write_all(request.as_bytes()).is_ok() {
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            if reader.read_line(&mut line).is_ok() {
+                // If Docker returns an HTTP 200, the container actively exists
+                return line.contains(" 200 ");
+            }
+        }
+    }
+    false
+}
+
 fn evaluate_line_signatures(
     line: &str,
     rules: &[(String, Regex, Vec<AtomicAction>, Vec<AtomicAction>)],
     id_extractor: &Regex,
-    registry: &Arc<RwLock<RegistryMap>>, // UPGRADED: Core typing context shifted to RwLock
+    registry: &Arc<RwLock<RegistryMap>>,
     whitelist: &[ipnet::IpNet],
     table: &str,
     json_enabled: bool,
     docker_socket_path: &str,
     is_from_file: bool,
-    active_containers: &HashSet<String>,
+    active_containers: &Arc<RwLock<HashSet<String>>>,
+    anti_dos_state: &Arc<Mutex<AntiDosState>>,
 ) {
-    let _ = active_containers;
+    // Explicitly consume variables on non-Linux targets to silence compiler warnings
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = active_containers;
+        let _ = anti_dos_state;
+    }
 
     for (rule_name, rx, try_act, final_act) in rules.iter() {
         if rx.is_match(line) {
@@ -651,10 +728,69 @@ fn evaluate_line_signatures(
 
                     #[cfg(target_os = "linux")]
                     {
-                        let is_valid = active_containers.contains(&container_id)
-                            || active_containers
-                                .iter()
-                                .any(|long_id| long_id.starts_with(&container_id));
+                        let mut is_valid = false;
+
+                        // Check primary active cache
+                        {
+                            let active_guard = active_containers.read().unwrap_or_else(|p| p.into_inner());
+                            is_valid = active_guard.contains(&container_id)
+                                || active_guard.iter().any(|long_id| long_id.starts_with(&container_id));
+                        }
+
+                        // Fallback: Synchronous Verification mapped behind Negative Cache & Rate Limits
+                        if !is_valid {
+                            let mut dos_guard = anti_dos_state.lock().unwrap_or_else(|p| p.into_inner());
+
+                            // Token Replenishment
+                            let now = Instant::now();
+                            if now.duration_since(dos_guard.last_refill).as_secs() >= 1 {
+                                dos_guard.tokens = MAX_LOOKUP_TOKENS;
+                                dos_guard.last_refill = now;
+                            }
+
+                            // Bypass check if attacker is hitting known bad IDs
+                            if dos_guard.negative_cache.contains(&container_id) {
+                                continue;
+                            }
+
+                            if dos_guard.tokens > 0 {
+                                dos_guard.tokens -= 1;
+                                drop(dos_guard); // Free lock immediately during active I/O
+
+                                let actually_exists = is_container_active_sync(&container_id, docker_socket_path);
+
+                                if actually_exists {
+                                    let mut active_write = active_containers.write().unwrap_or_else(|p| p.into_inner());
+                                    active_write.insert(container_id.clone());
+                                    is_valid = true;
+                                } else {
+                                    let mut dos_write = anti_dos_state.lock().unwrap_or_else(|p| p.into_inner());
+
+                                    // Maintain bounded LRU capacity for Negative Cache
+                                    if dos_write.negative_cache.len() >= MAX_NEGATIVE_CACHE {
+                                        if let Some(oldest) = dos_write.negative_queue.pop_front() {
+                                            dos_write.negative_cache.remove(&oldest);
+                                        }
+                                    }
+                                    dos_write.negative_cache.insert(container_id.clone());
+                                    dos_write.negative_queue.push_back(container_id.clone());
+                                }
+                            } else {
+                                // ID Exhaustion flood detected. Drop payload cleanly to protect the engine.
+                                emit_log(
+                                    "WARN",
+                                    "orchestrator",
+                                    None,
+                                    None,
+                                    None,
+                                    Some("api_rate_limit"),
+                                    "DROPPED",
+                                    "Container lookup token pool exhausted. Payload discarded.",
+                                    json_enabled,
+                                );
+                                continue;
+                            }
+                        }
 
                         if !is_valid {
                             continue;
@@ -685,7 +821,7 @@ fn evaluate_line_signatures(
 }
 
 fn dispatch_to_worker(
-    registry: &Arc<RwLock<RegistryMap>>, // UPGRADED: Core typing context shifted to RwLock
+    registry: &Arc<RwLock<RegistryMap>>,
     container_id: String,
     try_actions: Vec<AtomicAction>,
     final_actions: Vec<AtomicAction>,
@@ -792,7 +928,7 @@ fn dispatch_to_worker(
 fn run_worker_lifecycle(
     container_id: String,
     rx_chan: Receiver<WorkerChannelMessage>,
-    registry: Arc<RwLock<RegistryMap>>, // UPGRADED: Core typing context shifted to RwLock
+    registry: Arc<RwLock<RegistryMap>>,
     whitelist: Vec<ipnet::IpNet>,
     table: String,
     json_enabled: bool,

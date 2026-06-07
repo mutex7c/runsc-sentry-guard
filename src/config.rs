@@ -2,6 +2,7 @@
 // Handles the secure ingestion, parsing, and type-safe validation of the declarative `config.toml` structure.
 // Enforces strict schema validations via Serde to ensure safe startup aborts on anomaly detection.
 
+use anyhow::{anyhow, Context, Result};
 use ipnet::IpNet;
 use serde::Deserialize;
 use std::fs;
@@ -82,27 +83,26 @@ pub struct GuardConfig {
 
 // Fail-Safe Configuration Loader
 // Securely reads the raw profile manifest from the host system, executing deep structural syntax validations.
-pub fn load_config<P: AsRef<Path>>(path: P) -> Result<GuardConfig, String> {
+pub fn load_config<P: AsRef<Path>>(path: P) -> Result<GuardConfig> {
     let path_ref = path.as_ref();
 
-    let content = fs::read_to_string(path_ref).map_err(|e| {
+    let content = fs::read_to_string(path_ref).with_context(|| {
         format!(
-            "Configuration missing, inaccessible, or tampered at '{}': {}",
-            path_ref.display(),
-            e
+            "Configuration missing, inaccessible, or tampered at '{}'",
+            path_ref.display()
         )
     })?;
 
     let config: GuardConfig = toml::from_str(&content)
-        .map_err(|e| format!("Configuration structural verification failed: {}", e))?;
+        .context("Configuration structural verification failed")?;
 
     if config.rules.is_empty() {
-        return Err("Security Constraint Violation: At least one active detection [[rules]] block must be defined.".to_string());
+        return Err(anyhow!("Security Constraint Violation: At least one active detection [[rules]] block must be defined."));
     }
 
     for rule in &config.rules {
         if rule.try_actions.is_empty() && rule.final_actions.is_empty() {
-            return Err(format!(
+            return Err(anyhow!(
                 "Validation Error: Rule '{}' contains no operational try/final actions.",
                 rule.name
             ));
@@ -159,6 +159,9 @@ mod tests {
     fn test_load_config_missing_file_handling() {
         let result = load_config("/path/that/absolutely/does/not/exist/config.toml");
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Configuration missing, inaccessible, or tampered"));
+
+        // Extract the error and convert it to a string to verify the context
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("Configuration missing, inaccessible, or tampered"));
     }
 }

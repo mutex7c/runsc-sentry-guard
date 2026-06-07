@@ -556,21 +556,45 @@ fn execute_atomic_command(
                                 );
                                 continue;
                             }
-                            execute_firewall_mutation(&ip.to_string(), set_name, timeout, table)?;
-                            emit_log(
-                                "CRITICAL",
-                                "worker_engine",
-                                None,
-                                Some(container_id),
-                                Some(&ip.to_string()),
-                                Some("nft_blacklist"),
-                                "SUCCESS",
-                                &format!(
-                                    "Target network isolated via set {} for duration context {}",
-                                    set_name, timeout
-                                ),
-                                json_enabled,
-                            );
+                            #[cfg(target_os = "linux")]
+                            fn execute_firewall_mutation(
+                                ip: &str,
+                                set: &str,
+                                timeout: &str,
+                                table: &str,
+                            ) -> Result<(), String> {
+                                use regex::Regex;
+                                static VALIDATION_RULE: OnceLock<Regex> = OnceLock::new();
+
+                                let rule = VALIDATION_RULE.get_or_init(|| Regex::new(r"^\d+[smhd]$").unwrap());
+
+                                if !rule.is_match(timeout) {
+                                    return Err(format!(
+                                        "Security Constraint Violation: Intercepted malformed firewall duration payload: '{}'",
+                                        timeout
+                                    ));
+                                }
+
+                                // Safely construct the final nftables element block
+                                let element_payload = format!("{{ {} timeout {} }}", ip, timeout);
+
+                                // FIX: Split the table string (e.g., "inet security_ops") into discrete string tokens
+                                // to prevent execve from rejecting the command as a single malformed argument.
+                                let s = Command::new("nft")
+                                    .arg("add")
+                                    .arg("element")
+                                    .args(table.split_whitespace())
+                                    .arg(set)
+                                    .arg(&element_payload)
+                                    .status()
+                                    .map_err(|e| e.to_string())?;
+
+                                if s.success() {
+                                    Ok(())
+                                } else {
+                                    Err("Kernel nftables transaction rejected execution parameters.".into())
+                                }
+                            }
                         }
                         Ok(())
                     }

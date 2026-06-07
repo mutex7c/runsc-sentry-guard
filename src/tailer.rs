@@ -360,6 +360,15 @@ pub fn start_monitor_loop(config: GuardConfig) {
     }
 }
 
+// RAII connection guard to guarantee atomics decrement even under thread panics
+struct ConnectionGuard(Arc<AtomicUsize>);
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 fn run_uds_server(
     registry: Arc<Mutex<RegistryMap>>,
     regex_rules: Arc<Vec<(String, Regex, Vec<AtomicAction>, Vec<AtomicAction>)>>,
@@ -432,6 +441,7 @@ fn run_uds_server(
             let cache_clone = Arc::clone(&active_containers);
 
             thread::spawn(move || {
+                let _guard = ConnectionGuard(conn_tracker);
                 handle_uds_stream(
                     stream,
                     reg_clone,
@@ -443,7 +453,7 @@ fn run_uds_server(
                     ds_path_clone,
                     cache_clone,
                 );
-                conn_tracker.fetch_sub(1, Ordering::SeqCst);
+               
             });
         }
     }

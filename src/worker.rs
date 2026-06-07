@@ -694,7 +694,7 @@ pub fn execute_containment_pipeline(
         emit_json_escalation_marker(&container_id, &rule_name, json_enabled);
 
         for fallback in &final_actions {
-            if let Err(fallback_error) = execute_atomic_command(
+            match execute_atomic_command(
                 fallback,
                 &container_id,
                 &whitelist,
@@ -703,17 +703,67 @@ pub fn execute_containment_pipeline(
                 &socket_path,
                 &trigger_message,
             ) {
-                emit_log(
-                    "CRITICAL",
-                    "worker_engine",
-                    Some(&rule_name),
-                    Some(&container_id),
-                    None,
-                    Some(&format!("{:?}", fallback)),
-                    "CRASH",
-                    &format!("EMERGENCY CONTAINMENT FAILURE: {}", fallback_error),
-                    json_enabled,
-                );
+                Ok(_) => {
+                    emit_log(
+                        "INFO",
+                        "worker_engine",
+                        Some(&rule_name),
+                        Some(&container_id),
+                        None,
+                        Some(&format!("{:?}", fallback)),
+                        "SUCCESS",
+                        "Emergency fallback action executed successfully.",
+                        json_enabled,
+                    );
+
+                    // Short-circuit the loop ONLY if the successful action was a terminal state mutation
+                    match fallback {
+                        AtomicAction::ContainerSignal { signal } => {
+                            if signal == "SIGKILL" || signal == "SIGSTOP" {
+                                emit_log(
+                                    "CRITICAL",
+                                    "worker_engine",
+                                    Some(&rule_name),
+                                    Some(&container_id),
+                                    None,
+                                    None,
+                                    "HALTED",
+                                    "Terminal signal delivered. Short-circuiting remaining fallback chain.",
+                                    json_enabled,
+                                );
+                                break;
+                            }
+                        }
+                        AtomicAction::Restart => {
+                            emit_log(
+                                "CRITICAL",
+                                "worker_engine",
+                                Some(&rule_name),
+                                Some(&container_id),
+                                None,
+                                None,
+                                "HALTED",
+                                "Container runtime restarted. Short-circuiting remaining fallback chain.",
+                                json_enabled,
+                            );
+                            break;
+                        }
+                        _ => {} // Non-terminal actions (logging, firewalls, webhooks) allow the loop to continue
+                    }
+                }
+                Err(fallback_error) => {
+                    emit_log(
+                        "CRITICAL",
+                        "worker_engine",
+                        Some(&rule_name),
+                        Some(&container_id),
+                        None,
+                        Some(&format!("{:?}", fallback)),
+                        "CRASH",
+                        &format!("EMERGENCY CONTAINMENT FAILURE: {}", fallback_error),
+                        json_enabled,
+                    );
+                }
             }
         }
     }

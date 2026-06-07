@@ -833,6 +833,41 @@ mod tests {
         );
     }
 
+    // NEW: Verifies that exact-boundary matches without a trailing newline are flagged correctly
+    #[test]
+    fn test_read_bounded_line_exact_limit_anomaly() {
+        let data = vec![b'B'; 64];
+        let mut cursor = Cursor::new(data);
+
+        let result = read_bounded_line(&mut cursor, 64);
+        assert!(result.is_err(), "Engine should fail if buffer hits limit exactly without finding a newline");
+    }
+
+    // NEW: Regression verification proving command-injection attempts inside firewall rules are blocked instantly
+    #[test]
+    fn test_firewall_timeout_injection_defense() {
+        let target_ip = "10.0.0.2";
+        let target_set = "blacklist_set";
+        let target_table = "inet filter";
+
+        // Attempt an absolute classic syntax bypass payload
+        let malicious_timeout = "24h; nft delete table inet filter;";
+
+        let validation_result = execute_firewall_mutation(target_ip, target_set, malicious_timeout, target_table);
+
+        assert!(
+            validation_result.is_err(),
+            "VULNERABILITY REGRESSION: Ingestion loop allowed unchecked structural timeout manipulation!"
+        );
+
+        if let Err(err_string) = validation_result {
+            assert!(
+                err_string.contains("Security Constraint Violation"),
+                "Error context should explicitly detail a security validation drop"
+            );
+        }
+    }
+
     #[test]
     fn test_execute_uds_request_length_boundary_violation() {
         let malformed_http_response = "HTTP/1.1 200 OK\r\nContent-Length: 1073741824\r\n\r\n";
@@ -840,7 +875,7 @@ mod tests {
 
         let mut reader = std::io::BufReader::new(&mut cursor);
         let status_line = read_bounded_line(&mut reader, 8192).unwrap();
-        let status_code = status_line
+        let _status_code = status_line
             .split_whitespace()
             .nth(1)
             .unwrap()

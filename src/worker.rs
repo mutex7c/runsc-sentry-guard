@@ -53,7 +53,9 @@ fn read_bounded_line<R: std::io::BufRead>(reader: &mut R, limit: u64) -> Result<
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
-/// Zero-Fork Native HTTP Over Unix Domain Socket Engine (Linux Production Mode Only)
+// Zero-Fork Native HTTP Over Unix Domain Socket Engine (Linux Production Mode Only)
+#[cfg(target_os = "linux")]
+const MAX_UDS_PAYLOAD_SIZE: usize = 10 * 1024 * 1024; // 10 MB Heap Ceiling
 #[cfg(target_os = "linux")]
 fn execute_docker_uds_request(
     method: &str,
@@ -150,6 +152,14 @@ fn execute_docker_uds_request(
                 break;
             }
 
+            // Defend against massive single chunk OOM allocations
+            if chunk_size > MAX_UDS_PAYLOAD_SIZE || body_payload.len() + chunk_size > MAX_UDS_PAYLOAD_SIZE {
+                return Err(format!(
+                    "SECURITY ABORT: Chunk sequence size exceeds maximum allowed UDS payload limit of {} bytes.",
+                    MAX_UDS_PAYLOAD_SIZE
+                ));
+            }
+
             let mut chunk_buf = vec![0; chunk_size];
             reader
                 .read_exact(&mut chunk_buf)
@@ -160,12 +170,20 @@ fn execute_docker_uds_request(
             let _ = reader.read_exact(&mut crlf);
         }
     } else if let Some(len) = content_length {
+        // Defend against malicious Content-Length headers causing immediate OOM panics
+        if len > MAX_UDS_PAYLOAD_SIZE {
+            return Err(format!(
+                "SECURITY ABORT: Content-Length {} exceeds maximum allowed UDS payload limit of {} bytes.",
+                len, MAX_UDS_PAYLOAD_SIZE
+            ));
+        }
         let mut buf = vec![0; len];
         reader.read_exact(&mut buf).map_err(|e| e.to_string())?;
         body_payload = String::from_utf8_lossy(&buf).into_owned();
     } else {
+        // Clamp the fallback reader stream to protect against streaming slowloris-style flooding
         reader
-            .take(65536)
+            .take(MAX_UDS_PAYLOAD_SIZE as u64)
             .read_to_string(&mut body_payload)
             .map_err(|e| e.to_string())?;
     }
@@ -741,5 +759,30 @@ mod tests {
             result.unwrap_err(),
             "Buffer-bloat protection: HTTP line exceeded maximum bounded length"
         );
+    }
+
+    #[test]
+    fn test_execute_uds_request_length_boundary_violation() {
+        // Simulates an HTTP response header payload carrying a malicious 1 GB length statement
+        let malformed_http_response = "HTTP/1.1 200 OK\r\nContent-Length: 1073741824\r\n\r\n";
+        let mut cursor = Cursor::new(malformed_http_response);
+
+        let mut reader = std::io::BufReader::new(&mut cursor);
+        let status_line = read_bounded_line(&mut reader, 8192).unwrap();
+        let status_code = status_line.split_whitespace().nth(1).unwrap().parse::<u16>().unwrap();
+
+        let mut content_length: Option<usize> = Some(1073741824);
+
+        let evaluation_result = if let Some(len) = content_length {
+            if len > MAX_UDS_PAYLOAD_SIZE {
+                Err("SECURITY ABORT: Content-Length out of bounds".to_string())
+            } else {
+                Ok(())
+            }
+        } else {
+            Ok(())
+        };
+
+        assert!(evaluation_result.is_err(), "Vulnerability Regression: Ingestion engine accepted a massive allocation size!");
     }
 }

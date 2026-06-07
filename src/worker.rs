@@ -9,6 +9,8 @@ use std::process::Command;
 use std::sync::Arc;
 
 #[cfg(target_os = "linux")]
+use std::io::BufRead; // Add this line near your other std::io imports
+#[cfg(target_os = "linux")]
 use serde::Deserialize;
 #[cfg(target_os = "linux")]
 use std::collections::HashMap;
@@ -41,6 +43,7 @@ struct DockerInspectResponse {
 #[cfg(target_os = "linux")]
 pub struct DockerEventPayload {
     #[serde(rename = "Type")]
+    #[allow(dead_code)]
     pub event_type: String,
     #[serde(rename = "Action")]
     pub action: String,
@@ -689,7 +692,8 @@ fn execute_firewall_mutation(
 #[derive(Deserialize)]
 #[cfg(target_os = "linux")]
 struct DockerContainerListResponse {
-    Id: String,
+    #[serde(rename = "Id")]
+    id: String, // Clean, idiomatic Rust name that maps perfectly to "Id" in the JSON
 }
 
 #[cfg(target_os = "linux")]
@@ -701,7 +705,7 @@ pub fn fetch_running_container_ids(socket_path: &str) -> std::collections::HashS
             if let Ok(parsed) =
                 serde_json::from_str::<Vec<DockerContainerListResponse>>(&json_payload)
             {
-                return parsed.into_iter().map(|c| c.Id).collect();
+                return parsed.into_iter().map(|c| c.id).collect();
             }
         }
         _ => {}

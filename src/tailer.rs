@@ -484,6 +484,30 @@ pub fn start_monitor_loop(config: GuardConfig) {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn get_peer_uid(stream: &std::os::unix::net::UnixStream) -> std::io::Result<u32> {
+    use std::os::unix::io::AsRawFd;
+    let fd = stream.as_raw_fd();
+    let mut ucred = libc::ucred { pid: 0, uid: 0, gid: 0 };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+
+    let res = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut ucred as *mut libc::ucred as *mut libc::c_void,
+            &mut len,
+        )
+    };
+
+    if res == 0 {
+        Ok(ucred.uid)
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
 fn run_uds_server(
     registry: Arc<RwLock<RegistryMap>>,
     regex_rules: Arc<Vec<(String, Regex, Vec<AtomicAction>, Vec<AtomicAction>)>>,
@@ -542,12 +566,12 @@ fn run_uds_server(
     for stream in listener.incoming() {
         if let Ok(stream) = stream {
 
-            // SECURITY: Extract Peer Credentials to prevent unauthorized local processes from flooding the queue
+            // SECURITY: Extract Peer Credentials using raw libc to bypass unstable std features
             #[cfg(target_os = "linux")]
             {
-                if let Ok(cred) = stream.peer_cred() {
+                if let Ok(peer_uid) = get_peer_uid(&stream) {
                     // Reject connection if not root (or map specifically to 'docker' group if required)
-                    if cred.uid() != 0 {
+                    if peer_uid != 0 {
                         emit_log(
                             "WARN",
                             "uds_server",
@@ -556,7 +580,7 @@ fn run_uds_server(
                             None,
                             Some("trust_boundary"),
                             "REJECTED",
-                            &format!("Unauthorized UID {} attempted UDS connection. Payload dropped.", cred.uid()),
+                            &format!("Unauthorized UID {} attempted UDS connection. Payload dropped.", peer_uid),
                             json_enabled,
                         );
                         continue;
@@ -731,14 +755,11 @@ fn evaluate_line_signatures(
 
                     #[cfg(target_os = "linux")]
                     {
-                        let mut is_valid = false;
-
-                        // Check primary active cache
-                        {
+                        let mut is_valid = {
                             let active_guard = active_containers.read().expect("CRITICAL: Active container cache lock poisoned. Aborting.");
-                            is_valid = active_guard.contains(&container_id)
-                                || active_guard.iter().any(|long_id| long_id.starts_with(&container_id));
-                        }
+                            active_guard.contains(&container_id)
+                                || active_guard.iter().any(|long_id| long_id.starts_with(&container_id))
+                        };
 
                         // Fallback: Synchronous Verification mapped behind Negative Cache & Rate Limits
                         if !is_valid {

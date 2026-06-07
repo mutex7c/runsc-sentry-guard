@@ -54,19 +54,116 @@ pub fn start_monitor_loop(config: GuardConfig) {
     // Initialize the shared thread-safe container ID cache
     let active_containers = Arc::new(RwLock::new(HashSet::<String>::new()));
 
-    // Detached background thread to periodically refresh the whitelist cache from the socket
+    // Detached event-driven background thread utilizing zero-delay socket streaming context
     #[cfg(target_os = "linux")]
     {
         let cache_clone = Arc::clone(&active_containers);
         let ds_path = docker_socket_path.clone();
-        let thread_interval = config.monitor.check_interval_ms;
+
         thread::spawn(move || {
+            use std::io::Write;
+
+            // 1. Initial Seeding Call to eliminate cold-start visibility race windows
+            let initial_ids = crate::worker::fetch_running_container_ids(&ds_path);
+            if let Ok(mut guard) = cache_clone.write() {
+                *guard = initial_ids;
+            }
+
+            // Target container filter query string explicitly tracking asset creation and destruction
+            let stream_endpoint = "/events?filters=%7B%22type%22%3A%5B%22container%22%5D%2C%22event%22%3A%5B%22start%22%2C%22die%22%5D%7D";
+
             loop {
-                let fresh_ids = crate::worker::fetch_running_container_ids(&ds_path);
-                if let Ok(mut guard) = cache_clone.write() {
-                    *guard = fresh_ids;
+                if let Ok(mut stream) = UnixStream::connect(&ds_path) {
+                    let request = format!(
+                        "GET {} HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n",
+                        stream_endpoint
+                    );
+
+                    if stream.write_all(request.as_bytes()).is_ok() {
+                        let mut reader = BufReader::new(stream);
+                        let mut status_ok = false;
+                        let mut is_chunked = false;
+                        let mut header_count = 0;
+
+                        // Parse HTTP response headers safely up to a strict line ceiling
+                        while header_count < 100 {
+                            let mut header_line = String::new();
+                            if reader.read_line(&mut header_line).is_err() {
+                                break;
+                            }
+                            let trimmed = header_line.trim();
+                            if trimmed.is_empty() {
+                                break;
+                            }
+                            if header_line.starts_with("HTTP/1.1 200")
+                                || header_line.starts_with("HTTP/1.0 200")
+                            {
+                                status_ok = true;
+                            }
+                            let lower = trimmed.to_lowercase();
+                            if lower.starts_with("transfer-encoding:") && lower.contains("chunked")
+                            {
+                                is_chunked = true;
+                            }
+                            header_count += 1;
+                        }
+
+                        // Stream processing loop with native HTTP chunk-unwrapping
+                        if status_ok && is_chunked {
+                            let mut chunk_size_buf = String::new();
+
+                            loop {
+                                chunk_size_buf.clear();
+                                if reader.read_line(&mut chunk_size_buf).is_err() {
+                                    break;
+                                }
+                                let trimmed_size = chunk_size_buf.trim();
+                                if trimmed_size.is_empty() {
+                                    continue;
+                                }
+
+                                // Convert hex chunk sizes directly to byte lengths
+                                let chunk_size = match usize::from_str_radix(trimmed_size, 16) {
+                                    Ok(size) => size,
+                                    Err(_) => break,
+                                };
+
+                                if chunk_size == 0 {
+                                    break; // Stream termination boundary reached
+                                }
+
+                                let mut chunk_buf = vec![0u8; chunk_size];
+                                if reader.read_exact(&mut chunk_buf).is_err() {
+                                    break;
+                                }
+
+                                // Consume trailing carriage return line feeds bound to chunk limits
+                                let mut crlf = [0u8; 2];
+                                if reader.read_exact(&mut crlf).is_err() {
+                                    break;
+                                }
+
+                                let payload_str = String::from_utf8_lossy(&chunk_buf);
+                                for line in payload_str.lines() {
+                                    if let Ok(event) = serde_json::from_str::<
+                                        crate::worker::DockerEventPayload,
+                                    >(line)
+                                    {
+                                        if let Ok(mut guard) = cache_clone.write() {
+                                            if event.action == "start" {
+                                                guard.insert(event.actor.id);
+                                            } else if event.action == "die" {
+                                                guard.remove(&event.actor.id);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
-                thread::sleep(Duration::from_millis(thread_interval));
+                // Secure connection retry backing delay handling socket crashes gracefully
+                thread::sleep(Duration::from_secs(1));
             }
         });
     }
@@ -556,8 +653,8 @@ fn evaluate_line_signatures(
                     {
                         let is_valid = active_containers.contains(&container_id)
                             || active_containers
-                            .iter()
-                            .any(|long_id| long_id.starts_with(&container_id));
+                                .iter()
+                                .any(|long_id| long_id.starts_with(&container_id));
 
                         if !is_valid {
                             continue;
@@ -603,7 +700,9 @@ fn dispatch_to_worker(
 
     // FAST PATH: Acquire parallel, non-blocking read lock to pass telemetry frames on active mailboxes
     {
-        let reg_read = registry.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let reg_read = registry
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(tx) = reg_read.get(&container_id) {
             let _ = tx.try_send((try_actions, final_actions, rule_name, trigger_message));
             return;

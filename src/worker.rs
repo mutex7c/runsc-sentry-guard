@@ -35,6 +35,23 @@ struct DockerNetworkSettings {
 struct DockerInspectResponse {
     NetworkSettings: DockerNetworkSettings,
 }
+#[derive(Deserialize, Debug)]
+#[cfg(target_os = "linux")]
+pub struct DockerEventPayload {
+    #[serde(rename = "Type")]
+    pub event_type: String,
+    #[serde(rename = "Action")]
+    pub action: String,
+    #[serde(rename = "Actor")]
+    pub actor: DockerEventActor,
+}
+
+#[derive(Deserialize, Debug)]
+#[cfg(target_os = "linux")]
+pub struct DockerEventActor {
+    #[serde(rename = "ID")]
+    pub id: String,
+}
 
 #[cfg(target_os = "linux")]
 fn read_bounded_line<R: std::io::BufRead>(reader: &mut R, limit: u64) -> Result<String, String> {
@@ -119,7 +136,10 @@ fn execute_docker_uds_request(
 
     loop {
         if header_count > MAX_HTTP_HEADERS {
-            return Err("UDS Error: Maximum HTTP header count exceeded. Aborting to prevent thread lockup.".into());
+            return Err(
+                "UDS Error: Maximum HTTP header count exceeded. Aborting to prevent thread lockup."
+                    .into(),
+            );
         }
 
         let line = read_bounded_line(&mut reader, 8192)?;
@@ -284,11 +304,16 @@ fn execute_atomic_command(
             // Arguments are passed as literal string slices, entirely eliminating shell injection vulnerabilities.
             let s = Command::new("curl")
                 .args(&[
-                    "-X", "POST",
-                    "-H", "Content-Type: application/json",
-                    "--max-time", "5",
-                    "--connect-timeout", "3",
-                    "--data", &payload,
+                    "-X",
+                    "POST",
+                    "-H",
+                    "Content-Type: application/json",
+                    "--max-time",
+                    "5",
+                    "--connect-timeout",
+                    "3",
+                    "--data",
+                    &payload,
                     url,
                 ])
                 .status()
@@ -557,31 +582,52 @@ fn execute_atomic_command(
             {
                 match infrastructure_action {
                     AtomicAction::ValidateState => {
-                        println!("[DEV-MOCK] Verifying runtime operational status for ID: {}", container_id);
+                        println!(
+                            "[DEV-MOCK] Verifying runtime operational status for ID: {}",
+                            container_id
+                        );
                         Ok(())
                     }
                     AtomicAction::Pause => {
-                        println!("[DEV-MOCK] Injecting out-of-band container namespace FREEZE on ID: {}", container_id);
+                        println!(
+                            "[DEV-MOCK] Injecting out-of-band container namespace FREEZE on ID: {}",
+                            container_id
+                        );
                         Ok(())
                     }
                     AtomicAction::Unpause => {
-                        println!("[DEV-MOCK] Releasing container namespace FREEZE mutation execution on ID: {}", container_id);
+                        println!(
+                            "[DEV-MOCK] Releasing container namespace FREEZE mutation execution on ID: {}",
+                            container_id
+                        );
                         Ok(())
                     }
                     AtomicAction::Restart => {
-                        println!("[DEV-MOCK] Dispatching rolling container runtime reboot signature to ID: {}", container_id);
+                        println!(
+                            "[DEV-MOCK] Dispatching rolling container runtime reboot signature to ID: {}",
+                            container_id
+                        );
                         Ok(())
                     }
                     AtomicAction::CommitSnapshot { prefix } => {
-                        println!("[DEV-MOCK] Committing container snapshot to register using tag: {}-{}", prefix, container_id);
+                        println!(
+                            "[DEV-MOCK] Committing container snapshot to register using tag: {}-{}",
+                            prefix, container_id
+                        );
                         Ok(())
                     }
                     AtomicAction::ContainerSignal { signal } => {
-                        println!("[DEV-MOCK] Injecting kernel process termination signal [{}] straight to target ID: {}", signal, container_id);
+                        println!(
+                            "[DEV-MOCK] Injecting kernel process termination signal [{}] straight to target ID: {}",
+                            signal, container_id
+                        );
                         Ok(())
                     }
                     AtomicAction::NftBlacklist { set_name, timeout } => {
-                        println!("[DEV-MOCK] Appending element drop logic -> Table: {}, Set: {}, Duration: {}", table, set_name, timeout);
+                        println!(
+                            "[DEV-MOCK] Appending element drop logic -> Table: {}, Set: {}, Duration: {}",
+                            table, set_name, timeout
+                        );
                         Ok(())
                     }
                     _ => unreachable!(),
@@ -840,7 +886,10 @@ mod tests {
         let mut cursor = Cursor::new(data);
 
         let result = read_bounded_line(&mut cursor, 64);
-        assert!(result.is_err(), "Engine should fail if buffer hits limit exactly without finding a newline");
+        assert!(
+            result.is_err(),
+            "Engine should fail if buffer hits limit exactly without finding a newline"
+        );
     }
 
     // NEW: Regression verification proving command-injection attempts inside firewall rules are blocked instantly
@@ -853,7 +902,8 @@ mod tests {
         // Attempt an absolute classic syntax bypass payload
         let malicious_timeout = "24h; nft delete table inet filter;";
 
-        let validation_result = execute_firewall_mutation(target_ip, target_set, malicious_timeout, target_table);
+        let validation_result =
+            execute_firewall_mutation(target_ip, target_set, malicious_timeout, target_table);
 
         assert!(
             validation_result.is_err(),

@@ -6,6 +6,7 @@ authors = ["mutex7c <mutex7c@users.noreply.github.com>"]
 description = "An ultra-lightweight active incident response daemon for runsc (gVisor) sandboxes."
 homepage = "https://github.com/mutex7c/runsc-sentry-guard"
 repository = "https://github.com/mutex7c/runsc-sentry-guard"
+license = "MIT"
 
 [dependencies]
 serde = { version = "1.0.228", features = ["derive"] }

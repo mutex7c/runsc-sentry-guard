@@ -80,3 +80,18 @@ call matrices (DNS resolution, SSL loading, Netlink sockets).
 Syscall sandboxing is now exclusively delegated to the Systemd `SystemCallFilter` profiles 
 defined in the provided service unit.
 ```
+
+## 4. Architectural Note: Execution Identity & DAC
+
+Earlier alpha versions of this daemon attempted to perform an internal identity shift 
+upon boot—dropping from `root` to an unprivileged user (`nobody`) while attempting 
+to retain `CAP_NET_ADMIN` internally. 
+
+However, Linux Discretionary Access Control (DAC) requires standard `root` group 
+ownership to interact with the container engine Unix Domain Socket (`/var/run/docker.sock`) 
+and to reliably read privileged sandbox streams (`/var/log/gvisor/`). Attempting to strip DAC overrides fundamentally broke the daemon's core ingestion and state-validation mechanisms. 
+
+Consequently, internal capability manipulation has been explicitly removed. The 
+daemon **must** execute as standard `root` (UID 0). All capability bounding 
+(restricting the process strictly to `CAP_NET_ADMIN`) and file-system jailing 
+must be delegated to the `systemd` supervisor or AppArmor profiles as defined above.

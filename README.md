@@ -15,11 +15,9 @@ often struggle or introduce unnecessary performance
 overhead when trying to intercept deep sandbox system calls. 
 
 When a container running inside a runsc profile experiences an 
-exploit, it generates numerous indicators inside the 
-host-side debug streams.
-
-`runsc-sentry-guard` intercepts these events out-of-band directly 
-from the host edge. 
+exploit, it generates various indicators inside the 
+host-side debug streams. `runsc-sentry-guard` intercepts these 
+events out-of-band directly from the host edge. 
 
 It completely bypasses the need for complex 
 kernel-hooking architectures (like eBPF) or intrusive container 

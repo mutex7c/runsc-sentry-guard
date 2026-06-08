@@ -79,7 +79,6 @@ call matrices (DNS resolution, SSL loading, Netlink sockets).
 
 Syscall sandboxing is now exclusively delegated to the Systemd `SystemCallFilter` profiles 
 defined in the provided service unit.
-```
 
 ## 4. Architectural Note: Execution Identity & DAC
 

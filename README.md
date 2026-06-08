@@ -1,11 +1,9 @@
 # runsc-sentry-guard
 
 An ultra-lightweight, out-of-band active incident response daemon 
-for `runsc` (gVisor) sandboxes written in memory-safe Rust.
+for `runsc` (gVisor) sandboxes written in Rust.
 
 > ⚠️ **Development Status: ALPHA** 
-> > This daemon has been structurally verified and 
-> tested in development environments.
 > 
 > DO NOT USE in production environments yet!
 
@@ -15,41 +13,49 @@ for `runsc` (gVisor) sandboxes written in memory-safe Rust.
 containers, but traditional container detection tools 
 often struggle or introduce unnecessary performance 
 overhead when trying to intercept deep sandbox system calls. 
-When a container running inside a runsc profile undergoes an 
-exploit, it generates high-fidelity indicators inside the 
+
+When a container running inside a runsc profile experiences an 
+exploit, it generates numerous indicators inside the 
 host-side debug streams.
 
 `runsc-sentry-guard` intercepts these events out-of-band directly 
-from the host edge. It completely bypasses the need for complex 
+from the host edge. 
+
+It completely bypasses the need for complex 
 kernel-hooking architectures (like eBPF) or intrusive container 
-modifications, delivering immediate, zero-dependency 
+modifications, enabling real-time, zero-dependency 
 active containment.
 
 ## 2. Architectural Design Philosophy
 
-`runsc-sentry-guard` is built to challenge traditional container security conventions. By shifting the defense boundary from inside the workload to the host edge, it fixes the visibility and latency flaws inherent in legacy detection tools.
+`runsc-sentry-guard` challenges traditional container security conventions. 
+By shifting the defense boundary from inside the workload to the host edge, it fixes 
+the visibility and latency flaws inherent in legacy detection tools.
 
-| Defensive Vector       | Traditional Agent Approaches                                                                                                                                                                                                                                                                                                  | runsc-sentry-guard Architecture                                                                                                                                                                                                          |
-|:-----------------------|:------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|:-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| **Isolation Boundary** | **In-Workload Shims / Sidecars:** Run inside or attached to the container. If an attacker achieves container escape or root privilege, the security agent can be blinded, tampered with, or killed.                                                                                                                           | **Out-of-Band (Host Edge):** Operates completely decoupled at the host user-space layer. The sandboxed workload has zero visibility into the guard daemon, making it tamper-proof.                                                       |
-| **Response Latency**   | **Passive Logging & Triage:** Collects events, streams them to a centralized SIEM, and waits for human security engineers to write a script or manually isolate the infrastructure.                                                                                                                                           | **Active Automated Mitigation:** Bridges detection and containment into a single sub-second loop. It mutates host firewalls and freezes task states the moment a signature lands.                                                        |
-| **Concurrency Scale**  | **Monolithic Event FIFO Queues:** Processes incoming logs sequentially. A single high-volume attack or a hanging mitigation script can block the entire event pipeline for adjacent workloads.                                                                                                                                | **Key-Based Serialization:** Spawns isolated, independent worker threads pinned to unique Container IDs. A complex containment routine on container A never stalls defenses for container B.                                             |
-| **Ingestion Latency**  | **Disk Log Tailers:** Relies on gVisor writing `.boot` files to the host storage layer, introducing minor filesystem write overhead and potential TOCTOU (Time-of-Check to Time-of-Use) security latency. This option is supported for testing, but UDS Stream Receiver / Socket Mode is strictly recommended for production. | **UDS Stream Receiver:** Bypasses host disk I/O completely. Runtimes stream telemetry straight into the daemon's user-space memory, dropping response latency to sub-millisecond intervals and eliminating disk-spoofing risks entirely. |
+| Defensive Vector       | Traditional Agent Approaches                                                                                                                                                                                                                                                                                                                          | runsc-sentry-guard Architecture                                                                                                                                                                                                          |
+|:-----------------------|:------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|:-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| **Isolation Boundary** | **In-Workload Shims / Sidecars:** Run inside or attached to the container. If an attacker achieves container escape or root privilege, the security agent can be blinded, tampered with, or killed.                                                                                                                                                   | **Out-of-Band (Host Edge):** Operates completely decoupled at the host user-space layer. The sandboxed workload has zero visibility into the guard daemon, making it tamper-proof.                                                       |
+| **Response Latency**   | **Passive Logging & Triage:** Collects events, streams them to a centralized SIEM, and waits for human security engineers to execute a script or manually isolate the infrastructure.                                                                                                                                                                 | **Active Automated Mitigation:** Bridges detection and containment into a single real-time loop. It mutates host firewalls and freezes task states the moment a signature is detected.                                                   |
+| **Concurrency Scale**  | **Monolithic Event FIFO Queues:** Processes incoming logs sequentially. A single high-volume attack or a hanging mitigation script can block the entire event pipeline for adjacent workloads.                                                                                                                                                        | **Key-Based Serialization:** Spawns isolated, independent worker threads pinned to unique Container IDs. A complex containment routine on container A never stalls defenses for container B.                                             |
+| **Ingestion Latency**  | **Disk Log Tailers:** Relies on gVisor writing `.boot` files to the host storage layer, introducing minor filesystem write overhead and potential TOCTOU (Time-of-Check to Time-of-Use) security latency. This option is supported by `runsc-sentry-guard` for testing, but UDS Stream Receiver / Socket Mode is strictly recommended for production. | **UDS Stream Receiver:** Bypasses host disk I/O completely. Runtimes stream telemetry straight into the daemon's user-space memory, dropping response latency to sub-millisecond intervals and eliminating disk-spoofing risks entirely. |
 
 ## 3. Core Documentation & Context Links
 
 * [Product Requirements & Compliance Specs (CRA & NIS2)](./REQUIREMENTS_AND_COMPLIANCE.md)
-* [Deep Technical Implementation Specification](./TECHNICAL_SPECIFICATION.md)
-* [Comprehensive Configuration & Script Specs](./CONFIG.md)
-* [Host Hardening Profiles (AppArmor, Seccomp, Systemd)](./SECURITY_HARDENING.md)
+* [Technical Implementation Specification](./TECHNICAL_SPECIFICATION.md)
+* [Configuration & Script Specs](./CONFIG.md)
+* [Host Hardening Profiles (AppArmor, Systemd)](./SECURITY_HARDENING.md)
+* [Integration Testing & Threat Simulation Playbook](./TESTING_AND_SIMULATION.md)
 
 ## 4. Compilation & Assembly
 
-Choose **one** of the following compilation workflows based on your host environment constraints:
+Choose **one** of the following compilation workflows based on your host environment 
+constraints:
 
 ### Path A: Local Rust Toolchain Execution (Developers)
 
-If you have the stable Rust compiler toolchain installed natively on your local development machine, run:
+If you have the stable Rust compiler toolchain installed natively on your local 
+development machine, run:
 
 ```bash
 cargo build --release
@@ -59,7 +65,8 @@ The optimized artifact will be output directly to `./target/release/runsc-sentry
 
 ### Path B: Toolchain-Free Containerized Compilation (Production Servers)
 
-If you do not want to install the Rust compiler natively on your production host machine, you can build the binary inside an ephemeral, official container wrapper:
+If you do not want to install the Rust compiler natively on your production host machine, 
+you can build the binary inside an ephemeral, official container wrapper:
 
 ```bash
 docker run --rm -v "$PWD":/usr/src/guard -w /usr/src/guard rust:1.96-alpine cargo build --release
@@ -71,8 +78,10 @@ path without polluting your host engine dependencies.
 
 ### Path C: Automated CI/CD Image Assembly (Cloud-Native)
 
-To distribute and run the guard inside containerized or orchestrated environments (like Kubernetes), 
-utilize this multi-stage `Dockerfile`. It compiles the binary within an isolated build layer and copies it into a highly stripped, minimal runtime image to keep the attack surface microscopic.
+To distribute and run the guard inside containerized or orchestrated environments 
+(like Kubernetes), use this multi-stage `Dockerfile`. It compiles the binary within 
+an isolated build layer and copies it into a highly stripped, minimal runtime image 
+to keep the attack surface negligible.
 
 Create a file named `Dockerfile` in your root folder:
 
@@ -123,17 +132,20 @@ Provision your example configuration file blueprint:
 cp config.toml.example config.toml
 ```
 
-Open and modify `config.toml` to customize your threat signatures, define core infrastructure whitelists, and align your mitigation playbooks.
+Open and modify `config.toml` to customize your threat signatures, 
+define core infrastructure whitelists, and align your mitigation playbooks.
 
 ### 5.4 Step 3: Run the System Installer
 
-Ensure the installer script has administrative execution permissions on the host system:
+Ensure the installer script has administrative execution permissions 
+on the host system:
 
 ```bash
 chmod +x install.sh
 ```
 
-Execute the automated installer shell script with root privileges to establish FHS directory structures, copy binaries to `/usr/sbin/`, and register the background engine:
+Execute the automated installer shell script with root privileges 
+to establish FHS directory structures, copy binaries to `/usr/sbin/`, and register the background engine:
 
 ```bash
 sudo ./install.sh

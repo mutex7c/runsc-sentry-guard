@@ -1,7 +1,5 @@
 // Application Entry point
-// Orchestrates process initialization and routes execution to the multithreaded monitoring handlers.
-// Note: Internal capability dropping has been explicitly removed.
-// Sandboxing is natively delegated to systemd (CapabilityBoundingSet, ProtectSystem).
+// Orchestrates process initialization and routes execution to the multithreaded monitoring handlers
 
 mod config;
 mod logger;

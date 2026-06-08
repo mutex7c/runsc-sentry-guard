@@ -1,6 +1,8 @@
 // Configuration Engine Module
-// Handles the secure ingestion, parsing, and type-safe validation of the declarative `config.toml` structure.
-// Enforces strict schema validations via Serde to ensure safe startup aborts on anomaly detection.
+// Handles the secure ingestion, parsing,
+// and type-safe validation of the declarative `config.toml` structure
+// Enforces strict schema validations
+// via Serde to ensure safe startup aborts on anomaly detection
 
 use anyhow::{anyhow, Context, Result};
 use ipnet::IpNet;
@@ -8,7 +10,7 @@ use serde::Deserialize;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-// Strongly typed operational matrix definitions mapping onto specific automated containment actions.
+// Strictly typed operational matrix definitions mapping onto specific automated containment actions
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AtomicAction {
@@ -45,7 +47,7 @@ pub enum IngestionMode {
     Dual,
 }
 
-// Global Daemon Engine Metric Parameters.
+// Global Daemon Engine Metric Parameters
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MonitorConfig {
@@ -56,11 +58,10 @@ pub struct MonitorConfig {
     pub nftables_default_table: String,
     pub json_logging_enabled: bool,
     pub docker_socket_path: String,
-    // FIX: Removed dead_code allowance; property is now actively consumed by the dedicated heartbeat thread.
     pub systemd_watchdog_interval_ms: u64,
 }
 
-// Threat Identification Rules Mapping Signatures to Incident Containment Playbooks.
+// Threat Identification Rules Mapping Signatures to Incident Containment Playbooks
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuleConfig {
@@ -82,7 +83,8 @@ pub struct GuardConfig {
 }
 
 // Fail-Safe Configuration Loader
-// Securely reads the raw profile manifest from the host system, executing deep structural syntax validations.
+// Securely reads the raw profile manifest from the host system,
+// executing deep structural syntax validations
 pub fn load_config<P: AsRef<Path>>(path: P) -> Result<GuardConfig> {
     let path_ref = path.as_ref();
 

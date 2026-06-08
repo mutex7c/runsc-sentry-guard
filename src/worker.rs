@@ -1,5 +1,6 @@
 // Containment Mitigation Engine
-// Invokes localized host sandboxing isolation techniques and direct socket interactions safely.
+// Invokes localized host sandboxing isolation techniques
+// and direct socket interactions safely
 
 use crate::config::AtomicAction;
 use crate::logger::emit_log;
@@ -9,7 +10,7 @@ use std::process::Command;
 use std::sync::Arc;
 
 #[cfg(target_os = "linux")]
-use std::io::BufRead; // Add this line near your other std::io imports
+use std::io::BufRead;
 #[cfg(target_os = "linux")]
 use serde::Deserialize;
 #[cfg(target_os = "linux")]
@@ -138,7 +139,7 @@ fn execute_docker_uds_request(
     let mut is_chunked = false;
     let mut content_length: Option<usize> = None;
 
-    // FIX: Enforced a hard loop ceiling for header processing to prevent streaming slowloris-style thread hangs
+    // Enforce hard loop ceiling for header processing to prevent streaming slowloris-style thread hangs
     let mut header_count = 0;
     const MAX_HTTP_HEADERS: usize = 100;
 
@@ -302,13 +303,13 @@ fn execute_atomic_command(
     match action {
         AtomicAction::WebhookAlert { url } => {
             let payload = format!(
-                "{{\"text\":\"🚨 [SENTRY-GUARD] Active containment pipeline triggered for container context: {}\"}}",
+                "{{\"text\":\"[SENTRY-GUARD] Active containment pipeline triggered for container context: {}\"}}",
                 container_id
             );
 
-            // Invoke host-native curl safely.
-            // --max-time 5 prevents slowloris/hanging connections from starving the worker thread pool.
-            // Arguments are passed as literal string slices, entirely eliminating shell injection vulnerabilities.
+            // Invoke host-native curl safely
+            // --max-time 5 prevents slowloris/hanging connections from starving the worker thread pool
+            // Arguments are passed as literal string slices, entirely eliminating shell injection vulnerabilities
             let s = Command::new("curl")
                 .args(&[
                     "-X",
@@ -671,7 +672,7 @@ fn execute_firewall_mutation(
     // Safely construct the final nftables element block
     let element_payload = format!("{{ {} timeout {} }}", ip, timeout);
 
-    // FIX: Split the table string (e.g., "inet security_ops") into discrete string tokens
+    // Split the table string (e.g., "inet security_ops") into discrete string tokens
     // to prevent execve from rejecting the command as a single malformed argument.
     let s = Command::new("nft")
         .arg("add")
@@ -693,7 +694,7 @@ fn execute_firewall_mutation(
 #[cfg(target_os = "linux")]
 struct DockerContainerListResponse {
     #[serde(rename = "Id")]
-    id: String, // Clean, idiomatic Rust name that maps perfectly to "Id" in the JSON
+    id: String,
 }
 
 #[cfg(target_os = "linux")]
@@ -895,7 +896,7 @@ mod tests {
             .contains("Buffer-bloat protection: HTTP line exceeded maximum bounded length"));
     }
 
-    // NEW: Verifies that exact-boundary matches without a trailing newline are flagged correctly
+    // Verify that exact-boundary matches without a trailing newline are flagged correctly
     #[test]
     fn test_read_bounded_line_exact_limit_anomaly() {
         let data = vec![b'B'; 64];
@@ -908,7 +909,7 @@ mod tests {
         );
     }
 
-    // NEW: Regression verification proving command-injection attempts inside firewall rules are blocked instantly
+    // Regression verification proving command-injection attempts inside firewall rules are blocked instantly
     #[test]
     fn test_firewall_timeout_injection_defense() {
         let target_ip = "10.0.0.2";

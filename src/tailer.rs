@@ -1,6 +1,6 @@
 // Ingestion Pipeline Engine
-// Operates high-performance file tailers and parallel UDS socket tracking pipelines cleanly.
-// Features active DoS-resistant TOCTOU mitigations, SO_PEERCRED trust boundaries, and lock safety.
+// Operates fast file tailers and parallel UDS socket tracking pipelines
+// Features active DoS-resistant TOCTOU mitigations, SO_PEERCRED trust boundaries, and lock safety
 
 use regex::Regex;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -54,7 +54,7 @@ pub fn start_monitor_loop(config: GuardConfig) {
     let docker_socket_path = config.monitor.docker_socket_path.clone();
     let watchdog_interval = config.monitor.systemd_watchdog_interval_ms;
 
-    // WRAP IN ARC: Prevent expensive heap cloning during incident routing
+    // Prevent expensive heap cloning during incident routing
     let whitelist = Arc::new(config.monitor.ip_whitelist);
     let table = Arc::new(config.monitor.nftables_default_table);
 
@@ -88,7 +88,7 @@ pub fn start_monitor_loop(config: GuardConfig) {
         thread::spawn(move || {
             use std::io::Write;
 
-            // 1. Initial Seeding Call to eliminate cold-start visibility race windows
+            // Initial Seeding Call to eliminate cold-start visibility race windows
             let initial_ids = crate::worker::fetch_running_container_ids(&ds_path);
             if let Ok(mut guard) = cache_clone.write() {
                 *guard = initial_ids;
@@ -566,7 +566,7 @@ fn run_uds_server(
     for stream in listener.incoming() {
         if let Ok(stream) = stream {
 
-            // SECURITY: Extract Peer Credentials using raw libc to bypass unstable std features
+            // Extract Peer Credentials using raw libc to bypass unstable std features
             #[cfg(target_os = "linux")]
             {
                 if let Ok(peer_uid) = get_peer_uid(&stream) {
@@ -869,7 +869,7 @@ fn dispatch_to_worker(
         }
     }
 
-    // SLOW PATH: Channel context does not exist. Acquire exclusive write lock to initialize pipeline workers.
+    // SLOW PATH: Channel context does not exist. Acquire exclusive write lock to initialize pipeline workers
     let mut reg_write = registry
         .write()
         .expect("CRITICAL: Worker registry lock poisoned. Aborting.");

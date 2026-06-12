@@ -159,6 +159,10 @@ mod tests {
     fn test_load_config_missing_file_handling() {
         let result = load_config("/path/that/absolutely/does/not/exist/config.toml");
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Configuration missing, inaccessible, or tampered"));
+        assert!(
+            result
+                .unwrap_err()
+                .contains("Configuration missing, inaccessible, or tampered")
+        );
     }
 }

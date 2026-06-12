@@ -4,16 +4,17 @@
 use crate::config::AtomicAction;
 use crate::logger::emit_log;
 use ipnet::IpNet;
+use std::io::BufRead;
 use std::process::Command;
 
 #[cfg(target_os = "linux")]
 use serde::Deserialize;
 #[cfg(target_os = "linux")]
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 #[cfg(target_os = "linux")]
 use std::net::IpAddr;
 #[cfg(target_os = "linux")]
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 #[derive(Deserialize)]
 #[allow(non_snake_case)]
@@ -34,6 +35,33 @@ struct DockerNetworkSettings {
 #[cfg(target_os = "linux")]
 struct DockerInspectResponse {
     NetworkSettings: DockerNetworkSettings,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[cfg(target_os = "linux")]
+struct FirewallDrop {
+    table: String,
+    set: String,
+    ip: String,
+}
+
+#[cfg(target_os = "linux")]
+fn firewall_drop_registry() -> &'static Mutex<HashSet<FirewallDrop>> {
+    static FIREWALL_DROPS: OnceLock<Mutex<HashSet<FirewallDrop>>> = OnceLock::new();
+    FIREWALL_DROPS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+#[cfg(target_os = "linux")]
+fn record_firewall_drop(table: &str, set: &str, ip: &str) {
+    let mut drops = firewall_drop_registry()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    drops.insert(FirewallDrop {
+        table: table.to_string(),
+        set: set.to_string(),
+        ip: ip.to_string(),
+    });
 }
 
 #[cfg(target_os = "linux")]
@@ -281,7 +309,10 @@ fn execute_atomic_command(
                 if ips.is_empty() {
                     "UNKNOWN_IP".to_string()
                 } else {
-                    ips.iter().map(|ip| ip.to_string()).collect::<Vec<_>>().join(",")
+                    ips.iter()
+                        .map(|ip| ip.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
                 }
             };
 
@@ -361,11 +392,14 @@ fn execute_atomic_command(
                 match infrastructure_action {
                     AtomicAction::ValidateState => {
                         let endpoint = format!("/containers/{}/json", container_id);
-                        let (status, json_payload) = execute_docker_uds_request("GET", &endpoint, None, socket_path)?;
+                        let (status, json_payload) =
+                            execute_docker_uds_request("GET", &endpoint, None, socket_path)?;
 
                         if status == 200 {
                             // Verify the container is actually still running, not just dead/exited
-                            if json_payload.contains("\"Running\": true") || json_payload.contains("\"Running\":true") {
+                            if json_payload.contains("\"Running\": true")
+                                || json_payload.contains("\"Running\":true")
+                            {
                                 emit_log(
                                     "INFO",
                                     "worker_engine",
@@ -382,7 +416,10 @@ fn execute_atomic_command(
                                 Err("Container is no longer in a running state. Aborting containment to prevent TOCTOU misfires.".into())
                             }
                         } else {
-                            Err(format!("State validation rejected (HTTP {}). Container likely terminated.", status))
+                            Err(format!(
+                                "State validation rejected (HTTP {}). Container likely terminated.",
+                                status
+                            ))
                         }
                     }
 
@@ -605,11 +642,78 @@ fn execute_firewall_mutation(
         .map_err(|e| e.to_string())?;
 
     if s.success() {
+        record_firewall_drop(table, set, ip);
         Ok(())
     } else {
         Err("Kernel nftables transaction rejected execution parameters.".into())
     }
 }
+
+#[cfg(target_os = "linux")]
+fn delete_firewall_drop(entry: &FirewallDrop) -> Result<(), String> {
+    let s = Command::new("nft")
+        .args(&[
+            "delete",
+            "element",
+            &entry.table,
+            &entry.set,
+            &format!("{{ {} }}", entry.ip),
+        ])
+        .status()
+        .map_err(|e| e.to_string())?;
+
+    if s.success() {
+        Ok(())
+    } else {
+        Err("Kernel nftables cleanup transaction rejected execution parameters.".into())
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub fn cleanup_firewall_drops(json_enabled: bool) {
+    let pending_drops: Vec<FirewallDrop> = {
+        let mut drops = firewall_drop_registry()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        drops.drain().collect()
+    };
+
+    for entry in pending_drops {
+        match delete_firewall_drop(&entry) {
+            Ok(()) => emit_log(
+                "INFO",
+                "shutdown",
+                None,
+                None,
+                Some(&entry.ip),
+                Some("nft_blacklist_cleanup"),
+                "SUCCESS",
+                &format!(
+                    "Removed shutdown-tracked nftables element from set {}.",
+                    entry.set
+                ),
+                json_enabled,
+            ),
+            Err(e) => emit_log(
+                "WARN",
+                "shutdown",
+                None,
+                None,
+                Some(&entry.ip),
+                Some("nft_blacklist_cleanup"),
+                "FAILURE",
+                &format!(
+                    "Unable to remove shutdown-tracked nftables element from set {}: {}",
+                    entry.set, e
+                ),
+                json_enabled,
+            ),
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn cleanup_firewall_drops(_json_enabled: bool) {}
 
 pub fn execute_containment_pipeline(
     container_id: String,

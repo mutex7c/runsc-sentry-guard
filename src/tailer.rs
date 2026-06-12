@@ -8,7 +8,7 @@ use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -30,7 +30,7 @@ struct LogDescriptor {
 type WorkerChannelMessage = (Vec<AtomicAction>, Vec<AtomicAction>, String, String);
 type RegistryMap = HashMap<String, SyncSender<WorkerChannelMessage>>;
 
-pub fn start_monitor_loop(config: GuardConfig) {
+pub fn start_monitor_loop(config: GuardConfig, shutdown_requested: Arc<AtomicBool>) {
     let mode = &config.monitor.mode;
     let json_enabled = config.monitor.json_logging_enabled;
     let whitelist = config.monitor.ip_whitelist.clone();
@@ -40,10 +40,11 @@ pub fn start_monitor_loop(config: GuardConfig) {
 
     // Spawn a dedicated, decoupled watchdog heartbeat thread
     if watchdog_interval > 0 {
+        let watchdog_shutdown = Arc::clone(&shutdown_requested);
         thread::spawn(move || {
-            loop {
+            while !watchdog_shutdown.load(Ordering::SeqCst) {
                 notify_systemd_watchdog();
-                thread::sleep(Duration::from_millis(watchdog_interval));
+                sleep_until_shutdown(&watchdog_shutdown, Duration::from_millis(watchdog_interval));
             }
         });
     }
@@ -69,6 +70,7 @@ pub fn start_monitor_loop(config: GuardConfig) {
     let id_extractor = Regex::new(r"--id=\b([a-fA-F0-9]{12}|[a-fA-F0-9]{64})\b").unwrap();
     let mut file_state_tracker: HashMap<String, LogDescriptor> = HashMap::new();
     let mut first_run = true;
+    let mut uds_thread = None;
 
     if mode == &IngestionMode::Socket || mode == &IngestionMode::Dual {
         let uds_registry = Arc::clone(&worker_registry);
@@ -77,8 +79,9 @@ pub fn start_monitor_loop(config: GuardConfig) {
         let uds_whitelist = whitelist.clone();
         let uds_table = table.clone();
         let uds_socket_path = docker_socket_path.clone();
+        let uds_shutdown = Arc::clone(&shutdown_requested);
 
-        thread::spawn(move || {
+        uds_thread = Some(thread::spawn(move || {
             run_uds_server(
                 uds_registry,
                 uds_regex,
@@ -87,8 +90,9 @@ pub fn start_monitor_loop(config: GuardConfig) {
                 uds_table,
                 json_enabled,
                 uds_socket_path,
+                uds_shutdown,
             );
-        });
+        }));
     }
 
     if mode == &IngestionMode::Socket {
@@ -103,9 +107,14 @@ pub fn start_monitor_loop(config: GuardConfig) {
             "Out-of-band UDS streaming receiver active. Filesystem parsing idle.",
             json_enabled,
         );
-        loop {
-            thread::park();
+        while !shutdown_requested.load(Ordering::SeqCst) {
+            thread::park_timeout(Duration::from_millis(100));
         }
+
+        if let Some(handle) = uds_thread {
+            let _ = handle.join();
+        }
+        return;
     }
 
     emit_log(
@@ -126,7 +135,7 @@ pub fn start_monitor_loop(config: GuardConfig) {
         notify_systemd_ready();
     }
 
-    loop {
+    while !shutdown_requested.load(Ordering::SeqCst) {
         let log_dir_path = Path::new(&config.monitor.log_dir);
 
         if !log_dir_path.exists() {
@@ -147,7 +156,10 @@ pub fn start_monitor_loop(config: GuardConfig) {
                     "Target directory unreachable.",
                     json_enabled,
                 );
-                thread::sleep(Duration::from_millis(config.monitor.check_interval_ms));
+                sleep_until_shutdown(
+                    &shutdown_requested,
+                    Duration::from_millis(config.monitor.check_interval_ms),
+                );
                 continue;
             }
         }
@@ -170,7 +182,10 @@ pub fn start_monitor_loop(config: GuardConfig) {
                         "Log directory is not owned by root or is world-writable. File mode suspended to prevent spoofing.",
                         json_enabled,
                     );
-                    thread::sleep(Duration::from_millis(config.monitor.check_interval_ms));
+                    sleep_until_shutdown(
+                        &shutdown_requested,
+                        Duration::from_millis(config.monitor.check_interval_ms),
+                    );
                     continue;
                 }
             }
@@ -180,6 +195,10 @@ pub fn start_monitor_loop(config: GuardConfig) {
 
         if let Ok(entries) = fs::read_dir(log_dir_path) {
             for entry in entries.flatten() {
+                if shutdown_requested.load(Ordering::SeqCst) {
+                    break;
+                }
+
                 let path = entry.path();
 
                 if path.extension().map_or(false, |ext| ext == "boot") {
@@ -253,11 +272,20 @@ pub fn start_monitor_loop(config: GuardConfig) {
                         }
 
                         loop {
+                            if shutdown_requested.load(Ordering::SeqCst) {
+                                break;
+                            }
+
                             scratchpad_buffer.clear();
                             let mut reached_eof = false;
                             let mut exceeded_limit = false;
 
                             loop {
+                                if shutdown_requested.load(Ordering::SeqCst) {
+                                    reached_eof = true;
+                                    break;
+                                }
+
                                 let available_buffer = match reader.fill_buf() {
                                     Ok(buf) if buf.is_empty() => {
                                         reached_eof = true;
@@ -337,7 +365,7 @@ pub fn start_monitor_loop(config: GuardConfig) {
                                 &table,
                                 json_enabled,
                                 &docker_socket_path,
-                                true
+                                true,
                             );
                         }
 
@@ -357,7 +385,14 @@ pub fn start_monitor_loop(config: GuardConfig) {
 
         file_state_tracker.retain(|path_key, _| actively_seen_paths.contains(path_key));
         first_run = false;
-        thread::sleep(Duration::from_millis(config.monitor.check_interval_ms));
+        sleep_until_shutdown(
+            &shutdown_requested,
+            Duration::from_millis(config.monitor.check_interval_ms),
+        );
+    }
+
+    if let Some(handle) = uds_thread {
+        let _ = handle.join();
     }
 }
 
@@ -369,6 +404,7 @@ fn run_uds_server(
     table: String,
     json_enabled: bool,
     docker_socket_path: String,
+    shutdown_requested: Arc<AtomicBool>,
 ) {
     let socket_path = "/var/run/runsc-sentry-guard.sock";
     let _ = fs::remove_file(socket_path);
@@ -390,6 +426,25 @@ fn run_uds_server(
             return;
         }
     };
+
+    if let Err(e) = listener.set_nonblocking(true) {
+        emit_log(
+            "ERROR",
+            "uds_server",
+            None,
+            None,
+            None,
+            Some("nonblocking"),
+            "CRASH",
+            &format!(
+                "Failed to configure UDS listener for graceful shutdown: {}",
+                e
+            ),
+            json_enabled,
+        );
+        let _ = fs::remove_file(socket_path);
+        return;
+    }
 
     if let Err(e) = fs::set_permissions(socket_path, fs::Permissions::from_mode(0o660)) {
         emit_log(
@@ -416,36 +471,67 @@ fn run_uds_server(
     let active_connections = Arc::new(AtomicUsize::new(0));
     const MAX_UDS_CONNECTIONS: usize = 50;
 
-    for stream in listener.incoming() {
-        if let Ok(stream) = stream {
-            if active_connections.load(Ordering::SeqCst) >= MAX_UDS_CONNECTIONS {
-                continue;
+    while !shutdown_requested.load(Ordering::SeqCst) {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                if active_connections.load(Ordering::SeqCst) >= MAX_UDS_CONNECTIONS {
+                    continue;
+                }
+
+                active_connections.fetch_add(1, Ordering::SeqCst);
+                let conn_tracker = Arc::clone(&active_connections);
+
+                let reg_clone = Arc::clone(&registry);
+                let rules_clone = Arc::clone(&regex_rules);
+                let id_clone = id_extractor.clone();
+                let wl_clone = whitelist.clone();
+                let tbl_clone = table.clone();
+                let ds_path_clone = docker_socket_path.clone();
+                let stream_shutdown = Arc::clone(&shutdown_requested);
+
+                thread::spawn(move || {
+                    handle_uds_stream(
+                        stream,
+                        reg_clone,
+                        rules_clone,
+                        id_clone,
+                        wl_clone,
+                        tbl_clone,
+                        json_enabled,
+                        ds_path_clone,
+                        stream_shutdown,
+                    );
+                    conn_tracker.fetch_sub(1, Ordering::SeqCst);
+                });
             }
-
-            active_connections.fetch_add(1, Ordering::SeqCst);
-            let conn_tracker = Arc::clone(&active_connections);
-
-            let reg_clone = Arc::clone(&registry);
-            let rules_clone = Arc::clone(&regex_rules);
-            let id_clone = id_extractor.clone();
-            let wl_clone = whitelist.clone();
-            let tbl_clone = table.clone();
-            let ds_path_clone = docker_socket_path.clone();
-
-            thread::spawn(move || {
-                handle_uds_stream(
-                    stream,
-                    reg_clone,
-                    rules_clone,
-                    id_clone,
-                    wl_clone,
-                    tbl_clone,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                sleep_until_shutdown(&shutdown_requested, Duration::from_millis(100));
+            }
+            Err(e) => {
+                emit_log(
+                    "ERROR",
+                    "uds_server",
+                    None,
+                    None,
+                    None,
+                    Some("accept"),
+                    "FAILURE",
+                    &format!("UDS accept failed: {}", e),
                     json_enabled,
-                    ds_path_clone,
                 );
-                conn_tracker.fetch_sub(1, Ordering::SeqCst);
-            });
+                sleep_until_shutdown(&shutdown_requested, Duration::from_millis(100));
+            }
         }
+    }
+
+    let _ = fs::remove_file(socket_path);
+
+    for _ in 0..50 {
+        if active_connections.load(Ordering::SeqCst) == 0 {
+            break;
+        }
+
+        thread::sleep(Duration::from_millis(10));
     }
 }
 
@@ -458,6 +544,7 @@ fn handle_uds_stream(
     table: String,
     json_enabled: bool,
     docker_socket_path: String,
+    shutdown_requested: Arc<AtomicBool>,
 ) {
     if let Err(e) = stream.set_read_timeout(Some(Duration::from_millis(100))) {
         emit_log(
@@ -477,7 +564,7 @@ fn handle_uds_stream(
     let mut reader = BufReader::new(stream);
     let mut buf = Vec::new();
 
-    loop {
+    while !shutdown_requested.load(Ordering::SeqCst) {
         buf.clear();
 
         let mut chunk = reader.by_ref().take(8192);
@@ -519,7 +606,7 @@ fn handle_uds_stream(
                     &table,
                     json_enabled,
                     &docker_socket_path,
-                    false
+                    false,
                 );
             }
             Err(_) => break,
@@ -624,7 +711,12 @@ fn dispatch_to_worker(
         worker_tx
     });
 
-    match tx.try_send((try_actions, final_actions, rule_name.clone(), trigger_message)) {
+    match tx.try_send((
+        try_actions,
+        final_actions,
+        rule_name.clone(),
+        trigger_message,
+    )) {
         Ok(_) => {}
         Err(TrySendError::Full(_)) => {
             emit_log(
@@ -712,6 +804,17 @@ fn run_worker_lifecycle(
     }
 }
 
+fn sleep_until_shutdown(shutdown_requested: &AtomicBool, duration: Duration) {
+    const POLL_INTERVAL: Duration = Duration::from_millis(100);
+    let mut remaining = duration;
+
+    while !shutdown_requested.load(Ordering::SeqCst) && remaining > Duration::ZERO {
+        let sleep_for = remaining.min(POLL_INTERVAL);
+        thread::sleep(sleep_for);
+        remaining = remaining.saturating_sub(sleep_for);
+    }
+}
+
 fn notify_systemd_watchdog() {
     if let Ok(socket_path) = std::env::var("NOTIFY_SOCKET") {
         if !socket_path.is_empty() {
@@ -732,23 +835,67 @@ fn notify_systemd_watchdog() {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::config::{GuardConfig, IngestionMode, MonitorConfig};
     use regex::Regex;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn test_id_extractor_strict_boundaries() {
         let id_extractor = Regex::new(r"--id=\b([a-fA-F0-9]{12}|[a-fA-F0-9]{64})\b").unwrap();
 
         let valid_64 = "--id=a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
-        assert!(id_extractor.is_match(valid_64), "Regex failed to match valid 64-char ID");
+        assert!(
+            id_extractor.is_match(valid_64),
+            "Regex failed to match valid 64-char ID"
+        );
 
         let valid_12 = "--id=a1b2c3d4e5f6";
-        assert!(id_extractor.is_match(valid_12), "Regex failed to match valid 12-char ID");
+        assert!(
+            id_extractor.is_match(valid_12),
+            "Regex failed to match valid 12-char ID"
+        );
 
         let invalid_spoof = "--id=a1b2c3d4e5f67890a";
-        assert!(!id_extractor.is_match(invalid_spoof), "SECURITY ALERT: Regex matched an unbounded invalid spoof ID");
+        assert!(
+            !id_extractor.is_match(invalid_spoof),
+            "SECURITY ALERT: Regex matched an unbounded invalid spoof ID"
+        );
 
         let invalid_short = "--id=abc";
-        assert!(!id_extractor.is_match(invalid_short), "SECURITY ALERT: Regex matched a malformed short ID");
+        assert!(
+            !id_extractor.is_match(invalid_short),
+            "SECURITY ALERT: Regex matched a malformed short ID"
+        );
+    }
+
+    #[test]
+    fn test_monitor_loop_returns_when_shutdown_already_requested() {
+        let config = GuardConfig {
+            monitor: MonitorConfig {
+                mode: IngestionMode::File,
+                log_dir: "/path/unused/when/shutdown/is/requested".to_string(),
+                check_interval_ms: 1_000,
+                ip_whitelist: vec!["127.0.0.1/32".parse().unwrap()],
+                nftables_default_table: "inet filter".to_string(),
+                json_logging_enabled: false,
+                docker_socket_path: "/var/run/docker.sock".to_string(),
+                systemd_watchdog_interval_ms: 0,
+            },
+            rules: Vec::new(),
+        };
+
+        let shutdown_requested = Arc::new(AtomicBool::new(true));
+        let start = Instant::now();
+
+        start_monitor_loop(config, shutdown_requested);
+
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "monitor loop did not return promptly after shutdown was requested"
+        );
     }
 }
 

@@ -1,10 +1,11 @@
 // Structured SIEM Audit Logging Module
-// Handles the emission of synchronized plain-text and structured JSON logging payloads.
+// Handles the emission of synchronized plain-text
+// and structured JSON logging payloads
 
 use serde::Serialize;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-// Standardized structured JSON tracking signature optimized for enterprise SIEM ingestion.
+// Standardized structured JSON tracking signature optimized for enterprise SIEM ingestion
 #[derive(Serialize)]
 struct JsonLogPayload<'a> {
     timestamp: u64,
@@ -19,7 +20,7 @@ struct JsonLogPayload<'a> {
 }
 
 // Synchronized Log Outflow Router
-// Distributes operational telemetry across standard plain text streams or structured SIEM models cleanly.
+// Distributes operational telemetry across standard plain text streams or structured SIEM models
 pub fn emit_log(
     level: &str,
     component: &str,

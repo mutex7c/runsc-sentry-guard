@@ -1,11 +1,14 @@
 // Containment Mitigation Engine
-// Invokes localized host sandboxing isolation techniques and direct socket interactions safely.
+// Invokes localized host sandboxing isolation techniques
+// and direct socket interactions safely
 
 use crate::config::AtomicAction;
 use crate::logger::emit_log;
+use anyhow::{Result, anyhow, bail};
 use ipnet::IpNet;
 use std::io::BufRead;
 use std::process::Command;
+use std::sync::Arc;
 
 #[cfg(target_os = "linux")]
 use serde::Deserialize;
@@ -55,17 +58,17 @@ pub struct DockerEventActor {
 }
 
 #[cfg(target_os = "linux")]
-fn read_bounded_line<R: std::io::BufRead>(reader: &mut R, limit: u64) -> Result<String, String> {
+fn read_bounded_line<R: std::io::BufRead>(reader: &mut R, limit: u64) -> Result<String> {
     use std::io::Read;
     let mut buf = Vec::new();
     reader
         .by_ref()
         .take(limit)
         .read_until(b'\n', &mut buf)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| anyhow!("I/O Error reading bounded line: {}", e))?;
 
     if buf.len() as u64 == limit && !buf.ends_with(&[b'\n']) {
-        return Err("Buffer-bloat protection: HTTP line exceeded maximum bounded length".into());
+        bail!("Buffer-bloat protection: HTTP line exceeded maximum bounded length");
     }
 
     Ok(String::from_utf8_lossy(&buf).into_owned())
@@ -80,15 +83,16 @@ fn execute_docker_uds_request(
     path: &str,
     body: Option<&str>,
     socket_path: &str,
-) -> Result<(u16, String), String> {
+) -> Result<(u16, String)> {
     use std::io::{BufReader, Read, Write};
     use std::os::unix::net::UnixStream;
     use std::time::Duration;
 
     let mut stream = UnixStream::connect(socket_path).map_err(|e| {
-        format!(
+        anyhow!(
             "Container Engine Socket Connection Refused at {}: {}",
-            socket_path, e
+            socket_path,
+            e
         )
     })?;
 
@@ -111,15 +115,17 @@ fn execute_docker_uds_request(
 
     stream
         .write_all(request_payload.as_bytes())
-        .map_err(|e| e.to_string())?;
-    stream.flush().map_err(|e| e.to_string())?;
+        .map_err(|e| anyhow!("Failed to write to UDS: {}", e))?;
+    stream
+        .flush()
+        .map_err(|e| anyhow!("Failed to flush UDS stream: {}", e))?;
 
     let mut reader = BufReader::new(stream);
 
     let status_line = read_bounded_line(&mut reader, 8192)?;
 
     if status_line.is_empty() {
-        return Err("Received completely empty frame stream from container daemon socket.".into());
+        bail!("Received completely empty frame stream from container daemon socket.");
     }
 
     let status_code = status_line
@@ -131,15 +137,14 @@ fn execute_docker_uds_request(
     let mut is_chunked = false;
     let mut content_length: Option<usize> = None;
 
-    // FIX: Enforced a hard loop ceiling for header processing to prevent streaming slowloris-style thread hangs
+    // Enforce hard loop ceiling for header processing to prevent streaming slowloris-style thread hangs
     let mut header_count = 0;
     const MAX_HTTP_HEADERS: usize = 100;
 
     loop {
         if header_count > MAX_HTTP_HEADERS {
-            return Err(
+            bail!(
                 "UDS Error: Maximum HTTP header count exceeded. Aborting to prevent thread lockup."
-                    .into(),
             );
         }
 
@@ -175,7 +180,7 @@ fn execute_docker_uds_request(
             }
 
             let chunk_size = usize::from_str_radix(trimmed_size, 16)
-                .map_err(|e| format!("Failed to parse chunk size: {}", e))?;
+                .map_err(|e| anyhow!("Failed to parse chunk size: {}", e))?;
 
             if chunk_size == 0 {
                 break;
@@ -184,16 +189,16 @@ fn execute_docker_uds_request(
             if chunk_size > MAX_UDS_PAYLOAD_SIZE
                 || body_payload.len() + chunk_size > MAX_UDS_PAYLOAD_SIZE
             {
-                return Err(format!(
+                bail!(
                     "SECURITY ABORT: Chunk sequence size exceeds maximum allowed UDS payload limit of {} bytes.",
                     MAX_UDS_PAYLOAD_SIZE
-                ));
+                );
             }
 
             let mut chunk_buf = vec![0; chunk_size];
             reader
                 .read_exact(&mut chunk_buf)
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| anyhow!("Failed to read chunk payload: {}", e))?;
             body_payload.push_str(&String::from_utf8_lossy(&chunk_buf));
 
             let mut crlf = vec![0; 2];
@@ -201,19 +206,22 @@ fn execute_docker_uds_request(
         }
     } else if let Some(len) = content_length {
         if len > MAX_UDS_PAYLOAD_SIZE {
-            return Err(format!(
+            bail!(
                 "SECURITY ABORT: Content-Length {} exceeds maximum allowed UDS payload limit of {} bytes.",
-                len, MAX_UDS_PAYLOAD_SIZE
-            ));
+                len,
+                MAX_UDS_PAYLOAD_SIZE
+            );
         }
         let mut buf = vec![0; len];
-        reader.read_exact(&mut buf).map_err(|e| e.to_string())?;
+        reader
+            .read_exact(&mut buf)
+            .map_err(|e| anyhow!("Failed to read exact payload length: {}", e))?;
         body_payload = String::from_utf8_lossy(&buf).into_owned();
     } else {
         reader
             .take(MAX_UDS_PAYLOAD_SIZE as u64)
             .read_to_string(&mut body_payload)
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| anyhow!("Failed to read payload to string: {}", e))?;
     }
 
     Ok((status_code, body_payload))
@@ -271,7 +279,7 @@ pub fn resolve_container_ips(
                 Some("resolve_ip"),
                 "FAILURE",
                 &format!(
-                    "Failed to query Container socket for networking metadata via UDS channel: {}",
+                    "Failed to query Container socket for networking metadata via UDS channel: {:#}",
                     e
                 ),
                 json_enabled,
@@ -289,20 +297,20 @@ fn execute_atomic_command(
     json_enabled: bool,
     socket_path: &str,
     trigger_message: &str,
-) -> Result<(), String> {
+) -> Result<()> {
     let _ = whitelist;
     let _ = socket_path;
 
     match action {
         AtomicAction::WebhookAlert { url } => {
             let payload = format!(
-                "{{\"text\":\"🚨 [SENTRY-GUARD] Active containment pipeline triggered for container context: {}\"}}",
+                "{{\"text\":\"[SENTRY-GUARD] Active containment pipeline triggered for container context: {}\"}}",
                 container_id
             );
 
-            // Invoke host-native curl safely.
-            // --max-time 5 prevents slowloris/hanging connections from starving the worker thread pool.
-            // Arguments are passed as literal string slices, entirely eliminating shell injection vulnerabilities.
+            // Invoke host-native curl safely
+            // --max-time 5 prevents slowloris/hanging connections from starving the worker thread pool
+            // Arguments are passed as literal string slices, entirely eliminating shell injection vulnerabilities
             let s = Command::new("curl")
                 .args(&[
                     "-X",
@@ -318,15 +326,15 @@ fn execute_atomic_command(
                     url,
                 ])
                 .status()
-                .map_err(|e| format!("Failed to invoke system curl binary: {}", e))?;
+                .map_err(|e| anyhow!("Failed to invoke system curl binary: {}", e))?;
 
             if s.success() {
                 Ok(())
             } else {
-                Err(format!(
+                bail!(
                     "Webhook dispatch failed. curl exited with non-zero status code: {:?}",
                     s.code()
-                ))
+                );
             }
         }
 
@@ -352,7 +360,7 @@ fn execute_atomic_command(
                 .arg(&resolved_ip)
                 .arg(trigger_message)
                 .spawn()
-                .map_err(|e| format!("Failed to spawn automation extension subprocess: {}", e))?;
+                .map_err(|e| anyhow!("Failed to spawn automation extension subprocess: {}", e))?;
 
             let timeout = std::time::Duration::from_secs(15);
             let start = std::time::Instant::now();
@@ -360,25 +368,27 @@ fn execute_atomic_command(
             loop {
                 match child.try_wait() {
                     Ok(Some(status)) => {
-                        return if status.success() {
-                            Ok(())
+                        if status.success() {
+                            return Ok(());
                         } else {
-                            Err(format!(
+                            bail!(
                                 "Custom extension script exited with failure footprint: {}",
                                 status
-                            ))
-                        };
+                            );
+                        }
                     }
                     Ok(None) => {
                         if start.elapsed() > timeout {
                             let _ = child.kill();
                             let _ = child.wait();
-                            return Err("Custom extension script exceeded 15-second execution boundary. Process forcefully terminated.".into());
+                            bail!(
+                                "Custom extension script exceeded 15-second execution boundary. Process forcefully terminated."
+                            );
                         }
                         std::thread::sleep(std::time::Duration::from_millis(100));
                     }
                     Err(e) => {
-                        return Err(format!("Failed to parse child execution status: {}", e));
+                        bail!("Failed to parse child execution status: {}", e);
                     }
                 }
             }
@@ -441,13 +451,15 @@ fn execute_atomic_command(
                                 );
                                 Ok(())
                             } else {
-                                Err("Container is no longer in a running state. Aborting containment to prevent TOCTOU misfires.".into())
+                                bail!(
+                                    "Container is no longer in a running state. Aborting containment to prevent TOCTOU misfires."
+                                );
                             }
                         } else {
-                            Err(format!(
+                            bail!(
                                 "State validation rejected (HTTP {}). Container likely terminated.",
                                 status
-                            ))
+                            );
                         }
                     }
 
@@ -459,10 +471,7 @@ fn execute_atomic_command(
                         if (200..300).contains(&status) || status == 409 {
                             Ok(())
                         } else {
-                            Err(format!(
-                                "Pause mutation rejected (HTTP {}): {}",
-                                status, err_payload
-                            ))
+                            bail!("Pause mutation rejected (HTTP {}): {}", status, err_payload);
                         }
                     }
 
@@ -474,10 +483,11 @@ fn execute_atomic_command(
                         if (200..300).contains(&status) || status == 409 {
                             Ok(())
                         } else {
-                            Err(format!(
+                            bail!(
                                 "Unpause mutation rejected (HTTP {}): {}",
-                                status, err_payload
-                            ))
+                                status,
+                                err_payload
+                            );
                         }
                     }
 
@@ -489,10 +499,11 @@ fn execute_atomic_command(
                         if (200..300).contains(&status) {
                             Ok(())
                         } else {
-                            Err(format!(
+                            bail!(
                                 "Restart mutation rejected (HTTP {}): {}",
-                                status, err_payload
-                            ))
+                                status,
+                                err_payload
+                            );
                         }
                     }
 
@@ -513,10 +524,7 @@ fn execute_atomic_command(
                         if (200..300).contains(&status) {
                             Ok(())
                         } else {
-                            Err(format!(
-                                "CommitSnapshot rejected (HTTP {}): {}",
-                                status, err_payload
-                            ))
+                            bail!("CommitSnapshot rejected (HTTP {}): {}", status, err_payload);
                         }
                     }
 
@@ -529,10 +537,11 @@ fn execute_atomic_command(
                         if (200..300).contains(&status) || status == 409 {
                             Ok(())
                         } else {
-                            Err(format!(
+                            bail!(
                                 "ContainerSignal rejected (HTTP {}): {}",
-                                status, err_payload
-                            ))
+                                status,
+                                err_payload
+                            );
                         }
                     }
 
@@ -540,7 +549,9 @@ fn execute_atomic_command(
                         let ips = resolve_container_ips(container_id, json_enabled, socket_path);
 
                         if ips.is_empty() {
-                            return Err("IP resolution yielded zero addresses; cannot apply nftables blacklist.".into());
+                            bail!(
+                                "IP resolution yielded zero addresses; cannot apply nftables blacklist."
+                            );
                         }
 
                         for ip in ips {
@@ -641,26 +652,24 @@ fn execute_atomic_command(
 }
 
 #[cfg(target_os = "linux")]
-fn execute_firewall_mutation(
-    ip: &str,
-    set: &str,
-    timeout: &str,
-    table: &str,
-) -> Result<(), String> {
+fn execute_firewall_mutation(ip: &str, set: &str, timeout: &str, table: &str) -> Result<()> {
     use regex::Regex;
     static VALIDATION_RULE: OnceLock<Regex> = OnceLock::new();
 
     let rule = VALIDATION_RULE.get_or_init(|| Regex::new(r"^\d+[smhd]$").unwrap());
 
     if !rule.is_match(timeout) {
-        return Err(format!(
+        bail!(
             "Security Constraint Violation: Intercepted malformed firewall duration payload: '{}'",
             timeout
-        ));
+        );
     }
 
+    // Safely construct the final nftables element block
     let element_payload = format!("{{ {} timeout {} }}", ip, timeout);
 
+    // Split the table string (e.g., "inet security_ops") into discrete string tokens
+    // to prevent execve from rejecting the command as a single malformed argument.
     let s = Command::new("nft")
         .arg("add")
         .arg("element")
@@ -668,12 +677,12 @@ fn execute_firewall_mutation(
         .arg(set)
         .arg(&element_payload)
         .status()
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| anyhow!("Subprocess execution failed: {}", e))?;
 
     if s.success() {
         Ok(())
     } else {
-        Err("Kernel nftables transaction rejected execution parameters.".into())
+        bail!("Kernel nftables transaction rejected execution parameters.");
     }
 }
 
@@ -705,8 +714,8 @@ pub fn execute_containment_pipeline(
     container_id: String,
     try_actions: Vec<AtomicAction>,
     final_actions: Vec<AtomicAction>,
-    whitelist: Vec<IpNet>,
-    table: String,
+    whitelist: Arc<Vec<IpNet>>,
+    table: Arc<String>,
     json_enabled: bool,
     rule_name: String,
     socket_path: String,
@@ -732,7 +741,7 @@ pub fn execute_containment_pipeline(
                 None,
                 Some(&format!("{:?}", action)),
                 "FAILURE",
-                &format!("Primary playbook action failed structural context: {}", e),
+                &format!("Primary playbook action failed structural context: {:#}", e),
                 json_enabled,
             );
             pipeline_failed = true;
@@ -810,7 +819,7 @@ pub fn execute_containment_pipeline(
                         None,
                         Some(&format!("{:?}", fallback)),
                         "CRASH",
-                        &format!("EMERGENCY CONTAINMENT FAILURE: {}", fallback_error),
+                        &format!("EMERGENCY CONTAINMENT FAILURE: {:#}", fallback_error),
                         json_enabled,
                     );
                 }
@@ -877,13 +886,15 @@ mod tests {
         let result = read_bounded_line(&mut cursor, 50);
 
         assert!(result.is_err());
-        assert_eq!(
-            result.unwrap_err(),
-            "Buffer-bloat protection: HTTP line exceeded maximum bounded length"
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Buffer-bloat protection: HTTP line exceeded maximum bounded length")
         );
     }
 
-    // NEW: Verifies that exact-boundary matches without a trailing newline are flagged correctly
+    // Verify that exact-boundary matches without a trailing newline are flagged correctly
     #[test]
     fn test_read_bounded_line_exact_limit_anomaly() {
         let data = vec![b'B'; 64];
@@ -896,7 +907,7 @@ mod tests {
         );
     }
 
-    // NEW: Regression verification proving command-injection attempts inside firewall rules are blocked instantly
+    // Regression verification proving command-injection attempts inside firewall rules are blocked instantly
     #[test]
     fn test_firewall_timeout_injection_defense() {
         let target_ip = "10.0.0.2";
@@ -914,9 +925,9 @@ mod tests {
             "VULNERABILITY REGRESSION: Ingestion loop allowed unchecked structural timeout manipulation!"
         );
 
-        if let Err(err_string) = validation_result {
+        if let Err(err) = validation_result {
             assert!(
-                err_string.contains("Security Constraint Violation"),
+                err.to_string().contains("Security Constraint Violation"),
                 "Error context should explicitly detail a security validation drop"
             );
         }
@@ -938,9 +949,11 @@ mod tests {
 
         let content_length: Option<usize> = Some(1073741824);
 
-        let evaluation_result = if let Some(len) = content_length {
+        let evaluation_result: Result<()> = if let Some(len) = content_length {
             if len > MAX_UDS_PAYLOAD_SIZE {
-                Err("SECURITY ABORT: Content-Length out of bounds".to_string())
+                Err(anyhow::anyhow!(
+                    "SECURITY ABORT: Content-Length out of bounds"
+                ))
             } else {
                 Ok(())
             }

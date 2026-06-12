@@ -1,6 +1,6 @@
 // Ingestion Pipeline Engine
-// Operates high-performance file tailers and parallel UDS socket tracking pipelines cleanly.
-// Features active DoS-resistant TOCTOU mitigations and SO_PEERCRED trust boundaries.
+// Operates fast file tailers and parallel UDS socket tracking pipelines
+// Features active DoS-resistant TOCTOU mitigations, SO_PEERCRED trust boundaries, and lock safety
 
 use regex::Regex;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -20,7 +20,7 @@ use std::ffi::{CString, OsStr};
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
-use std::os::unix::io::{AsRawFd, FromRawFd};
+use std::os::unix::io::FromRawFd;
 
 use crate::config::{AtomicAction, GuardConfig, IngestionMode};
 use crate::logger::emit_log;
@@ -45,15 +45,18 @@ struct AntiDosState {
 
 #[allow(dead_code)]
 const MAX_NEGATIVE_CACHE: usize = 1000;
+#[allow(dead_code)]
 const MAX_LOOKUP_TOKENS: u32 = 10; // Max API queries per second for unknown IDs
 
 pub fn start_monitor_loop(config: GuardConfig) {
     let mode = &config.monitor.mode;
     let json_enabled = config.monitor.json_logging_enabled;
-    let whitelist = config.monitor.ip_whitelist.clone();
-    let table = config.monitor.nftables_default_table.clone();
     let docker_socket_path = config.monitor.docker_socket_path.clone();
     let watchdog_interval = config.monitor.systemd_watchdog_interval_ms;
+
+    // Prevent expensive heap cloning during incident routing
+    let whitelist = Arc::new(config.monitor.ip_whitelist);
+    let table = Arc::new(config.monitor.nftables_default_table);
 
     // Spawn a dedicated, decoupled watchdog heartbeat thread
     if watchdog_interval > 0 {
@@ -85,7 +88,7 @@ pub fn start_monitor_loop(config: GuardConfig) {
         thread::spawn(move || {
             use std::io::Write;
 
-            // 1. Initial Seeding Call to eliminate cold-start visibility race windows
+            // Initial Seeding Call to eliminate cold-start visibility race windows
             let initial_ids = crate::worker::fetch_running_container_ids(&ds_path);
             if let Ok(mut guard) = cache_clone.write() {
                 *guard = initial_ids;
@@ -217,8 +220,8 @@ pub fn start_monitor_loop(config: GuardConfig) {
         let uds_registry = Arc::clone(&worker_registry);
         let uds_regex = Arc::clone(&regex_compiled);
         let uds_id_extractor = id_extractor.clone();
-        let uds_whitelist = whitelist.clone();
-        let uds_table = table.clone();
+        let uds_whitelist = Arc::clone(&whitelist);
+        let uds_table = Arc::clone(&table);
         let uds_socket_path = docker_socket_path.clone();
         let uds_cache = Arc::clone(&active_containers);
         let uds_anti_dos = Arc::clone(&anti_dos_state);
@@ -481,12 +484,40 @@ pub fn start_monitor_loop(config: GuardConfig) {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn get_peer_uid(stream: &std::os::unix::net::UnixStream) -> std::io::Result<u32> {
+    use std::os::unix::io::AsRawFd;
+    let fd = stream.as_raw_fd();
+    let mut ucred = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+
+    let res = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut ucred as *mut libc::ucred as *mut libc::c_void,
+            &mut len,
+        )
+    };
+
+    if res == 0 {
+        Ok(ucred.uid)
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
 fn run_uds_server(
     registry: Arc<RwLock<RegistryMap>>,
     regex_rules: Arc<Vec<(String, Regex, Vec<AtomicAction>, Vec<AtomicAction>)>>,
     id_extractor: Regex,
-    whitelist: Vec<ipnet::IpNet>,
-    table: String,
+    whitelist: Arc<Vec<ipnet::IpNet>>,
+    table: Arc<String>,
     json_enabled: bool,
     docker_socket_path: String,
     active_containers: Arc<RwLock<HashSet<String>>>,
@@ -538,28 +569,30 @@ fn run_uds_server(
 
     for stream in listener.incoming() {
         if let Ok(stream) = stream {
-            // SECURITY: Extract Peer Credentials to prevent unauthorized local processes from flooding the queue
+            // Extract Peer Credentials using raw libc to bypass unstable std features
             #[cfg(target_os = "linux")]
-            match peer_uid(&stream) {
-                Ok(0) => {}
-                Ok(uid) => {
-                    emit_log(
-                        "WARN",
-                        "uds_server",
-                        None,
-                        None,
-                        None,
-                        Some("trust_boundary"),
-                        "REJECTED",
-                        &format!(
-                            "Unauthorized UID {} attempted UDS connection. Payload dropped.",
-                            uid
-                        ),
-                        json_enabled,
-                    );
-                    continue;
+            {
+                match get_peer_uid(&stream) {
+                    Ok(0) => {}
+                    Ok(peer_uid) => {
+                        emit_log(
+                            "WARN",
+                            "uds_server",
+                            None,
+                            None,
+                            None,
+                            Some("trust_boundary"),
+                            "REJECTED",
+                            &format!(
+                                "Unauthorized UID {} attempted UDS connection. Payload dropped.",
+                                peer_uid
+                            ),
+                            json_enabled,
+                        );
+                        continue;
+                    }
+                    Err(_) => continue, // Drop unverified origins safely
                 }
-                Err(_) => continue,
             }
 
             if active_connections.load(Ordering::SeqCst) >= MAX_UDS_CONNECTIONS {
@@ -572,8 +605,8 @@ fn run_uds_server(
             let reg_clone = Arc::clone(&registry);
             let rules_clone = Arc::clone(&regex_rules);
             let id_clone = id_extractor.clone();
-            let wl_clone = whitelist.clone();
-            let tbl_clone = table.clone();
+            let wl_clone = Arc::clone(&whitelist);
+            let tbl_clone = Arc::clone(&table);
             let ds_path_clone = docker_socket_path.clone();
             let cache_clone = Arc::clone(&active_containers);
             let dos_clone = Arc::clone(&anti_dos_state);
@@ -602,8 +635,8 @@ fn handle_uds_stream(
     registry: Arc<RwLock<RegistryMap>>,
     regex_rules: Arc<Vec<(String, Regex, Vec<AtomicAction>, Vec<AtomicAction>)>>,
     id_extractor: Regex,
-    whitelist: Vec<ipnet::IpNet>,
-    table: String,
+    whitelist: Arc<Vec<ipnet::IpNet>>,
+    table: Arc<String>,
     json_enabled: bool,
     docker_socket_path: String,
     active_containers: Arc<RwLock<HashSet<String>>>,
@@ -704,8 +737,8 @@ fn evaluate_line_signatures(
     rules: &[(String, Regex, Vec<AtomicAction>, Vec<AtomicAction>)],
     id_extractor: &Regex,
     registry: &Arc<RwLock<RegistryMap>>,
-    whitelist: &[ipnet::IpNet],
-    table: &str,
+    whitelist: &Arc<Vec<ipnet::IpNet>>,
+    table: &Arc<String>,
     json_enabled: bool,
     docker_socket_path: &str,
     is_from_file: bool,
@@ -727,10 +760,10 @@ fn evaluate_line_signatures(
 
                     #[cfg(target_os = "linux")]
                     {
-                        // Check primary active cache
                         let mut is_valid = {
-                            let active_guard =
-                                active_containers.read().unwrap_or_else(|p| p.into_inner());
+                            let active_guard = active_containers.read().expect(
+                                "CRITICAL: Active container cache lock poisoned. Aborting.",
+                            );
                             active_guard.contains(&container_id)
                                 || active_guard
                                     .iter()
@@ -739,8 +772,9 @@ fn evaluate_line_signatures(
 
                         // Fallback: Synchronous Verification mapped behind Negative Cache & Rate Limits
                         if !is_valid {
-                            let mut dos_guard =
-                                anti_dos_state.lock().unwrap_or_else(|p| p.into_inner());
+                            let mut dos_guard = anti_dos_state
+                                .lock()
+                                .expect("CRITICAL: DoS State lock poisoned. Aborting.");
 
                             // Token Replenishment
                             let now = Instant::now();
@@ -762,14 +796,15 @@ fn evaluate_line_signatures(
                                     is_container_active_sync(&container_id, docker_socket_path);
 
                                 if actually_exists {
-                                    let mut active_write = active_containers
-                                        .write()
-                                        .unwrap_or_else(|p| p.into_inner());
+                                    let mut active_write = active_containers.write().expect(
+                                        "CRITICAL: Active container cache lock poisoned. Aborting.",
+                                    );
                                     active_write.insert(container_id.clone());
                                     is_valid = true;
                                 } else {
-                                    let mut dos_write =
-                                        anti_dos_state.lock().unwrap_or_else(|p| p.into_inner());
+                                    let mut dos_write = anti_dos_state
+                                        .lock()
+                                        .expect("CRITICAL: DoS State lock poisoned. Aborting.");
 
                                     // Maintain bounded LRU capacity for Negative Cache
                                     if dos_write.negative_cache.len() >= MAX_NEGATIVE_CACHE {
@@ -813,8 +848,8 @@ fn evaluate_line_signatures(
                         active_try,
                         final_act.clone(),
                         rule_name.clone(),
-                        whitelist,
-                        table,
+                        Arc::clone(whitelist),
+                        Arc::clone(table),
                         json_enabled,
                         docker_socket_path,
                         line.to_string(),
@@ -831,8 +866,8 @@ fn dispatch_to_worker(
     try_actions: Vec<AtomicAction>,
     final_actions: Vec<AtomicAction>,
     rule_name: String,
-    whitelist: &[ipnet::IpNet],
-    table: &str,
+    whitelist: Arc<Vec<ipnet::IpNet>>,
+    table: Arc<String>,
     json_enabled: bool,
     docker_socket_path: &str,
     trigger_message: String,
@@ -843,17 +878,17 @@ fn dispatch_to_worker(
     {
         let reg_read = registry
             .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .expect("CRITICAL: Worker registry lock poisoned. Aborting.");
         if let Some(tx) = reg_read.get(&container_id) {
             let _ = tx.try_send((try_actions, final_actions, rule_name, trigger_message));
             return;
         }
     }
 
-    // SLOW PATH: Channel context does not exist. Acquire exclusive write lock to initialize pipeline workers.
+    // SLOW PATH: Channel context does not exist. Acquire exclusive write lock to initialize pipeline workers
     let mut reg_write = registry
         .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+        .expect("CRITICAL: Worker registry lock poisoned. Aborting.");
 
     // Double-Checked Locking Pattern validation check
     if !reg_write.contains_key(&container_id) && reg_write.len() >= MAX_WORKERS {
@@ -874,8 +909,8 @@ fn dispatch_to_worker(
     let tx = reg_write.entry(container_id.clone()).or_insert_with(|| {
         let (worker_tx, worker_rx) = sync_channel::<WorkerChannelMessage>(64);
         let cid_clone = container_id.clone();
-        let wl_clone = whitelist.to_vec();
-        let tbl_clone = table.to_string();
+        let wl_clone = Arc::clone(&whitelist);
+        let tbl_clone = Arc::clone(&table);
         let ds_clone = docker_socket_path.to_string();
         let reg_sharing_reference = Arc::clone(registry);
 
@@ -934,8 +969,8 @@ fn run_worker_lifecycle(
     container_id: String,
     rx_chan: Receiver<WorkerChannelMessage>,
     registry: Arc<RwLock<RegistryMap>>,
-    whitelist: Vec<ipnet::IpNet>,
-    table: String,
+    whitelist: Arc<Vec<ipnet::IpNet>>,
+    table: Arc<String>,
     json_enabled: bool,
     docker_socket_path: String,
 ) {
@@ -948,8 +983,8 @@ fn run_worker_lifecycle(
                     container_id.clone(),
                     try_cmds,
                     final_cmds,
-                    whitelist.clone(),
-                    table.clone(),
+                    Arc::clone(&whitelist),
+                    Arc::clone(&table),
                     json_enabled,
                     rule,
                     docker_socket_path.clone(),
@@ -960,7 +995,7 @@ fn run_worker_lifecycle(
                 // Decay phase: Acquire exclusive write lock strictly on worker termination
                 let mut reg = registry
                     .write()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    .expect("CRITICAL: Worker registry lock poisoned. Aborting.");
 
                 match rx_chan.try_recv() {
                     Ok((try_cmds, final_cmds, rule, trigger_msg)) => {
@@ -970,8 +1005,8 @@ fn run_worker_lifecycle(
                             container_id.clone(),
                             try_cmds,
                             final_cmds,
-                            whitelist.clone(),
-                            table.clone(),
+                            Arc::clone(&whitelist),
+                            Arc::clone(&table),
                             json_enabled,
                             rule,
                             docker_socket_path.clone(),
@@ -1056,35 +1091,6 @@ fn notify_systemd_ready() {
             }
         }
     }
-}
-
-#[cfg(target_os = "linux")]
-fn peer_uid(stream: &UnixStream) -> std::io::Result<libc::uid_t> {
-    let mut cred = std::mem::MaybeUninit::<libc::ucred>::uninit();
-    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-
-    let rc = unsafe {
-        libc::getsockopt(
-            stream.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            cred.as_mut_ptr().cast(),
-            &mut len,
-        )
-    };
-
-    if rc != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-
-    if len < std::mem::size_of::<libc::ucred>() as libc::socklen_t {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "short SO_PEERCRED response",
-        ));
-    }
-
-    Ok(unsafe { cred.assume_init() }.uid)
 }
 
 struct ConnectionGuard(Arc<AtomicUsize>);

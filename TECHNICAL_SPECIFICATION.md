@@ -88,7 +88,8 @@ set_name = "container_blacklist"
 timeout = "168h"
 ```
 
-*Note: The configuration schema supports `type = "kill"` as a functional runtime alias, mapping seamlessly onto the internal `ContainerSignal` data structure via Serde token aliases.*
+*Note: The configuration schema supports `type = "kill"` as a functional runtime alias, mapping directly
+onto the internal `ContainerSignal` data structure via Serde token aliases.*
 
 ## 3. Native In-Application Seccomp-BPF Runtime
 

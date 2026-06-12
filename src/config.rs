@@ -1,13 +1,16 @@
 // Configuration Engine Module
-// Handles the secure ingestion, parsing, and type-safe validation of the declarative `config.toml` structure.
-// Enforces strict schema validations via Serde to ensure safe startup aborts on anomaly detection.
+// Handles the secure ingestion, parsing,
+// and type-safe validation of the declarative `config.toml` structure
+// Enforces strict schema validations
+// via Serde to ensure safe startup aborts on anomaly detection
 
+use anyhow::{Context, Result, anyhow};
 use ipnet::IpNet;
 use serde::Deserialize;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-// Strongly typed operational matrix definitions mapping onto specific automated containment actions.
+// Strictly typed operational matrix definitions mapping onto specific automated containment actions
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AtomicAction {
@@ -44,7 +47,7 @@ pub enum IngestionMode {
     Dual,
 }
 
-// Global Daemon Engine Metric Parameters.
+// Global Daemon Engine Metric Parameters
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MonitorConfig {
@@ -57,7 +60,6 @@ pub struct MonitorConfig {
     pub docker_socket_path: String,
     #[serde(default = "default_seccomp_enabled")]
     pub seccomp_enabled: bool,
-    // FIX: Removed dead_code allowance; property is now actively consumed by the dedicated heartbeat thread.
     pub systemd_watchdog_interval_ms: u64,
 }
 
@@ -65,7 +67,7 @@ fn default_seccomp_enabled() -> bool {
     cfg!(all(target_os = "linux", target_arch = "x86_64"))
 }
 
-// Threat Identification Rules Mapping Signatures to Incident Containment Playbooks.
+// Threat Identification Rules Mapping Signatures to Incident Containment Playbooks
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuleConfig {
@@ -87,28 +89,30 @@ pub struct GuardConfig {
 }
 
 // Fail-Safe Configuration Loader
-// Securely reads the raw profile manifest from the host system, executing deep structural syntax validations.
-pub fn load_config<P: AsRef<Path>>(path: P) -> Result<GuardConfig, String> {
+// Securely reads the raw profile manifest from the host system,
+// executing deep structural syntax validations
+pub fn load_config<P: AsRef<Path>>(path: P) -> Result<GuardConfig> {
     let path_ref = path.as_ref();
 
-    let content = fs::read_to_string(path_ref).map_err(|e| {
+    let content = fs::read_to_string(path_ref).with_context(|| {
         format!(
-            "Configuration missing, inaccessible, or tampered at '{}': {}",
-            path_ref.display(),
-            e
+            "Configuration missing, inaccessible, or tampered at '{}'",
+            path_ref.display()
         )
     })?;
 
-    let config: GuardConfig = toml::from_str(&content)
-        .map_err(|e| format!("Configuration structural verification failed: {}", e))?;
+    let config: GuardConfig =
+        toml::from_str(&content).context("Configuration structural verification failed")?;
 
     if config.rules.is_empty() {
-        return Err("Security Constraint Violation: At least one active detection [[rules]] block must be defined.".to_string());
+        return Err(anyhow!(
+            "Security Constraint Violation: At least one active detection [[rules]] block must be defined."
+        ));
     }
 
     for rule in &config.rules {
         if rule.try_actions.is_empty() && rule.final_actions.is_empty() {
-            return Err(format!(
+            return Err(anyhow!(
                 "Validation Error: Rule '{}' contains no operational try/final actions.",
                 rule.name
             ));
@@ -166,10 +170,9 @@ mod tests {
     fn test_load_config_missing_file_handling() {
         let result = load_config("/path/that/absolutely/does/not/exist/config.toml");
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .contains("Configuration missing, inaccessible, or tampered")
-        );
+
+        // Extract the error and convert it to a string to verify the context
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("Configuration missing, inaccessible, or tampered"));
     }
 }

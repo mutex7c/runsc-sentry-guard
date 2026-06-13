@@ -79,8 +79,8 @@ fn main() {
             // Trigger the post-crash recovery engine during bootstrap
             // initialization before spinning up core processing tracking loops
             cleanup_stale_firewall_elements(&valid_config);
-
-            start_monitor_loop(valid_config, Arc::clone(&shutdown));
+            
+            start_monitor_loop(valid_config, Arc::clone(&shutdown), active_path.to_string());
 
             logger::emit_log(
                 "INFO",

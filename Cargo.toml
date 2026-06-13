@@ -17,6 +17,7 @@ ipnet = { version = "2.12.0", features = ["serde"] }
 libc = "0.2.186"
 regex = "1.12.3"
 signal-hook = "0.4.4"
+notify = "8.2.0"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 caps = "0.5.6"

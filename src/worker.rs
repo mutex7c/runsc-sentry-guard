@@ -307,9 +307,6 @@ fn execute_atomic_command(
                 container_id
             );
 
-            // Invoke host-native curl safely
-            // --max-time 5 prevents slowloris/hanging connections from starving the worker thread pool
-            // Arguments are passed as literal string slices, entirely eliminating shell injection vulnerabilities
             let s = Command::new("curl")
                 .args(&[
                     "-X",
@@ -669,12 +666,8 @@ fn execute_firewall_mutation(
         );
     }
 
-    // Safely construct the final nftables element block
-    // Appended tracking metadata comment payload to allow deterministic post-crash discovery
     let element_payload = format!("{{ {} timeout {} comment \"runsc-sentry-guard\" }}", ip, timeout);
 
-    // Split the table string (e.g., "inet security_ops") into discrete string tokens
-    // to prevent execve from rejecting the command as a single malformed argument.
     let s = Command::new("nft")
         .arg("add")
         .arg("element")
@@ -729,10 +722,11 @@ pub fn execute_containment_pipeline(
     let mut pipeline_failed = false;
 
     for action in &try_actions {
+
         if let Err(e) = execute_atomic_command(
             action,
             &container_id,
-            &whitelist,
+            &whitelist[..],
             &table,
             json_enabled,
             &socket_path,
@@ -758,10 +752,11 @@ pub fn execute_containment_pipeline(
         emit_json_escalation_marker(&container_id, &rule_name, json_enabled);
 
         for fallback in &final_actions {
+
             match execute_atomic_command(
                 fallback,
                 &container_id,
-                &whitelist,
+                &whitelist[..],
                 &table,
                 json_enabled,
                 &socket_path,
@@ -780,7 +775,6 @@ pub fn execute_containment_pipeline(
                         json_enabled,
                     );
 
-                    // Short-circuit the loop ONLY if the successful action was a terminal state mutation
                     match fallback {
                         AtomicAction::ContainerSignal { signal } => {
                             if signal == "SIGKILL" || signal == "SIGSTOP" {
@@ -812,7 +806,7 @@ pub fn execute_containment_pipeline(
                             );
                             break;
                         }
-                        _ => {} // Non-terminal actions (logging, firewalls, webhooks) allow the loop to continue
+                        _ => {}
                     }
                 }
                 Err(fallback_error) => {
@@ -897,7 +891,6 @@ mod tests {
             .contains("Buffer-bloat protection: HTTP line exceeded maximum bounded length"));
     }
 
-    // Verify that exact-boundary matches without a trailing newline are flagged correctly
     #[test]
     fn test_read_bounded_line_exact_limit_anomaly() {
         let data = vec![b'B'; 64];
@@ -910,14 +903,12 @@ mod tests {
         );
     }
 
-    // Regression verification proving command-injection attempts inside firewall rules are blocked instantly
     #[test]
     fn test_firewall_timeout_injection_defense() {
         let target_ip = "10.0.0.2";
         let target_set = "blacklist_set";
         let target_table = "inet filter";
 
-        // Attempt an absolute classic syntax bypass payload
         let malicious_timeout = "24h; nft delete table inet filter;";
 
         let validation_result =
@@ -966,5 +957,64 @@ mod tests {
             evaluation_result.is_err(),
             "Vulnerability Regression: Ingestion engine accepted a massive allocation size!"
         );
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub fn extract_id_from_pid(pid: i32) -> Option<String> {
+    use std::fs;
+    use regex::Regex;
+    let cmdline_path = format!("/proc/{}/cmdline", pid);
+    if let Ok(content) = fs::read_to_string(cmdline_path) {
+        let id_extractor = Regex::new(r"\b([a-fA-F0-9]{12}|[a-fA-F0-9]{64})\b").unwrap();
+        for arg in content.split('\0') {
+            if let Some(caps) = id_extractor.captures(arg) {
+                if let Some(matched_id) = caps.get(1) {
+                    return Some(matched_id.as_str().to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+pub fn cleanup_stale_firewall_elements(config: &crate::config::GuardConfig) {
+    let table = &config.monitor.nftables_default_table;
+    let ip_regex = regex::Regex::new(r"\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b|([a-fA-F0-9:]+:+[a-fA-F0-9:]+)\b").unwrap();
+
+    for rule in &config.rules {
+        let combined_actions = rule.try_actions.iter().chain(rule.final_actions.iter());
+        for action in combined_actions {
+            if let AtomicAction::NftBlacklist { set_name, .. } = action {
+                let output = Command::new("nft")
+                    .arg("list")
+                    .arg("set")
+                    .args(table.split_whitespace())
+                    .arg(set_name)
+                    .output();
+
+                if let Ok(out) = output {
+                    let stdout_str = String::from_utf8_lossy(&out.stdout);
+                    for line in stdout_str.lines() {
+                        if line.contains("comment \"runsc-sentry-guard\"") {
+                            if let Some(caps) = ip_regex.captures(line) {
+                                if let Some(matched_ip) = caps.get(0) {
+                                    let ip_str = matched_ip.as_str();
+                                    let element_payload = format!("{{ {} }}", ip_str);
+
+                                    let _ = Command::new("nft")
+                                        .arg("delete")
+                                        .arg("element")
+                                        .args(table.split_whitespace())
+                                        .arg(set_name)
+                                        .arg(&element_payload)
+                                        .status();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }

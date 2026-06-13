@@ -1,15 +1,16 @@
 // Application Entry point
-
 // Orchestrates process initialization and routes execution to the multithreaded monitoring handlers
 
 mod config;
 mod logger;
-mod tailer;
 mod worker;
+mod limiters;
+mod socket;
+mod ingestion;
 
 use config::load_config;
 use std::path::Path;
-use tailer::start_monitor_loop;
+use ingestion::start_monitor_loop;
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -47,7 +48,6 @@ fn main() {
     match load_config(active_path) {
         Ok(valid_config) => {
             let json_enabled = valid_config.monitor.json_logging_enabled;
-
             let flush_firewall = valid_config.monitor.flush_firewall_on_shutdown;
             let nft_table = valid_config.monitor.nftables_default_table.clone();
             let mut sets_to_flush = Vec::new();
@@ -76,10 +76,8 @@ fn main() {
                 json_enabled,
             );
 
-            // Trigger the post-crash recovery engine during bootstrap
-            // initialization before spinning up core processing tracking loops
-            cleanup_stale_firewall_elements(&valid_config);
-            
+            worker::cleanup_stale_firewall_elements(&valid_config);
+
             start_monitor_loop(valid_config, Arc::clone(&shutdown), active_path.to_string());
 
             logger::emit_log(
@@ -118,55 +116,6 @@ fn main() {
         Err(err_msg) => {
             eprintln!("System Architectural Boot Panic: {}", err_msg);
             std::process::exit(1);
-        }
-    }
-}
-
-// Post-Crash Recovery Bootstrap Engine
-
-// Scans configured nftables sets at startup, identifies elements
-// carrying "runsc-sentry-guard" tracking comment, and purges them to prevent stale drifts
-fn cleanup_stale_firewall_elements(config: &config::GuardConfig) {
-    let table = &config.monitor.nftables_default_table;
-    // Bounded regex tracking standard IPv4 and simplified IPv6 formatting tokens
-    let ip_regex = regex::Regex::new(r"\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b|([a-fA-F0-9:]+:+[a-fA-F0-9:]+)\b").unwrap();
-
-    for rule in &config.rules {
-        let combined_actions = rule.try_actions.iter().chain(rule.final_actions.iter());
-        for action in combined_actions {
-            if let config::AtomicAction::NftBlacklist { set_name, .. } = action {
-                // Query the exact host-side state configuration of the targeted set
-                let output = std::process::Command::new("nft")
-                    .arg("list")
-                    .arg("set")
-                    .args(table.split_whitespace())
-                    .arg(set_name)
-                    .output();
-
-                if let Ok(out) = output {
-                    let stdout_str = String::from_utf8_lossy(&out.stdout);
-                    for line in stdout_str.lines() {
-                        // Isolate elements dropped by our daemon during a previous crashed lifecycle run
-                        if line.contains("comment \"runsc-sentry-guard\"") {
-                            if let Some(caps) = ip_regex.captures(line) {
-                                if let Some(matched_ip) = caps.get(0) {
-                                    let ip_str = matched_ip.as_str();
-                                    let element_payload = format!("{{ {} }}", ip_str);
-
-                                    // Remove the individual stale element value cleanly from the set
-                                    let _ = std::process::Command::new("nft")
-                                        .arg("delete")
-                                        .arg("element")
-                                        .args(table.split_whitespace())
-                                        .arg(set_name)
-                                        .arg(&element_payload)
-                                        .status();
-                                }
-                            }
-                        }
-                    }
-                }
-            }
         }
     }
 }

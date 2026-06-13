@@ -115,6 +115,9 @@ pub fn load_config<P: AsRef<Path>>(path: P) -> Result<GuardConfig> {
     Ok(config)
 }
 
+pub type WorkerChannelMessage = (Vec<AtomicAction>, Vec<AtomicAction>, String, String);
+pub type RegistryMap = std::collections::HashMap<String, std::sync::mpsc::SyncSender<WorkerChannelMessage>>;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -128,6 +131,7 @@ mod tests {
         temp_path.push("runsc_valid_test_config.toml");
 
         let mut file = File::create(&temp_path).unwrap();
+
         let toml_data = r#"
             [monitor]
             mode = "file"
@@ -153,6 +157,7 @@ mod tests {
 
         assert_eq!(config.monitor.mode, IngestionMode::File);
         assert_eq!(config.monitor.docker_socket_path, "/var/run/docker.sock");
+        assert_eq!(config.monitor.max_workers, 100);
         assert_eq!(config.rules.len(), 1);
         assert_eq!(config.rules[0].name, "test_rule");
 

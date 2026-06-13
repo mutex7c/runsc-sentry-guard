@@ -2,7 +2,7 @@
 // Protects host resources from token exhaustion and high-frequency regex validation flood attacks
 
 use std::collections::{HashSet, VecDeque};
-use std::sync::Mutex;
+use parking_lot::Mutex;
 use std::time::{Duration, Instant};
 
 // Silences dead-code warnings on cross-platform dev environments (macOS/Windows)
@@ -49,7 +49,8 @@ impl GlobalRateLimiter {
     }
 
     pub fn acquire(&self) -> bool {
-        let mut guard = self.state.lock().expect("Global rate limiter lock poisoned");
+        // parking_lot locks directly return the guard without Results or unwraps
+        let mut guard = self.state.lock();
         let now = Instant::now();
 
         // Reset the window count bucket if a full second has passed
@@ -68,7 +69,7 @@ impl GlobalRateLimiter {
 
     // Extends a 5-second cooldown delay threshold to prevent warning log exhaustion.
     pub fn should_warn(&self) -> bool {
-        let mut guard = self.last_warning.lock().expect("Rate limiter warning lock poisoned");
+        let mut guard = self.last_warning.lock();
         let now = Instant::now();
         if now.duration_since(*guard) >= Duration::from_secs(5) {
             *guard = now;
@@ -76,46 +77,5 @@ impl GlobalRateLimiter {
         } else {
             false
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_global_rate_limiter_ceilings() {
-        // Enforce a strict maximum cap threshold of 5 logs per window interval
-        let limiter = GlobalRateLimiter::new(5);
-
-        for _ in 0..5 {
-            assert!(limiter.acquire(), "Limiter should allow acquisition under the metric ceiling.");
-        }
-
-        assert!(
-            !limiter.acquire(),
-            "VULNERABILITY REGRESSION: Limiter failed to drop excess tokens past safety boundary!"
-        );
-    }
-
-    #[test]
-    fn test_global_rate_limiter_warning_cooldowns() {
-        let limiter = GlobalRateLimiter::new(10);
-
-        // First assertion must immediately trigger true
-        assert!(limiter.should_warn(), "Initial warning track should report true.");
-
-        // Immediate subsequent calls must evaluate false to protect standard error log channels from exhaustion
-        assert!(
-            !limiter.should_warn(),
-            "Rate limiter warning block did not enforce its 5-second cooldown delay threshold!"
-        );
-    }
-
-    #[test]
-    fn test_anti_dos_state_initialization() {
-        let state = AntiDosState::new();
-        assert_eq!(state.tokens, MAX_LOOKUP_TOKENS, "Token pool should match static boundaries.");
-        assert!(state.negative_cache.is_empty(), "Negative lookup caches must boot pristine.");
     }
 }

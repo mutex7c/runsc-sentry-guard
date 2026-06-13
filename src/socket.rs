@@ -9,16 +9,17 @@ use std::io::{BufRead, BufReader, Read};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::{FromRawFd, IntoRawFd};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use mio::{Events, Interest, Poll, Token};
 use mio::net::UnixListener as MioUnixListener;
+use mio::{Events, Interest, Poll, Token};
+use parking_lot::{Mutex, RwLock}; // Updated to match ingestion.rs structures
 
 use crate::config::{AtomicAction, RegistryMap};
-use crate::logger::emit_log;
 use crate::limiters::{AntiDosState, GlobalRateLimiter};
+use crate::logger::emit_log;
 
 struct ConnectionGuard(Arc<AtomicUsize>);
 
@@ -32,7 +33,11 @@ impl Drop for ConnectionGuard {
 fn get_peer_creds(stream: &std::os::unix::net::UnixStream) -> std::io::Result<(u32, i32)> {
     use std::os::unix::io::AsRawFd;
     let fd = stream.as_raw_fd();
-    let mut ucred = libc::ucred { pid: 0, uid: 0, gid: 0 };
+    let mut ucred = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
     let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
 
     let res = unsafe {
@@ -96,7 +101,10 @@ pub fn run_uds_server(
             None,
             Some("permissions"),
             "CRASH",
-            &format!("Failed to enforce secure access permissions on UDS socket: {}", e),
+            &format!(
+                "Failed to enforce secure access permissions on UDS socket: {}",
+                e
+            ),
             json_enabled,
         );
         return;
@@ -143,7 +151,6 @@ pub fn run_uds_server(
     let mut events = Events::with_capacity(128);
 
     while !shutdown.load(Ordering::SeqCst) {
-
         // Let the OS handle the sleep and notification states efficiently
         if let Err(e) = poll.poll(&mut events, Some(Duration::from_millis(100))) {
             if e.kind() == std::io::ErrorKind::Interrupted {
@@ -159,13 +166,25 @@ pub fn run_uds_server(
                         Ok((mio_stream, _)) => {
                             // Safely unpack and consume the mio file descriptor into standard library structures
                             let stream = unsafe {
-                                std::os::unix::net::UnixStream::from_raw_fd(mio_stream.into_raw_fd())
+                                std::os::unix::net::UnixStream::from_raw_fd(
+                                    mio_stream.into_raw_fd(),
+                                )
                             };
 
                             // Revert the stream to blocking mode before handing it off
                             // to the synchronous BufReader in the worker thread
                             if let Err(e) = stream.set_nonblocking(false) {
-                                emit_log("ERROR", "uds_server", None, None, None, None, "CRASH", &format!("Failed to set blocking mode: {}", e), json_enabled);
+                                emit_log(
+                                    "ERROR",
+                                    "uds_server",
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    "CRASH",
+                                    &format!("Failed to set blocking mode: {}", e),
+                                    json_enabled,
+                                );
                                 continue;
                             }
 
@@ -331,7 +350,7 @@ fn handle_uds_stream(
                 let current_line = String::from_utf8_lossy(&buf);
                 let trimmed = current_line.trim_end();
 
-                let rules_guard = regex_rules.read().unwrap_or_else(|e| e.into_inner());
+                let rules_guard = regex_rules.read();
                 crate::ingestion::evaluate_line_signatures(
                     trimmed,
                     &rules_guard,

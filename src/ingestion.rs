@@ -6,12 +6,12 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
-use std::sync::atomic::Ordering;
-use std::sync::mpsc::{Receiver, TryRecvError, TrySendError, sync_channel};
-use std::sync::{Arc, Mutex, RwLock};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{sync_channel, Receiver, TryRecvError, TrySendError};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+use parking_lot::{Mutex, RwLock};
 
 #[cfg(target_os = "linux")]
 use std::io::BufRead;
@@ -24,8 +24,8 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::FromRawFd;
 
 use crate::config::{AtomicAction, GuardConfig, IngestionMode, RegistryMap, WorkerChannelMessage};
-use crate::logger::emit_log;
 use crate::limiters::{AntiDosState, GlobalRateLimiter};
+use crate::logger::emit_log;
 use crate::worker::execute_containment_pipeline;
 
 struct LogDescriptor {
@@ -71,7 +71,7 @@ pub fn start_monitor_loop(config: GuardConfig, shutdown: Arc<AtomicBool>, config
                 if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&ds_path) {
                     let current_ids = crate::worker::fetch_running_container_ids(&ds_path);
 
-                    let mut guard = cache_clone.write().unwrap_or_else(|e| e.into_inner());
+                    let mut guard = cache_clone.write();
                     *guard = current_ids;
 
                     let request = format!(
@@ -150,8 +150,7 @@ pub fn start_monitor_loop(config: GuardConfig, shutdown: Arc<AtomicBool>, config
 
                                     if !trimmed.is_empty() {
                                         if let Ok(event) = serde_json::from_str::<crate::worker::DockerEventPayload>(trimmed) {
-
-                                            let mut guard = cache_clone.write().unwrap_or_else(|e| e.into_inner());
+                                            let mut guard = cache_clone.write();
                                             if event.action == "start" {
                                                 guard.insert(event.actor.id);
                                             } else if event.action == "die" {
@@ -185,7 +184,7 @@ pub fn start_monitor_loop(config: GuardConfig, shutdown: Arc<AtomicBool>, config
     let json_enabled_clone = json_enabled;
 
     thread::spawn(move || {
-        use notify::{Watcher, RecursiveMode};
+        use notify::{RecursiveMode, Watcher};
         let (tx, rx) = std::sync::mpsc::channel();
 
         let watcher_res = notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
@@ -203,7 +202,7 @@ pub fn start_monitor_loop(config: GuardConfig, shutdown: Arc<AtomicBool>, config
 
                     if let Ok(new_config) = crate::config::load_config(&path_watch_clone) {
                         let new_compiled = compile_rules(&new_config.rules);
-                        let mut guard = rules_watch_clone.write().unwrap_or_else(|e| e.into_inner());
+                        let mut guard = rules_watch_clone.write();
                         *guard = new_compiled;
                         emit_log(
                             "INFO",
@@ -458,7 +457,7 @@ pub fn start_monitor_loop(config: GuardConfig, shutdown: Arc<AtomicBool>, config
                                 let trimmed = line_slice.trim_end();
 
                                 if !trimmed.is_empty() {
-                                    let rules_guard = regex_compiled.read().unwrap_or_else(|e| e.into_inner());
+                                    let rules_guard = regex_compiled.read();
                                     evaluate_line_signatures(
                                         trimmed,
                                         &rules_guard,
@@ -525,7 +524,7 @@ pub fn start_monitor_loop(config: GuardConfig, shutdown: Arc<AtomicBool>, config
 
 #[cfg(target_os = "linux")]
 fn is_container_active_sync(container_id: &str, socket_path: &str) -> bool {
-    use std::io::{Write, Read};
+    use std::io::{Read, Write};
     if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(socket_path) {
         let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
         let request = format!("GET /containers/{}/json HTTP/1.0\r\n\r\n", container_id);
@@ -600,12 +599,12 @@ pub fn evaluate_line_signatures(
             #[cfg(target_os = "linux")]
             {
                 let mut is_valid = {
-                    let active_guard = active_containers.read().unwrap_or_else(|e| e.into_inner());
+                    let active_guard = active_containers.read();
                     active_guard.contains(&container_id) || active_guard.iter().any(|long_id| long_id.starts_with(&container_id))
                 };
 
                 if !is_valid {
-                    let mut dos_guard = anti_dos_state.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut dos_guard = anti_dos_state.lock();
                     let now = std::time::Instant::now();
                     if now.duration_since(dos_guard.last_refill).as_secs() >= 1 {
                         dos_guard.tokens = crate::limiters::MAX_LOOKUP_TOKENS;
@@ -623,11 +622,11 @@ pub fn evaluate_line_signatures(
                         let actually_exists = is_container_active_sync(&container_id, docker_socket_path);
 
                         if actually_exists {
-                            let mut active_write = active_containers.write().unwrap_or_else(|e| e.into_inner());
+                            let mut active_write = active_containers.write();
                             active_write.insert(container_id.clone());
                             is_valid = true;
                         } else {
-                            let mut dos_write = anti_dos_state.lock().unwrap_or_else(|e| e.into_inner());
+                            let mut dos_write = anti_dos_state.lock();
                             if dos_write.negative_cache.len() >= crate::limiters::MAX_NEGATIVE_CACHE {
                                 if let Some(oldest) = dos_write.negative_queue.pop_front() {
                                     dos_write.negative_cache.remove(&oldest);
@@ -693,14 +692,14 @@ fn dispatch_to_worker(
     max_workers: usize,
 ) {
     {
-        let reg_read = registry.read().unwrap_or_else(|e| e.into_inner());
+        let reg_read = registry.read();
         if let Some(tx) = reg_read.get(&container_id) {
             let _ = tx.try_send((try_actions, final_actions, rule_name, trigger_message));
             return;
         }
     }
 
-    let mut reg_write = registry.write().unwrap_or_else(|e| e.into_inner());
+    let mut reg_write = registry.write();
 
     if !reg_write.contains_key(&container_id) && reg_write.len() >= max_workers {
         emit_log(
@@ -740,7 +739,12 @@ fn dispatch_to_worker(
         worker_tx
     });
 
-    match tx.try_send((try_actions, final_actions.clone(), rule_name.clone(), trigger_message.clone())) {
+    match tx.try_send((
+        try_actions,
+        final_actions.clone(),
+        rule_name.clone(),
+        trigger_message.clone(),
+    )) {
         Ok(_) => {}
         Err(TrySendError::Full(_)) => {
             emit_log(
@@ -819,7 +823,7 @@ fn run_worker_lifecycle(
                 );
             }
             Err(_) => {
-                let mut reg = registry.write().unwrap_or_else(|e| e.into_inner());
+                let mut reg = registry.write();
 
                 match rx_chan.try_recv() {
                     Ok((try_cmds, final_cmds, rule, trigger_msg)) => {
@@ -880,16 +884,25 @@ pub fn notify_systemd_ready() {
 
 #[cfg(unix)]
 fn open_log_safe(dir_path: &Path, file_name: &OsStr) -> std::io::Result<fs::File> {
-    let dir_c = CString::new(dir_path.as_os_str().as_bytes()).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    let file_c = CString::new(file_name.as_bytes()).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let dir_c = CString::new(dir_path.as_os_str().as_bytes())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let file_c = CString::new(file_name.as_bytes())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
 
     unsafe {
-        let dir_fd = libc::open(dir_c.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC);
+        let dir_fd = libc::open(
+            dir_c.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        );
         if dir_fd < 0 {
             return Err(std::io::Error::last_os_error());
         }
 
-        let file_fd = libc::openat(dir_fd, file_c.as_ptr(), libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        let file_fd = libc::openat(
+            dir_fd,
+            file_c.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        );
         libc::close(dir_fd);
 
         if file_fd < 0 {
@@ -900,12 +913,19 @@ fn open_log_safe(dir_path: &Path, file_name: &OsStr) -> std::io::Result<fs::File
     }
 }
 
-fn compile_rules(rules: &[crate::config::RuleConfig]) -> Vec<(String, Regex, Vec<AtomicAction>, Vec<AtomicAction>)> {
+fn compile_rules(
+    rules: &[crate::config::RuleConfig],
+) -> Vec<(String, Regex, Vec<AtomicAction>, Vec<AtomicAction>)> {
     rules
         .iter()
         .filter_map(|r| {
             Regex::new(&r.regex_match).ok().map(|compiled| {
-                (r.name.clone(), compiled, r.try_actions.clone(), r.final_actions.clone())
+                (
+                    r.name.clone(),
+                    compiled,
+                    r.try_actions.clone(),
+                    r.final_actions.clone(),
+                )
             })
         })
         .collect()

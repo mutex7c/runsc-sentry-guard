@@ -1,4 +1,5 @@
 // Ingestion Pipeline Engine
+
 // Operates fast file tailers and parallel UDS socket tracking pipelines
 // Features active DoS-resistant TOCTOU mitigations, SO_PEERCRED trust boundaries, and lock safety
 
@@ -88,17 +89,19 @@ pub fn start_monitor_loop(config: GuardConfig) {
         thread::spawn(move || {
             use std::io::Write;
 
-            // Initial Seeding Call to eliminate cold-start visibility race windows
-            let initial_ids = crate::worker::fetch_running_container_ids(&ds_path);
-            if let Ok(mut guard) = cache_clone.write() {
-                *guard = initial_ids;
-            }
-
             // Target container filter query string explicitly tracking asset creation and destruction
             let stream_endpoint = "/events?filters=%7B%22type%22%3A%5B%22container%22%5D%2C%22event%22%3A%5B%22start%22%2C%22die%22%5D%7D";
 
             loop {
                 if let Ok(mut stream) = UnixStream::connect(&ds_path) {
+
+                    // Re-seed the cache immediately upon initial connection and
+                    // any subsequent reconnection, to prevent state drift blind spots
+                    let current_ids = crate::worker::fetch_running_container_ids(&ds_path);
+                    if let Ok(mut guard) = cache_clone.write() {
+                        *guard = current_ids;
+                    }
+
                     let request = format!(
                         "GET {} HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n",
                         stream_endpoint
@@ -396,7 +399,8 @@ pub fn start_monitor_loop(config: GuardConfig) {
                             continue;
                         }
 
-                        // 64 KB Line-bounded streaming evaluator. Defeats truncation padding while preventing context leakage.
+                        // 64 KB Line-bounded streaming evaluator defeats
+                        // truncation padding and prevents context leakage
                         const MAX_LINE_SIZE: usize = 65536;
                         let mut stream_buffer = vec![0u8; MAX_LINE_SIZE * 2];
                         let mut buffer_len = 0;
@@ -706,7 +710,7 @@ fn handle_uds_stream(
     }
 }
 
-// Synchronous Fast-Path to close the TOCTOU gap
+// Synchronous Fast-Path to close TOCTOU gap
 #[cfg(target_os = "linux")]
 fn is_container_active_sync(container_id: &str, socket_path: &str) -> bool {
     use std::io::{BufRead, Write};
@@ -740,7 +744,7 @@ fn evaluate_line_signatures(
     active_containers: &Arc<RwLock<HashSet<String>>>,
     anti_dos_state: &Arc<Mutex<AntiDosState>>,
 ) {
-    // Explicitly consume variables on non-Linux targets to silence compiler warnings
+    // Consume variables on non-Linux targets to silence compiler warnings
     #[cfg(not(target_os = "linux"))]
     {
         let _ = active_containers;
@@ -800,7 +804,8 @@ fn evaluate_line_signatures(
                                     dos_write.negative_queue.push_back(container_id.clone());
                                 }
                             } else {
-                                // ID Exhaustion flood detected. Drop payload cleanly to protect the engine.
+                                // ID Exhaustion flood detected
+                                // Drop payload cleanly to protect the engine
                                 emit_log(
                                     "WARN",
                                     "orchestrator",
@@ -858,7 +863,8 @@ fn dispatch_to_worker(
 ) {
     const MAX_WORKERS: usize = 100;
 
-    // FAST PATH: Acquire parallel, non-blocking read lock to pass telemetry frames on active mailboxes
+    // FAST PATH: Acquire parallel, non-blocking read lock
+    // to pass telemetry frames on active mailboxes
     {
         let reg_read = registry
             .read()
@@ -869,7 +875,8 @@ fn dispatch_to_worker(
         }
     }
 
-    // SLOW PATH: Channel context does not exist. Acquire exclusive write lock to initialize pipeline workers
+    // SLOW PATH: Channel context does not exist
+    // Acquire exclusive write lock to initialize pipeline workers
     let mut reg_write = registry
         .write()
         .expect("CRITICAL: Worker registry lock poisoned. Aborting.");
@@ -976,7 +983,8 @@ fn run_worker_lifecycle(
                 );
             }
             Err(_) => {
-                // Decay phase: Acquire exclusive write lock strictly on worker termination
+                // Decay phase
+                // Acquire exclusive write lock strictly on worker termination
                 let mut reg = registry
                     .write()
                     .expect("CRITICAL: Worker registry lock poisoned. Aborting.");

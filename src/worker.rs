@@ -2,7 +2,7 @@
 // Invokes localized host sandboxing isolation techniques
 // and direct socket interactions safely
 
-use crate::config::AtomicAction;
+use crate::config::{AtomicAction, LogLevel};
 use crate::logger::emit_log;
 use anyhow::{anyhow, bail, Result};
 use ipnet::IpNet;
@@ -90,6 +90,8 @@ fn execute_docker_uds_request(
     path: &str,
     body: Option<&str>,
     socket_path: &str,
+    config_log_level: LogLevel,
+    json_enabled: bool,
 ) -> Result<(u16, String)> {
     use std::io::{BufReader, Cursor, Read, Write};
     use std::os::unix::net::UnixStream;
@@ -203,6 +205,20 @@ fn execute_docker_uds_request(
                 );
             }
 
+            // Forensics Telemetry Hook: Gated strictly under Trace scope to track live buffer decoding sequences
+            emit_log(
+                "TRACE",
+                "worker_engine",
+                None,
+                None,
+                None,
+                Some("stream_chunk"),
+                "PROCESSING",
+                &format!("Decoding dynamic chunked telemetry sequence of size {} bytes.", chunk_size),
+                config_log_level,
+                json_enabled,
+            );
+
             let mut chunk_buf = vec![0; chunk_size];
             reader
                 .read_exact(&mut chunk_buf)
@@ -242,13 +258,14 @@ pub fn is_ip_safe(target_ip: &IpAddr, whitelist: &[IpNet]) -> bool {
 #[cfg(target_os = "linux")]
 pub fn resolve_container_ips(
     container_id: &str,
+    config_log_level: LogLevel,
     json_enabled: bool,
     socket_path: &str,
 ) -> Vec<IpAddr> {
     let endpoint = format!("/containers/{}/json", container_id);
     let mut ips = Vec::new();
 
-    match execute_docker_uds_request("GET", &endpoint, None, socket_path) {
+    match execute_docker_uds_request("GET", &endpoint, None, socket_path, config_log_level, json_enabled) {
         Ok((status, json_payload)) if status == 200 => {
             if let Ok(parsed) = serde_json::from_str::<DockerInspectResponse>(&json_payload) {
                 for network in parsed.NetworkSettings.Networks.values() {
@@ -273,6 +290,7 @@ pub fn resolve_container_ips(
                     "Container socket returned HTTP {} during IP resolution.",
                     status
                 ),
+                config_log_level,
                 json_enabled,
             );
         }
@@ -289,6 +307,7 @@ pub fn resolve_container_ips(
                     "Failed to query Container socket for networking metadata via UDS channel: {:#}",
                     e
                 ),
+                config_log_level,
                 json_enabled,
             );
         }
@@ -301,6 +320,7 @@ fn execute_atomic_command(
     container_id: &str,
     whitelist: &[IpNet],
     table: &str,
+    config_log_level: LogLevel,
     json_enabled: bool,
     socket_path: &str,
     trigger_message: &str,
@@ -345,7 +365,7 @@ fn execute_atomic_command(
         AtomicAction::RunCustomScript { path } => {
             #[cfg(target_os = "linux")]
             let resolved_ip = {
-                let ips = resolve_container_ips(container_id, json_enabled, socket_path);
+                let ips = resolve_container_ips(container_id, config_log_level, json_enabled, socket_path);
                 if ips.is_empty() {
                     "UNKNOWN_IP".to_string()
                 } else {
@@ -367,10 +387,10 @@ fn execute_atomic_command(
                 // !!! DO NOT REMOVE THIS NOTICE !!!
                 // ---------------------------------
                 // SAFETY: The block executed inside pre_exec runs between a POSIX fork and execve
-                // To prevent catastrophic deadlocks in multi-threaded runtime environments,
+                // To prevent catastrophic deadlocks in multithreaded runtime environments,
                 // this closure MUST stay strictly async-signal-safe. Do not introduce heap allocations
                 // (String, Vec), logging formatting, or user-space lock acquisitions here
-                
+
                 unsafe {
                     cmd.pre_exec(|| {
                         libc::prctl(libc::PR_CAP_AMBIENT, libc::PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0);
@@ -420,6 +440,7 @@ fn execute_atomic_command(
                 Some("log_json"),
                 "AUDIT",
                 "Standard signature verification telemetry logged.",
+                config_log_level,
                 json_enabled,
             );
             Ok(())
@@ -435,6 +456,7 @@ fn execute_atomic_command(
                 Some("log_critical"),
                 "ALERT",
                 "Security policy remediation loop engaged.",
+                config_log_level,
                 json_enabled,
             );
             Ok(())
@@ -447,7 +469,7 @@ fn execute_atomic_command(
                     AtomicAction::ValidateState => {
                         let endpoint = format!("/containers/{}/json", container_id);
                         let (status, json_payload) =
-                            execute_docker_uds_request("GET", &endpoint, None, socket_path)?;
+                            execute_docker_uds_request("GET", &endpoint, None, socket_path, config_log_level, json_enabled)?;
 
                         if status == 200 {
                             if json_payload.contains("\"Running\": true")
@@ -462,6 +484,7 @@ fn execute_atomic_command(
                                     Some("validate_state"),
                                     "SUCCESS",
                                     "Container state verified as active. Proceeding with containment pipeline.",
+                                    config_log_level,
                                     json_enabled,
                                 );
                                 Ok(())
@@ -479,7 +502,7 @@ fn execute_atomic_command(
                     AtomicAction::Pause => {
                         let endpoint = format!("/containers/{}/pause", container_id);
                         let (status, err_payload) =
-                            execute_docker_uds_request("POST", &endpoint, None, socket_path)?;
+                            execute_docker_uds_request("POST", &endpoint, None, socket_path, config_log_level, json_enabled)?;
 
                         if (200..300).contains(&status) || status == 409 {
                             Ok(())
@@ -495,7 +518,7 @@ fn execute_atomic_command(
                     AtomicAction::Unpause => {
                         let endpoint = format!("/containers/{}/unpause", container_id);
                         let (status, err_payload) =
-                            execute_docker_uds_request("POST", &endpoint, None, socket_path)?;
+                            execute_docker_uds_request("POST", &endpoint, None, socket_path, config_log_level, json_enabled)?;
 
                         if (200..300).contains(&status) || status == 409 {
                             Ok(())
@@ -511,7 +534,7 @@ fn execute_atomic_command(
                     AtomicAction::Restart => {
                         let endpoint = format!("/containers/{}/restart", container_id);
                         let (status, err_payload) =
-                            execute_docker_uds_request("POST", &endpoint, None, socket_path)?;
+                            execute_docker_uds_request("POST", &endpoint, None, socket_path, config_log_level, json_enabled)?;
 
                         if (200..300).contains(&status) {
                             Ok(())
@@ -536,7 +559,7 @@ fn execute_atomic_command(
                         );
 
                         let (status, err_payload) =
-                            execute_docker_uds_request("POST", &query_path, None, socket_path)?;
+                            execute_docker_uds_request("POST", &query_path, None, socket_path, config_log_level, json_enabled)?;
 
                         if (200..300).contains(&status) {
                             Ok(())
@@ -553,7 +576,7 @@ fn execute_atomic_command(
                         let query_path =
                             format!("/containers/{}/kill?signal={}", container_id, signal);
                         let (status, err_payload) =
-                            execute_docker_uds_request("POST", &query_path, None, socket_path)?;
+                            execute_docker_uds_request("POST", &query_path, None, socket_path, config_log_level, json_enabled)?;
 
                         if (200..300).contains(&status) || status == 409 {
                             Ok(())
@@ -567,7 +590,7 @@ fn execute_atomic_command(
                     }
 
                     AtomicAction::NftBlacklist { set_name, timeout } => {
-                        let ips = resolve_container_ips(container_id, json_enabled, socket_path);
+                        let ips = resolve_container_ips(container_id, config_log_level, json_enabled, socket_path);
 
                         if ips.is_empty() {
                             bail!("IP resolution yielded zero addresses; cannot apply nftables blacklist.");
@@ -584,6 +607,7 @@ fn execute_atomic_command(
                                     Some("nft_blacklist"),
                                     "INTERCEPTED",
                                     "Target IP matches core infrastructure whitelist. Skipping isolation for this specific address.",
+                                    config_log_level,
                                     json_enabled,
                                 );
                                 continue;
@@ -601,6 +625,7 @@ fn execute_atomic_command(
                                     "Target network isolated via set {} for duration context {}",
                                     set_name, timeout
                                 ),
+                                config_log_level,
                                 json_enabled,
                             );
                         }
@@ -696,7 +721,7 @@ struct DockerContainerListResponse {
 pub fn fetch_running_container_ids(socket_path: &str) -> std::collections::HashSet<String> {
     use std::collections::HashSet;
 
-    match execute_docker_uds_request("GET", "/containers/json", None, socket_path) {
+    match execute_docker_uds_request("GET", "/containers/json", None, socket_path, LogLevel::Info, true) {
         Ok((status, json_payload)) if status == 200 => {
             if let Ok(parsed) =
                 serde_json::from_str::<Vec<DockerContainerListResponse>>(&json_payload)
@@ -715,6 +740,7 @@ pub fn execute_containment_pipeline(
     final_actions: Vec<AtomicAction>,
     whitelist: Arc<Vec<IpNet>>,
     table: Arc<String>,
+    config_log_level: LogLevel,
     json_enabled: bool,
     rule_name: String,
     socket_path: String,
@@ -728,6 +754,7 @@ pub fn execute_containment_pipeline(
             &container_id,
             &whitelist[..],
             &table,
+            config_log_level,
             json_enabled,
             &socket_path,
             &trigger_message,
@@ -741,6 +768,7 @@ pub fn execute_containment_pipeline(
                 Some(&format!("{:?}", action)),
                 "FAILURE",
                 &format!("Primary playbook action failed structural context: {:#}", e),
+                config_log_level,
                 json_enabled,
             );
             pipeline_failed = true;
@@ -749,7 +777,7 @@ pub fn execute_containment_pipeline(
     }
 
     if pipeline_failed {
-        emit_json_escalation_marker(&container_id, &rule_name, json_enabled);
+        emit_json_escalation_marker(&container_id, &rule_name, config_log_level, json_enabled);
 
         for fallback in &final_actions {
             match execute_atomic_command(
@@ -757,6 +785,7 @@ pub fn execute_containment_pipeline(
                 &container_id,
                 &whitelist[..],
                 &table,
+                config_log_level,
                 json_enabled,
                 &socket_path,
                 &trigger_message,
@@ -771,6 +800,7 @@ pub fn execute_containment_pipeline(
                         Some(&format!("{:?}", fallback)),
                         "SUCCESS",
                         "Emergency fallback action executed successfully.",
+                        config_log_level,
                         json_enabled,
                     );
 
@@ -786,6 +816,7 @@ pub fn execute_containment_pipeline(
                                     None,
                                     "HALTED",
                                     "Terminal signal delivered. Short-circuiting remaining fallback chain.",
+                                    config_log_level,
                                     json_enabled,
                                 );
                                 break;
@@ -801,6 +832,7 @@ pub fn execute_containment_pipeline(
                                 None,
                                 "HALTED",
                                 "Container runtime restarted. Short-circuiting remaining fallback chain.",
+                                config_log_level,
                                 json_enabled,
                             );
                             break;
@@ -818,6 +850,7 @@ pub fn execute_containment_pipeline(
                         Some(&format!("{:?}", fallback)),
                         "CRASH",
                         &format!("EMERGENCY CONTAINMENT FAILURE: {:#}", fallback_error),
+                        config_log_level,
                         json_enabled,
                     );
                 }
@@ -826,7 +859,7 @@ pub fn execute_containment_pipeline(
     }
 }
 
-fn emit_json_escalation_marker(container_id: &str, rule: &str, json_enabled: bool) {
+fn emit_json_escalation_marker(container_id: &str, rule: &str, config_log_level: LogLevel, json_enabled: bool) {
     emit_log(
         "CRITICAL",
         "worker_engine",
@@ -836,6 +869,7 @@ fn emit_json_escalation_marker(container_id: &str, rule: &str, json_enabled: boo
         Some("escalation_routing"),
         "ENGAGED",
         "Primary playbook failed structural strategy. Deploying fallback containment actions.",
+        config_log_level,
         json_enabled,
     );
 }

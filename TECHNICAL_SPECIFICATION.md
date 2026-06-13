@@ -36,6 +36,7 @@ The parsing engine uses a declarative, strict-typing deserializer enforced via `
 ```toml
 [monitor]
 mode = "file" # Options: "file", "socket", or "dual"
+log_level = "debug" # Options: "error", "warn", "info", "debug", "trace"
 log_dir = "/var/log/gvisor/"
 docker_socket_path = "/var/run/docker.sock"
 check_interval_ms = 1000

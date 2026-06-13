@@ -25,7 +25,7 @@ use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
 use std::os::unix::io::FromRawFd;
 
-use crate::config::{AtomicAction, GuardConfig, IngestionMode, RegistryMap, WorkerChannelMessage};
+use crate::config::{AtomicAction, GuardConfig, IngestionMode, LogLevel, RegistryMap, WorkerChannelMessage};
 use crate::logger::emit_log;
 use crate::limiters::{AntiDosState, GlobalRateLimiter};
 use crate::worker::execute_containment_pipeline;
@@ -38,6 +38,7 @@ struct LogDescriptor {
 pub fn start_monitor_loop(config: GuardConfig, shutdown: Arc<AtomicBool>, config_path: String) {
     let mode = &config.monitor.mode;
     let json_enabled = config.monitor.json_logging_enabled;
+    let config_log_level = config.monitor.log_level;
     let docker_socket_path = config.monitor.docker_socket_path.clone();
     let watchdog_interval = config.monitor.systemd_watchdog_interval_ms;
     let max_workers = config.monitor.max_workers;
@@ -236,6 +237,7 @@ pub fn start_monitor_loop(config: GuardConfig, shutdown: Arc<AtomicBool>, config
                             None,
                             "SUCCESS",
                             "Active rule signatures successfully hot-reloaded from manifest.",
+                            config_log_level,
                             json_enabled_clone,
                         );
                     } else {
@@ -248,6 +250,7 @@ pub fn start_monitor_loop(config: GuardConfig, shutdown: Arc<AtomicBool>, config
                             None,
                             "FAILURE",
                             "Hot-reload aborted: Updated configuration manifest contains malformed syntax.",
+                            config_log_level,
                             json_enabled_clone,
                         );
                     }
@@ -282,6 +285,7 @@ pub fn start_monitor_loop(config: GuardConfig, shutdown: Arc<AtomicBool>, config
                 uds_whitelist,
                 uds_table,
                 json_enabled,
+                config_log_level,
                 uds_socket_path,
                 uds_cache,
                 uds_anti_dos,
@@ -302,6 +306,7 @@ pub fn start_monitor_loop(config: GuardConfig, shutdown: Arc<AtomicBool>, config
             None,
             "STARTED",
             "Out-of-band UDS streaming receiver active. Filesystem parsing idle.",
+            config_log_level,
             json_enabled,
         );
 
@@ -320,6 +325,7 @@ pub fn start_monitor_loop(config: GuardConfig, shutdown: Arc<AtomicBool>, config
         None,
         "STARTED",
         "Master directory tailer and Unix socket pipelines active.",
+        config_log_level,
         json_enabled,
     );
 
@@ -346,6 +352,7 @@ pub fn start_monitor_loop(config: GuardConfig, shutdown: Arc<AtomicBool>, config
                     None,
                     "MISSING",
                     "Target directory unreachable.",
+                    config_log_level,
                     json_enabled,
                 );
                 thread::sleep(Duration::from_millis(config.monitor.check_interval_ms));
@@ -367,6 +374,7 @@ pub fn start_monitor_loop(config: GuardConfig, shutdown: Arc<AtomicBool>, config
                         Some("directory_audit"),
                         "HALTED",
                         "Log directory is not owned by root or is world-writable. File mode suspended to prevent spoofing.",
+                        config_log_level,
                         json_enabled,
                     );
                     thread::sleep(Duration::from_millis(config.monitor.check_interval_ms));
@@ -452,6 +460,7 @@ pub fn start_monitor_loop(config: GuardConfig, shutdown: Arc<AtomicBool>, config
                                 Some("seek"),
                                 "FAILURE",
                                 &format!("Failed to seek to target stream pointer: {}", e),
+                                config_log_level,
                                 json_enabled,
                             );
                             continue;
@@ -489,6 +498,7 @@ pub fn start_monitor_loop(config: GuardConfig, shutdown: Arc<AtomicBool>, config
                                         &whitelist,
                                         &table,
                                         json_enabled,
+                                        config_log_level,
                                         &docker_socket_path,
                                         file_container_id.clone(),
                                         true,
@@ -513,6 +523,7 @@ pub fn start_monitor_loop(config: GuardConfig, shutdown: Arc<AtomicBool>, config
                                         Some("stream"),
                                         "OVERFLOW_FLUSHED",
                                         "Line length exceeded 64KB security threshold. Flushing stream segment.",
+                                        config_log_level,
                                         json_enabled,
                                     );
                                     buffer_len = 0;
@@ -554,9 +565,6 @@ fn is_container_active_sync(container_id: &str, socket_path: &str) -> bool {
         let request = format!("GET /containers/{}/json HTTP/1.0\r\n\r\n", container_id);
 
         if stream.write_all(request.as_bytes()).is_ok() {
-
-            // A 1KB buffer on the stack is more than sufficient
-            // for a lightweight status line response head
             let mut header_buf = [0u8; 1024];
             let mut bytes_read = 0;
 
@@ -566,7 +574,7 @@ fn is_container_active_sync(container_id: &str, socket_path: &str) -> bool {
                 }
                 match stream.read(&mut header_buf[bytes_read..]) {
                     Ok(n) if n > 0 => bytes_read += n,
-                    _ => break, // EOF or timeout encountered
+                    _ => break,
                 }
 
                 let mut headers = [httparse::EMPTY_HEADER; 16];
@@ -577,7 +585,7 @@ fn is_container_active_sync(container_id: &str, socket_path: &str) -> bool {
                         return res.code == Some(200);
                     }
                     Ok(httparse::Status::Partial) => continue,
-                    Err(_) => break, // Intercepted unparseable grammar sequence
+                    Err(_) => break,
                 }
             }
         }
@@ -593,6 +601,7 @@ pub fn evaluate_line_signatures(
     whitelist: &Arc<Vec<ipnet::IpNet>>,
     table: &Arc<String>,
     json_enabled: bool,
+    config_log_level: LogLevel,
     docker_socket_path: &str,
     file_container_id: Option<String>,
     is_from_file: bool,
@@ -612,6 +621,7 @@ pub fn evaluate_line_signatures(
                 Some("rate_limit"),
                 "THROTTLED",
                 "Global log ingestion rate ceiling reached. Dropping excess streams to preserve host CPU.",
+                config_log_level,
                 json_enabled,
             );
         }
@@ -625,6 +635,20 @@ pub fn evaluate_line_signatures(
     }
 
     for (rule_name, rx, try_act, final_act) in rules.iter() {
+        // High-Volume Diagnostics: Debug trace evaluating active log boundaries
+        emit_log(
+            "DEBUG",
+            "orchestrator",
+            None,
+            None,
+            None,
+            Some("signature_eval"),
+            "EVALUATING",
+            &format!("Scanning active stream sequences against signature layout: '{}'", rule_name),
+            config_log_level,
+            json_enabled,
+        );
+
         if rx.is_match(line) {
             let container_id = if let Some(ref id) = file_container_id {
                 id.clone()
@@ -687,6 +711,7 @@ pub fn evaluate_line_signatures(
                             Some("api_rate_limit"),
                             "DROPPED",
                             "Container lookup token pool exhausted. Payload discarded.",
+                            config_log_level,
                             json_enabled,
                         );
                         continue;
@@ -712,6 +737,7 @@ pub fn evaluate_line_signatures(
                 Arc::clone(whitelist),
                 Arc::clone(table),
                 json_enabled,
+                config_log_level,
                 docker_socket_path,
                 line.to_string(),
                 max_workers,
@@ -729,6 +755,7 @@ fn dispatch_to_worker(
     whitelist: Arc<Vec<ipnet::IpNet>>,
     table: Arc<String>,
     json_enabled: bool,
+    config_log_level: LogLevel,
     docker_socket_path: &str,
     trigger_message: String,
     max_workers: usize,
@@ -753,10 +780,25 @@ fn dispatch_to_worker(
             Some("route"),
             "OOM_PREVENTION",
             "Maximum worker thread ceiling reached. Malicious ID flood detected. Payload dropped.",
+            config_log_level,
             json_enabled,
         );
         return;
     }
+
+    // High-Volume Diagnostics: Worker thread serialization router event
+    emit_log(
+        "DEBUG",
+        "orchestrator",
+        Some(&rule_name),
+        Some(&container_id),
+        None,
+        Some("route"),
+        "DISPATCHED",
+        "Incident response task successfully routed to specialized isolated worker context.",
+        config_log_level,
+        json_enabled,
+    );
 
     let tx = reg_write.entry(container_id.clone()).or_insert_with(|| {
         let (worker_tx, worker_rx) = sync_channel::<WorkerChannelMessage>(64);
@@ -774,6 +816,7 @@ fn dispatch_to_worker(
                 wl_clone,
                 tbl_clone,
                 json_enabled,
+                config_log_level,
                 ds_clone,
             );
         });
@@ -798,6 +841,7 @@ fn dispatch_to_worker(
                 Some("route"),
                 "SATURATED",
                 "Worker execution queue full. Engaging emergency synchronous bypass for final actions.",
+                config_log_level,
                 json_enabled,
             );
 
@@ -814,6 +858,7 @@ fn dispatch_to_worker(
                     emergency_actions,
                     wl_clone,
                     tbl_clone,
+                    config_log_level,
                     json_enabled,
                     rule_name,
                     ds_clone,
@@ -831,6 +876,7 @@ fn dispatch_to_worker(
                 Some("route"),
                 "FAIL",
                 "Worker channel broken unexpectedly.",
+                config_log_level,
                 json_enabled,
             );
         }
@@ -844,6 +890,7 @@ fn run_worker_lifecycle(
     whitelist: Arc<Vec<ipnet::IpNet>>,
     table: Arc<String>,
     json_enabled: bool,
+    config_log_level: LogLevel,
     docker_socket_path: String,
 ) {
     let timeout_dur = Duration::from_secs(30);
@@ -857,6 +904,7 @@ fn run_worker_lifecycle(
                     final_cmds,
                     Arc::clone(&whitelist),
                     Arc::clone(&table),
+                    config_log_level,
                     json_enabled,
                     rule,
                     docker_socket_path.clone(),
@@ -875,6 +923,7 @@ fn run_worker_lifecycle(
                             final_cmds,
                             Arc::clone(&whitelist),
                             Arc::clone(&table),
+                            config_log_level,
                             json_enabled,
                             rule,
                             docker_socket_path.clone(),
@@ -883,6 +932,19 @@ fn run_worker_lifecycle(
                     }
                     Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => {
                         reg.remove(&container_id);
+                        // Deep Forensics: Thread decay cleanup execution scope hook
+                        emit_log(
+                            "TRACE",
+                            "worker_lifecycle",
+                            None,
+                            Some(&container_id),
+                            None,
+                            Some("lifecycle_decay"),
+                            "DECOMMISSIONED",
+                            "Worker context inactive past 30s ceiling. Safely flushing channels and clearing registry heap allocation footprints.",
+                            config_log_level,
+                            json_enabled,
+                        );
                         break;
                     }
                 }

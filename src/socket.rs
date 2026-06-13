@@ -15,9 +15,9 @@ use std::time::Duration;
 
 use mio::net::UnixListener as MioUnixListener;
 use mio::{Events, Interest, Poll, Token};
-use parking_lot::{Mutex, RwLock}; // Updated to match ingestion.rs structures
+use parking_lot::{Mutex, RwLock};
 
-use crate::config::{AtomicAction, RegistryMap};
+use crate::config::{AtomicAction, LogLevel, RegistryMap};
 use crate::limiters::{AntiDosState, GlobalRateLimiter};
 use crate::logger::emit_log;
 
@@ -64,6 +64,7 @@ pub fn run_uds_server(
     whitelist: Arc<Vec<ipnet::IpNet>>,
     table: Arc<String>,
     json_enabled: bool,
+    config_log_level: LogLevel,
     docker_socket_path: String,
     active_containers: Arc<RwLock<HashSet<String>>>,
     anti_dos_state: Arc<Mutex<AntiDosState>>,
@@ -86,6 +87,7 @@ pub fn run_uds_server(
                 None,
                 "CRASH",
                 &format!("UDS bind failed: {}", e),
+                config_log_level,
                 json_enabled,
             );
             return;
@@ -105,6 +107,7 @@ pub fn run_uds_server(
                 "Failed to enforce secure access permissions on UDS socket: {}",
                 e
             ),
+            config_log_level,
             json_enabled,
         );
         return;
@@ -122,6 +125,7 @@ pub fn run_uds_server(
                 None,
                 "CRASH",
                 &format!("Failed to initialize mio Poll instance: {}", e),
+                config_log_level,
                 json_enabled,
             );
             return;
@@ -139,6 +143,7 @@ pub fn run_uds_server(
             None,
             "CRASH",
             &format!("Failed to register UDS listener with mio registry: {}", e),
+            config_log_level,
             json_enabled,
         );
         return;
@@ -151,7 +156,6 @@ pub fn run_uds_server(
     let mut events = Events::with_capacity(128);
 
     while !shutdown.load(Ordering::SeqCst) {
-        // Let the OS handle the sleep and notification states efficiently
         if let Err(e) = poll.poll(&mut events, Some(Duration::from_millis(100))) {
             if e.kind() == std::io::ErrorKind::Interrupted {
                 continue;
@@ -164,15 +168,12 @@ pub fn run_uds_server(
                 loop {
                     match listener.accept() {
                         Ok((mio_stream, _)) => {
-                            // Safely unpack and consume the mio file descriptor into standard library structures
                             let stream = unsafe {
                                 std::os::unix::net::UnixStream::from_raw_fd(
                                     mio_stream.into_raw_fd(),
                                 )
                             };
 
-                            // Revert the stream to blocking mode before handing it off
-                            // to the synchronous BufReader in the worker thread
                             if let Err(e) = stream.set_nonblocking(false) {
                                 emit_log(
                                     "ERROR",
@@ -183,6 +184,7 @@ pub fn run_uds_server(
                                     None,
                                     "CRASH",
                                     &format!("Failed to set blocking mode: {}", e),
+                                    config_log_level,
                                     json_enabled,
                                 );
                                 continue;
@@ -201,6 +203,7 @@ pub fn run_uds_server(
                                             Some("trust_boundary"),
                                             "REJECTED",
                                             &format!("Unauthorized UID {} attempted UDS connection. Payload dropped.", peer_uid),
+                                            config_log_level,
                                             json_enabled,
                                         );
                                         continue;
@@ -217,6 +220,7 @@ pub fn run_uds_server(
                                             Some("trust_boundary"),
                                             "REJECTED",
                                             &format!("Failed to resolve container ID from peer PID {}. Connection dropped.", peer_pid),
+                                            config_log_level,
                                             json_enabled,
                                         );
                                         continue;
@@ -257,6 +261,7 @@ pub fn run_uds_server(
                                     wl_clone,
                                     tbl_clone,
                                     json_enabled,
+                                    config_log_level,
                                     ds_path_clone,
                                     cache_clone,
                                     dos_clone,
@@ -285,6 +290,7 @@ fn handle_uds_stream(
     whitelist: Arc<Vec<ipnet::IpNet>>,
     table: Arc<String>,
     json_enabled: bool,
+    config_log_level: LogLevel,
     docker_socket_path: String,
     active_containers: Arc<RwLock<HashSet<String>>>,
     anti_dos_state: Arc<Mutex<AntiDosState>>,
@@ -302,6 +308,7 @@ fn handle_uds_stream(
             Some("timeout_config"),
             "CRASH",
             &format!("Failed to enforce socket timeout: {}", e),
+            config_log_level,
             json_enabled,
         );
         return;
@@ -313,6 +320,20 @@ fn handle_uds_stream(
     loop {
         buf.clear();
         let mut chunk = reader.by_ref().take(8192);
+
+        // Telemetry Hook: High-frequency frame parsing diagnostics gated under Trace noise channel
+        emit_log(
+            "TRACE",
+            "uds_server",
+            None,
+            socket_container_id.as_deref(),
+            None,
+            Some("stream_read"),
+            "PROCESSING",
+            "Reading next raw diagnostic frame buffer partition across non-allocating socket channels.",
+            config_log_level,
+            json_enabled,
+        );
 
         match chunk.read_until(b'\n', &mut buf) {
             Ok(0) => break,
@@ -329,6 +350,7 @@ fn handle_uds_stream(
                         Some("stream"),
                         "TRUNCATED",
                         "UDS Line limit reached without delimiter. Discarding remainder safely.",
+                        config_log_level,
                         json_enabled,
                     );
 
@@ -359,6 +381,7 @@ fn handle_uds_stream(
                     &whitelist,
                     &table,
                     json_enabled,
+                    config_log_level,
                     &docker_socket_path,
                     socket_container_id.clone(),
                     false,

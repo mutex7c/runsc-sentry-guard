@@ -9,6 +9,17 @@ use serde::Deserialize;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+// Type-safe Log Level Severity Hierarchy Matrix
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LogLevel {
+    Trace,
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
+
 // Strictly typed operational matrix definitions mapping onto specific automated containment actions
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -51,11 +62,17 @@ fn default_max_workers() -> usize {
     100
 }
 
+fn default_log_level() -> LogLevel {
+    LogLevel::Info
+}
+
 // Global Daemon Engine Metric Parameters
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MonitorConfig {
     pub mode: IngestionMode,
+    #[serde(default = "default_log_level")]
+    pub log_level: LogLevel,
     pub log_dir: String,
     pub check_interval_ms: u64,
     pub ip_whitelist: Vec<IpNet>,
@@ -175,6 +192,7 @@ mod tests {
 
         assert_eq!(config.monitor.mode, IngestionMode::File);
         assert_eq!(config.monitor.docker_socket_path, "/var/run/docker.sock");
+        assert_eq!(config.monitor.log_level, LogLevel::Info); // Asserts legacy fallback mapping
         assert_eq!(config.monitor.max_workers, 100);
         assert_eq!(config.rules.len(), 1);
         assert_eq!(config.rules[0].name, "test_rule");

@@ -1,5 +1,6 @@
 [monitor]
 mode = "file" # Options: "file", "socket", or "dual"
+log_level = "info" # Options: "error", "warn", "info", "debug", "trace"
 log_dir = "/var/log/gvisor/"
 docker_socket_path = "/var/run/docker.sock"
 check_interval_ms = 1000

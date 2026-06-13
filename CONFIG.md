@@ -4,16 +4,17 @@ The `runsc-sentry-guard` daemon ingests a declarative TOML file layout. The inte
 
 ## 1. Global Daemon Parameters (`[monitor]`)
 
-| Parameter Name                 | Data Type Expected                         | Description / Purpose                                                                                                                           |
-|:-------------------------------|:-------------------------------------------|:------------------------------------------------------------------------------------------------------------------------------------------------|
-| `mode`                         | String (`"file"`, `"socket"`, or `"dual"`) | Dictates the ingestion strategy. `file` tails disk logs, `socket` listens out-of-band via UDS, and `dual` aggregates both loops simultaneously. |
-| `log_dir`                      | String (File Path)                         | The absolute host folder path where gVisor emits its active sandbox `.boot` streams.                                                            |
-| `docker_socket_path`           | String (File Path)                         | The absolute path to the container engine IPC socket (e.g., `/var/run/docker.sock` or `/run/podman/podman.sock`).                               |
-| `check_interval_ms`            | Unsigned 64-bit Integer                    | The thread polling interval cadence for inspecting file modifications.                                                                          |
-| `ip_whitelist`                 | Array of CIDR Strings                      | Core infrastructure IP networks strictly protected against accidental firewall locks.                                                           |
-| `nftables_default_table`       | String                                     | The specific nftables table space namespace where containment sets are deployed.                                                                |
-| `json_logging_enabled`         | Boolean Flag                               | Toggles terminal output logs between clean plain-text and structured SIEM JSON payloads.                                                        |
-| `systemd_watchdog_interval_ms` | Unsigned 64-bit Integer                    | The periodic runtime heartbeat loop frequency for systemd deadlock health checks.                                                               |
+| Parameter Name                 | Data Type Expected                                           | Description / Purpose                                                                                                                              |
+|:-------------------------------|:-------------------------------------------------------------|:---------------------------------------------------------------------------------------------------------------------------------------------------|
+| `mode`                         | String (`"file"`, `"socket"`, or `"dual"`)                   | Dictates the ingestion strategy. `file` tails disk logs, `socket` listens out-of-band via UDS, and `dual` aggregates both loops simultaneously.    |
+| `log_level`                    | String (`"error"`, `"warn"`, `"info"`, `"debug"`, `"trace"`) | Enforces a strict structural priority severity threshold to gate fine-grained diagnostic telemetry and forensics. Defaults to `"info"` if omitted. |
+| `log_dir`                      | String (File Path)                                           | The absolute host folder path where gVisor emits its active sandbox `.boot` streams.                                                               |
+| `docker_socket_path`           | String (File Path)                                           | The absolute path to the container engine IPC socket (e.g., `/var/run/docker.sock` or `/run/podman/podman.sock`).                                  |
+| `check_interval_ms`            | Unsigned 64-bit Integer                                      | The thread polling interval cadence for inspecting file modifications.                                                                             |
+| `ip_whitelist`                 | Array of CIDR Strings                                        | Core infrastructure IP networks strictly protected against accidental firewall locks.                                                              |
+| `nftables_default_table`       | String                                                       | The specific nftables table space namespace where containment sets are deployed.                                                                   |
+| `json_logging_enabled`         | Boolean Flag                                                 | Toggles terminal output logs between clean plain-text and structured SIEM JSON payloads.                                                           |
+| `systemd_watchdog_interval_ms` | Unsigned 64-bit Integer                                      | The periodic runtime heartbeat loop frequency for systemd deadlock health checks.                                                                  |
 
 > ⚠️ **SECURITY WARNING: Ingestion Modes**
 > 
@@ -25,7 +26,16 @@ The `runsc-sentry-guard` daemon ingests a declarative TOML file layout. The inte
 > The daemon enforces strict directory auditing and mandatory state validation to mitigate 
 > this, but **for all production deployments, `mode = "socket"` is strictly recommended** 
 > to guarantee sub-millisecond, tamper-proof, out-of-band mitigation.
- 
+
+> **Log Level Severity Matrix Reference**
+> * **`error`**: System breaks, missing host permissions, dead IPC sockets. (Minimal noise).
+> * **`warn`**: API rate throttling, negative cache lookups, non-fatal webhook timeouts.
+> * **`info`**: Lifecycle events (Daemon boot, ruleset hot-reloads, socket transitions).
+> * **`debug`**: Bounded stream evaluations, worker thread allocations, signature scanning.
+> * **`trace`**: High-verbose forensic tracing (Raw payload chunk splitting, 30s thread decay collections).
+>
+>
+
 ## 2. Container Runtime Engine Configuration (`daemon.json`)
 
 For `runsc-sentry-guard` to receive high-fidelity system call telemetry out-of-band, you must configure Docker/Podman to instruct the runsc / gVisor supervisor to emit strace logs down to the host file system.

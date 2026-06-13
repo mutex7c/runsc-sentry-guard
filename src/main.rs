@@ -48,6 +48,7 @@ fn main() {
     match load_config(active_path) {
         Ok(valid_config) => {
             let json_enabled = valid_config.monitor.json_logging_enabled;
+            let log_level = valid_config.monitor.log_level;
             let flush_firewall = valid_config.monitor.flush_firewall_on_shutdown;
             let nft_table = valid_config.monitor.nftables_default_table.clone();
             let mut sets_to_flush = Vec::new();
@@ -73,6 +74,7 @@ fn main() {
                     "Configuration profile verification successful via path: {}",
                     active_path
                 ),
+                log_level,
                 json_enabled,
             );
 
@@ -89,6 +91,7 @@ fn main() {
                 None,
                 "HALTED",
                 "Decommissioning sequence initialized. Processing cleanup contexts.",
+                log_level,
                 json_enabled,
             );
 

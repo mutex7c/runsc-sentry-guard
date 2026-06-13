@@ -364,6 +364,13 @@ fn execute_atomic_command(
 
             #[cfg(target_os = "linux")]
             {
+                // !!! DO NOT REMOVE THIS NOTICE !!!
+                // ---------------------------------
+                // SAFETY: The block executed inside pre_exec runs between a POSIX fork and execve
+                // To prevent catastrophic deadlocks in multi-threaded runtime environments,
+                // this closure MUST stay strictly async-signal-safe. Do not introduce heap allocations
+                // (String, Vec), logging formatting, or user-space lock acquisitions here
+                
                 unsafe {
                     cmd.pre_exec(|| {
                         libc::prctl(libc::PR_CAP_AMBIENT, libc::PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0);

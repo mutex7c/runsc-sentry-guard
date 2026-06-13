@@ -548,17 +548,37 @@ pub fn start_monitor_loop(config: GuardConfig, shutdown: Arc<AtomicBool>, config
 #[cfg(target_os = "linux")]
 fn is_container_active_sync(container_id: &str, socket_path: &str) -> bool {
     use std::io::{Read, Write};
+
     if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(socket_path) {
         let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
         let request = format!("GET /containers/{}/json HTTP/1.0\r\n\r\n", container_id);
 
         if stream.write_all(request.as_bytes()).is_ok() {
-            let mut reader = BufReader::new(stream);
-            let mut buf = Vec::new();
 
-            if reader.by_ref().take(8192).read_until(b'\n', &mut buf).is_ok() {
-                let line = String::from_utf8_lossy(&buf);
-                return line.contains(" 200 ");
+            // A 1KB buffer on the stack is more than sufficient
+            // for a lightweight status line response head
+            let mut header_buf = [0u8; 1024];
+            let mut bytes_read = 0;
+
+            loop {
+                if bytes_read >= header_buf.len() {
+                    break;
+                }
+                match stream.read(&mut header_buf[bytes_read..]) {
+                    Ok(n) if n > 0 => bytes_read += n,
+                    _ => break, // EOF or timeout encountered
+                }
+
+                let mut headers = [httparse::EMPTY_HEADER; 16];
+                let mut res = httparse::Response::new(&mut headers);
+
+                match res.parse(&header_buf[..bytes_read]) {
+                    Ok(httparse::Status::Complete(_)) => {
+                        return res.code == Some(200);
+                    }
+                    Ok(httparse::Status::Partial) => continue,
+                    Err(_) => break, // Intercepted unparseable grammar sequence
+                }
             }
         }
     }

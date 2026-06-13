@@ -253,6 +253,11 @@ pub fn start_monitor_loop(config: GuardConfig, shutdown: Arc<AtomicBool>) {
     );
 
     let id_extractor = Regex::new(r"--id=\b([a-fA-F0-9]{12}|[a-fA-F0-9]{64})\b").unwrap();
+
+    // Use dedicated filename-safe ID extractor regex to prevent
+    // cross-container log spoofing injection attacks
+    let filename_id_extractor = Regex::new(r"\b([a-fA-F0-9]{12}|[a-fA-F0-9]{64})\b").unwrap();
+
     let mut file_state_tracker: HashMap<String, LogDescriptor> = HashMap::new();
     let mut first_run = true;
 
@@ -377,6 +382,17 @@ pub fn start_monitor_loop(config: GuardConfig, shutdown: Arc<AtomicBool>) {
                     let path_str = path.to_string_lossy().into_owned();
                     actively_seen_paths.insert(path_str.clone());
 
+                    // Securely derive the target container ID from the
+                    // immutable file path rather than untrusted text lines
+                    let file_name_str = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    let file_container_id = filename_id_extractor
+                        .captures(file_name_str)
+                        .and_then(|caps| caps.get(1).map(|m| m.as_str().to_string()));
+
+                    if file_container_id.is_none() {
+                        continue; // Skip files that don't embed a valid container hex identifier
+                    }
+
                     #[cfg(target_os = "linux")]
                     let current_inode = {
                         use std::os::linux::fs::MetadataExt;
@@ -476,6 +492,7 @@ pub fn start_monitor_loop(config: GuardConfig, shutdown: Arc<AtomicBool>) {
                                         &table,
                                         json_enabled,
                                         &docker_socket_path,
+                                        file_container_id.clone(), // Pass the file-derived ID
                                         true,
                                         &active_containers,
                                         &anti_dos_state,
@@ -530,7 +547,7 @@ pub fn start_monitor_loop(config: GuardConfig, shutdown: Arc<AtomicBool>) {
 }
 
 #[cfg(target_os = "linux")]
-fn get_peer_uid(stream: &std::os::unix::net::UnixStream) -> std::io::Result<u32> {
+fn get_peer_creds(stream: &std::os::unix::net::UnixStream) -> std::io::Result<(u32, i32)> {
     use std::os::unix::io::AsRawFd;
     let fd = stream.as_raw_fd();
     let mut ucred = libc::ucred { pid: 0, uid: 0, gid: 0 };
@@ -547,10 +564,28 @@ fn get_peer_uid(stream: &std::os::unix::net::UnixStream) -> std::io::Result<u32>
     };
 
     if res == 0 {
-        Ok(ucred.uid)
+        Ok((ucred.uid, ucred.pid))
     } else {
         Err(std::io::Error::last_os_error())
     }
+}
+
+// Secure host process scraper to read runsc container runtime arguments out of /proc
+#[cfg(target_os = "linux")]
+fn extract_id_from_pid(pid: i32) -> Option<String> {
+    let cmdline_path = format!("/proc/{}/cmdline", pid);
+    if let Ok(content) = fs::read_to_string(cmdline_path) {
+        // Kernel cmdline strings are null-separated (\0)
+        let id_extractor = Regex::new(r"\b([a-fA-F0-9]{12}|[a-fA-F0-9]{64})\b").unwrap();
+        for arg in content.split('\0') {
+            if let Some(caps) = id_extractor.captures(arg) {
+                if let Some(matched_id) = caps.get(1) {
+                    return Some(matched_id.as_str().to_string());
+                }
+            }
+        }
+    }
+    None
 }
 
 fn run_uds_server(
@@ -563,7 +598,7 @@ fn run_uds_server(
     docker_socket_path: String,
     active_containers: Arc<RwLock<HashSet<String>>>,
     anti_dos_state: Arc<Mutex<AntiDosState>>,
-    shutdown: Arc<AtomicBool>, // CHANGED: Added tracking argument parameters to accept coordinates
+    shutdown: Arc<AtomicBool>,
 ) {
     let socket_path = "/var/run/runsc-sentry-guard.sock";
     let _ = fs::remove_file(socket_path);
@@ -628,11 +663,9 @@ fn run_uds_server(
         match listener.accept() {
             Ok((stream, _)) => {
 
-                // Extract Peer Credentials using raw libc to bypass unstable std features
                 #[cfg(target_os = "linux")]
-                {
-                    if let Ok(peer_uid) = get_peer_uid(&stream) {
-                        // Reject connection if not root (or map specifically to 'docker' group if required)
+                let socket_container_id = match get_peer_creds(&stream) {
+                    Ok((peer_uid, peer_pid)) => {
                         if peer_uid != 0 {
                             emit_log(
                                 "WARN",
@@ -647,10 +680,29 @@ fn run_uds_server(
                             );
                             continue;
                         }
-                    } else {
-                        continue; // Drop unverified origins safely
+
+                        let id = extract_id_from_pid(peer_pid);
+                        if id.is_none() {
+                            emit_log(
+                                "WARN",
+                                "uds_server",
+                                None,
+                                None,
+                                None,
+                                Some("trust_boundary"),
+                                "REJECTED",
+                                &format!("Failed to resolve container ID from peer PID {}. Connection dropped.", peer_pid),
+                                json_enabled,
+                            );
+                            continue;
+                        }
+                        id
                     }
-                }
+                    Err(_) => continue,
+                };
+
+                #[cfg(not(target_os = "linux"))]
+                let socket_container_id: Option<String> = None;
 
                 if active_connections.load(Ordering::SeqCst) >= MAX_UDS_CONNECTIONS {
                     continue;
@@ -667,6 +719,7 @@ fn run_uds_server(
                 let ds_path_clone = docker_socket_path.clone();
                 let cache_clone = Arc::clone(&active_containers);
                 let dos_clone = Arc::clone(&anti_dos_state);
+                let cid_socket_clone = socket_container_id.clone();
 
                 thread::spawn(move || {
                     let _guard = ConnectionGuard(conn_tracker);
@@ -681,6 +734,7 @@ fn run_uds_server(
                         ds_path_clone,
                         cache_clone,
                         dos_clone,
+                        cid_socket_clone,
                     );
                 });
             }
@@ -706,6 +760,7 @@ fn handle_uds_stream(
     docker_socket_path: String,
     active_containers: Arc<RwLock<HashSet<String>>>,
     anti_dos_state: Arc<Mutex<AntiDosState>>,
+    socket_container_id: Option<String>,
 ) {
     if let Err(e) = stream.set_read_timeout(Some(Duration::from_millis(100))) {
         emit_log(
@@ -766,6 +821,7 @@ fn handle_uds_stream(
                     &table,
                     json_enabled,
                     &docker_socket_path,
+                    socket_container_id.clone(),
                     false,
                     &active_containers,
                     &anti_dos_state,
@@ -806,6 +862,7 @@ fn evaluate_line_signatures(
     table: &Arc<String>,
     json_enabled: bool,
     docker_socket_path: &str,
+    file_container_id: Option<String>,
     is_from_file: bool,
     active_containers: &Arc<RwLock<HashSet<String>>>,
     anti_dos_state: &Arc<Mutex<AntiDosState>>,
@@ -819,98 +876,109 @@ fn evaluate_line_signatures(
 
     for (rule_name, rx, try_act, final_act) in rules.iter() {
         if rx.is_match(line) {
-            if let Some(caps) = id_extractor.captures(line) {
+
+            // Unified ID Extraction
+            // If file_container_id is present, we
+            // use it, otherwise, fallback safely to text regex (for UDS stream mode)
+
+            let container_id = if let Some(ref id) = file_container_id {
+                id.clone()
+            } else if let Some(caps) = id_extractor.captures(line) {
                 if let Some(matched_id) = caps.get(1) {
-                    let container_id = matched_id.as_str().to_string();
+                    matched_id.as_str().to_string()
+                } else {
+                    continue;
+                }
+            } else {
+                continue;
+            };
 
-                    #[cfg(target_os = "linux")]
-                    {
-                        let mut is_valid = {
-                            let active_guard = active_containers.read().expect("CRITICAL: Active container cache lock poisoned. Aborting.");
-                            active_guard.contains(&container_id)
-                                || active_guard.iter().any(|long_id| long_id.starts_with(&container_id))
-                        };
+            #[cfg(target_os = "linux")]
+            {
+                let mut is_valid = {
+                    let active_guard = active_containers.read().expect("CRITICAL: Active container cache lock poisoned. Aborting.");
+                    active_guard.contains(&container_id)
+                        || active_guard.iter().any(|long_id| long_id.starts_with(&container_id))
+                };
 
-                        // Fallback: Synchronous Verification mapped behind Negative Cache & Rate Limits
-                        if !is_valid {
-                            let mut dos_guard = anti_dos_state.lock().expect("CRITICAL: DoS State lock poisoned. Aborting.");
+                // Fallback: Synchronous Verification mapped behind Negative Cache & Rate Limits
+                if !is_valid {
+                    let mut dos_guard = anti_dos_state.lock().expect("CRITICAL: DoS State lock poisoned. Aborting.");
 
-                            // Token Replenishment
-                            let now = Instant::now();
-                            if now.duration_since(dos_guard.last_refill).as_secs() >= 1 {
-                                dos_guard.tokens = MAX_LOOKUP_TOKENS;
-                                dos_guard.last_refill = now;
-                            }
+                    // Token Replenishment
+                    let now = Instant::now();
+                    if now.duration_since(dos_guard.last_refill).as_secs() >= 1 {
+                        dos_guard.tokens = MAX_LOOKUP_TOKENS;
+                        dos_guard.last_refill = now;
+                    }
 
-                            // Bypass check if attacker is hitting known bad IDs
-                            if dos_guard.negative_cache.contains(&container_id) {
-                                continue;
-                            }
+                    // Bypass check if attacker is hitting known bad IDs
+                    if dos_guard.negative_cache.contains(&container_id) {
+                        continue;
+                    }
 
-                            if dos_guard.tokens > 0 {
-                                dos_guard.tokens -= 1;
-                                drop(dos_guard); // Free lock immediately during active I/O
+                    if dos_guard.tokens > 0 {
+                        dos_guard.tokens -= 1;
+                        drop(dos_guard); // Free lock immediately during active I/O
 
-                                let actually_exists = is_container_active_sync(&container_id, docker_socket_path);
+                        let actually_exists = is_container_active_sync(&container_id, docker_socket_path);
 
-                                if actually_exists {
-                                    let mut active_write = active_containers.write().expect("CRITICAL: Active container cache lock poisoned. Aborting.");
-                                    active_write.insert(container_id.clone());
-                                    is_valid = true;
-                                } else {
-                                    let mut dos_write = anti_dos_state.lock().expect("CRITICAL: DoS State lock poisoned. Aborting.");
+                        if actually_exists {
+                            let mut active_write = active_containers.write().expect("CRITICAL: Active container cache lock poisoned. Aborting.");
+                            active_write.insert(container_id.clone());
+                            is_valid = true;
+                        } else {
+                            let mut dos_write = anti_dos_state.lock().expect("CRITICAL: DoS State lock poisoned. Aborting.");
 
-                                    // Maintain bounded LRU capacity for Negative Cache
-                                    if dos_write.negative_cache.len() >= MAX_NEGATIVE_CACHE {
-                                        if let Some(oldest) = dos_write.negative_queue.pop_front() {
-                                            dos_write.negative_cache.remove(&oldest);
-                                        }
-                                    }
-                                    dos_write.negative_cache.insert(container_id.clone());
-                                    dos_write.negative_queue.push_back(container_id.clone());
+                            // Maintain bounded LRU capacity for Negative Cache
+                            if dos_write.negative_cache.len() >= MAX_NEGATIVE_CACHE {
+                                if let Some(oldest) = dos_write.negative_queue.pop_front() {
+                                    dos_write.negative_cache.remove(&oldest);
                                 }
-                            } else {
-                                // ID Exhaustion flood detected
-                                // Drop payload cleanly to protect the engine
-                                emit_log(
-                                    "WARN",
-                                    "orchestrator",
-                                    None,
-                                    None,
-                                    None,
-                                    Some("api_rate_limit"),
-                                    "DROPPED",
-                                    "Container lookup token pool exhausted. Payload discarded.",
-                                    json_enabled,
-                                );
-                                continue;
                             }
+                            dos_write.negative_cache.insert(container_id.clone());
+                            dos_write.negative_queue.push_back(container_id.clone());
                         }
-
-                        if !is_valid {
-                            continue;
-                        }
+                    } else {
+                        // ID Exhaustion flood detected
+                        // Drop payload cleanly to protect the engine
+                        emit_log(
+                            "WARN",
+                            "orchestrator",
+                            None,
+                            None,
+                            None,
+                            Some("api_rate_limit"),
+                            "DROPPED",
+                            "Container lookup token pool exhausted. Payload discarded.",
+                            json_enabled,
+                        );
+                        continue;
                     }
+                }
 
-                    let mut active_try = try_act.clone();
-                    if is_from_file && active_try.first() != Some(&AtomicAction::ValidateState) {
-                        active_try.insert(0, AtomicAction::ValidateState);
-                    }
-
-                    dispatch_to_worker(
-                        registry,
-                        container_id,
-                        active_try,
-                        final_act.clone(),
-                        rule_name.clone(),
-                        Arc::clone(whitelist),
-                        Arc::clone(table),
-                        json_enabled,
-                        docker_socket_path,
-                        line.to_string(),
-                    );
+                if !is_valid {
+                    continue;
                 }
             }
+
+            let mut active_try = try_act.clone();
+            if is_from_file && active_try.first() != Some(&AtomicAction::ValidateState) {
+                active_try.insert(0, AtomicAction::ValidateState);
+            }
+
+            dispatch_to_worker(
+                registry,
+                container_id,
+                active_try,
+                final_act.clone(),
+                rule_name.clone(),
+                Arc::clone(whitelist),
+                Arc::clone(table),
+                json_enabled,
+                docker_socket_path,
+                line.to_string(),
+            );
         }
     }
 }

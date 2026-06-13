@@ -140,3 +140,25 @@ sudo systemctl stop runsc-sentry-guard
 1. The engine journal must cleanly output `[INFO] ... Decommissioning sequence initialized. Processing cleanup contexts.`.
 2. The daemon must exit with status `0` without leaving hanging background socket listeners or thread leaks behind.
 3. Query `sudo nft list ruleset` on the host processor interface; the target isolation blacklist set elements must be entirely cleared out, confirming the completion of the configuration-driven post-termination purge.
+
+### Scenario H: Cross-Container Mitigation Spoofing Prevention
+
+**Objective:** Verify that the file log engine derives container IDs strictly from the immutable log filename stem rather than untrusted text payloads printed within the logs, ensuring a compromised container cannot frame an adjacent workload[cite: 1].
+
+**Execution:**
+1. Generate an active dummy log target profile using a valid, distinct hex name:
+```bash
+   touch /var/log/gvisor/a1b2c3d4e5f6.boot
+```
+
+2. Write an explicit, spoofed system call sequence designed to deliberately target an innocent container ID (`999999999999`):
+
+```bash
+   echo "execve(/bin/sh) --id=999999999999" >> /var/log/gvisor/a1b2c3d4e5f6.boot
+```
+
+**Expected Result:**
+
+1. The daemon intercepts the malicious signature match.
+2. The engine journal must report mitigation execution mapping **strictly** to the file segment name context (`a1b2c3d4e5f6`) rather than executing actions on the malicious injected text payload (`999999999999`).
+3. The forged cross-container attack vector is completely neutralized.

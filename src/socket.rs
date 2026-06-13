@@ -321,7 +321,7 @@ fn handle_uds_stream(
         buf.clear();
         let mut chunk = reader.by_ref().take(8192);
 
-        // Telemetry Hook: High-frequency frame parsing diagnostics gated under Trace noise channel
+        // Telemetry Hook: Gated under Trace scope to track live UDS socket evaluations
         emit_log(
             "TRACE",
             "uds_server",

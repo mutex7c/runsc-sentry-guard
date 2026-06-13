@@ -7,7 +7,7 @@ use std::fs;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::atomic::Ordering;
-use std::sync::mpsc::{Receiver, TryRecvError, TrySendError, sync_channel};
+use std::sync::mpsc::{Receiver, TrySendError, sync_channel};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::thread;
@@ -68,20 +68,17 @@ pub fn start_monitor_loop(config: GuardConfig, shutdown: Arc<AtomicBool>, config
 
         thread::spawn(move || {
             use std::io::{Cursor, Read, Write};
-
             let stream_endpoint = "/events?filters=%7B%22type%22%3A%5B%22container%22%5D%2C%22event%22%3A%5B%22start%22%2C%22die%22%5D%7D";
 
             while !stream_shutdown.load(Ordering::SeqCst) {
                 if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&ds_path) {
                     let current_ids = crate::worker::fetch_running_container_ids(&ds_path);
+                    {
+                        let mut guard = cache_clone.write();
+                        *guard = current_ids;
+                    }
 
-                    let mut guard = cache_clone.write();
-                    *guard = current_ids;
-
-                    let request = format!(
-                        "GET {} HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n",
-                        stream_endpoint
-                    );
+                    let request = format!("GET {} HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n", stream_endpoint);
 
                     if stream.write_all(request.as_bytes()).is_ok() {
                         let mut header_buf = [0u8; 8192];
@@ -90,11 +87,8 @@ pub fn start_monitor_loop(config: GuardConfig, shutdown: Arc<AtomicBool>, config
                         let mut status_ok = false;
                         let mut is_chunked = false;
 
-                        // Safely parse headers with httparse
                         loop {
-                            if bytes_read >= header_buf.len() {
-                                break;
-                            }
+                            if bytes_read >= header_buf.len() { break; }
                             let n = match stream.read(&mut header_buf[bytes_read..]) {
                                 Ok(n) if n > 0 => n,
                                 _ => break,
@@ -107,15 +101,11 @@ pub fn start_monitor_loop(config: GuardConfig, shutdown: Arc<AtomicBool>, config
                             match res.parse(&header_buf[..bytes_read]) {
                                 Ok(httparse::Status::Complete(body_start_offset)) => {
                                     header_end = body_start_offset;
-                                    if let Some(code) = res.code {
-                                        if code == 200 { status_ok = true; }
-                                    }
+                                    if let Some(code) = res.code { if code == 200 { status_ok = true; } }
                                     for header in res.headers {
                                         let name = header.name.to_lowercase();
                                         let value = String::from_utf8_lossy(header.value).to_lowercase();
-                                        if name == "transfer-encoding" && value.contains("chunked") {
-                                            is_chunked = true;
-                                        }
+                                        if name == "transfer-encoding" && value.contains("chunked") { is_chunked = true; }
                                     }
                                     break;
                                 }
@@ -125,46 +115,31 @@ pub fn start_monitor_loop(config: GuardConfig, shutdown: Arc<AtomicBool>, config
                         }
 
                         if status_ok && is_chunked {
-                            // Safely read standard lines out of the leftover buffer
                             let leftover = header_buf[header_end..bytes_read].to_vec();
                             let mut reader = BufReader::new(Cursor::new(leftover).chain(stream));
-
                             let mut chunk_size_buf = String::new();
                             let mut line_buffer = Vec::new();
 
                             while !stream_shutdown.load(Ordering::SeqCst) {
                                 chunk_size_buf.clear();
-                                if reader.read_line(&mut chunk_size_buf).is_err() {
-                                    break;
-                                }
+                                if reader.read_line(&mut chunk_size_buf).is_err() { break; }
                                 let trimmed_size = chunk_size_buf.trim();
-                                if trimmed_size.is_empty() {
-                                    continue;
-                                }
+                                if trimmed_size.is_empty() { continue; }
 
                                 let chunk_size = match usize::from_str_radix(trimmed_size, 16) {
                                     Ok(size) => size,
                                     Err(_) => break,
                                 };
-
-                                if chunk_size == 0 {
-                                    break;
-                                }
+                                if chunk_size == 0 { break; }
 
                                 let mut chunk_buf = vec![0u8; chunk_size];
-                                if reader.read_exact(&mut chunk_buf).is_err() {
-                                    break;
-                                }
+                                if reader.read_exact(&mut chunk_buf).is_err() { break; }
 
                                 let mut crlf = [0u8; 2];
-                                if reader.read_exact(&mut crlf).is_err() {
-                                    break;
-                                }
+                                if reader.read_exact(&mut crlf).is_err() { break; }
 
                                 line_buffer.extend_from_slice(&chunk_buf);
-                                if line_buffer.len() > 65536 {
-                                    line_buffer.clear();
-                                }
+                                if line_buffer.len() > 65536 { line_buffer.clear(); }
 
                                 let mut start_pos = 0;
                                 while let Some(newline_offset) = line_buffer[start_pos..].iter().position(|&b| b == b'\n') {
@@ -175,26 +150,18 @@ pub fn start_monitor_loop(config: GuardConfig, shutdown: Arc<AtomicBool>, config
                                     if !trimmed.is_empty() {
                                         if let Ok(event) = serde_json::from_str::<crate::worker::DockerEventPayload>(trimmed) {
                                             let mut guard = cache_clone.write();
-                                            if event.action == "start" {
-                                                guard.insert(event.actor.id);
-                                            } else if event.action == "die" {
-                                                guard.remove(&event.actor.id);
-                                            }
+                                            if event.action == "start" { guard.insert(event.actor.id); }
+                                            else if event.action == "die" { guard.remove(&event.actor.id); }
                                         }
                                     }
                                     start_pos = end_pos + 1;
                                 }
-
-                                if start_pos > 0 {
-                                    line_buffer.drain(0..start_pos);
-                                }
+                                if start_pos > 0 { line_buffer.drain(0..start_pos); }
                             }
                         }
                     }
                 }
-                if stream_shutdown.load(Ordering::SeqCst) {
-                    break;
-                }
+                if stream_shutdown.load(Ordering::SeqCst) { break; }
                 thread::sleep(Duration::from_secs(1));
             }
         });
@@ -212,47 +179,23 @@ pub fn start_monitor_loop(config: GuardConfig, shutdown: Arc<AtomicBool>, config
         let (tx, rx) = std::sync::mpsc::channel();
 
         let watcher_res = notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
-            if let Ok(event) = res {
-                if event.kind.is_modify() || event.kind.is_create() {
-                    let _ = tx.send(());
-                }
-            }
+            if let Ok(event) = res { if event.kind.is_modify() || event.kind.is_create() { let _ = tx.send(()); } }
         });
 
         if let Ok(mut watcher) = watcher_res {
             if watcher.watch(Path::new(&path_watch_clone), RecursiveMode::NonRecursive).is_ok() {
-                while let Ok(_) = rx.recv() {
+                while rx.recv().is_ok() {
                     thread::sleep(Duration::from_millis(100));
 
                     if let Ok(new_config) = crate::config::load_config(&path_watch_clone) {
                         let new_compiled = compile_rules(&new_config.rules);
-                        let mut guard = rules_watch_clone.write();
-                        *guard = new_compiled;
-                        emit_log(
-                            "INFO",
-                            "config_reload",
-                            None,
-                            None,
-                            None,
-                            None,
-                            "SUCCESS",
-                            "Active rule signatures successfully hot-reloaded from manifest.",
-                            config_log_level,
-                            json_enabled_clone,
-                        );
+                        {
+                            let mut guard = rules_watch_clone.write();
+                            *guard = new_compiled;
+                        }
+                        emit_log("INFO", "config_reload", None, None, None, None, "SUCCESS", "Active rulesets hot-reloaded from manifest.", config_log_level, json_enabled_clone);
                     } else {
-                        emit_log(
-                            "WARN",
-                            "config_reload",
-                            None,
-                            None,
-                            None,
-                            None,
-                            "FAILURE",
-                            "Hot-reload aborted: Updated configuration manifest contains malformed syntax.",
-                            config_log_level,
-                            json_enabled_clone,
-                        );
+                        emit_log("WARN", "config_reload", None, None, None, None, "FAILURE", "Hot-reload aborted: Updated manifest contains errors.", config_log_level, json_enabled_clone);
                     }
                 }
             }
@@ -279,82 +222,30 @@ pub fn start_monitor_loop(config: GuardConfig, shutdown: Arc<AtomicBool>, config
 
         thread::spawn(move || {
             crate::socket::run_uds_server(
-                uds_registry,
-                uds_regex,
-                uds_id_extractor,
-                uds_whitelist,
-                uds_table,
-                json_enabled,
-                config_log_level,
-                uds_socket_path,
-                uds_cache,
-                uds_anti_dos,
-                uds_shutdown,
-                max_workers,
-                limiter_clone,
+                uds_registry, uds_regex, uds_id_extractor, uds_whitelist, uds_table,
+                json_enabled, config_log_level, uds_socket_path, uds_cache, uds_anti_dos,
+                uds_shutdown, max_workers, limiter_clone,
             );
         });
     }
 
     if mode == &IngestionMode::Socket {
-        emit_log(
-            "INFO",
-            "orchestrator",
-            None,
-            None,
-            None,
-            None,
-            "STARTED",
-            "Out-of-band UDS streaming receiver active. Filesystem parsing idle.",
-            config_log_level,
-            json_enabled,
-        );
-
-        while !shutdown.load(Ordering::SeqCst) {
-            thread::sleep(Duration::from_millis(250));
-        }
+        emit_log("INFO", "orchestrator", None, None, None, None, "STARTED", "Out-of-band UDS receiver active. Filesystem parsing idle.", config_log_level, json_enabled);
+        while !shutdown.load(Ordering::SeqCst) { thread::sleep(Duration::from_millis(250)); }
         return;
     }
 
-    emit_log(
-        "INFO",
-        "orchestrator",
-        None,
-        None,
-        None,
-        None,
-        "STARTED",
-        "Master directory tailer and Unix socket pipelines active.",
-        config_log_level,
-        json_enabled,
-    );
+    emit_log("INFO", "orchestrator", None, None, None, None, "STARTED", "Master directory tailer and UDS receiver paths armed.", config_log_level, json_enabled);
 
-    if mode == &IngestionMode::File {
-        notify_systemd_ready();
-    }
+    if mode == &IngestionMode::File { notify_systemd_ready(); }
 
     while !shutdown.load(Ordering::SeqCst) {
         let log_dir_path = Path::new(&config.monitor.log_dir);
 
         if !log_dir_path.exists() {
-            #[cfg(not(target_os = "linux"))]
-            {
-                let _ = fs::create_dir_all(log_dir_path);
-            }
-            #[cfg(target_os = "linux")]
-            {
-                emit_log(
-                    "ERROR",
-                    "orchestrator",
-                    None,
-                    None,
-                    None,
-                    None,
-                    "MISSING",
-                    "Target directory unreachable.",
-                    config_log_level,
-                    json_enabled,
-                );
+            #[cfg(not(target_os = "linux"))] { let _ = fs::create_dir_all(log_dir_path); }
+            #[cfg(target_os = "linux")] {
+                emit_log("ERROR", "orchestrator", None, None, None, None, "MISSING", "Target directory unreachable.", config_log_level, json_enabled);
                 thread::sleep(Duration::from_millis(config.monitor.check_interval_ms));
                 continue;
             }
@@ -365,18 +256,7 @@ pub fn start_monitor_loop(config: GuardConfig, shutdown: Arc<AtomicBool>, config
             use std::os::unix::fs::MetadataExt;
             if let Ok(metadata) = log_dir_path.metadata() {
                 if metadata.uid() != 0 || (metadata.mode() & 0o002) != 0 {
-                    emit_log(
-                        "CRITICAL",
-                        "orchestrator",
-                        None,
-                        None,
-                        None,
-                        Some("directory_audit"),
-                        "HALTED",
-                        "Log directory is not owned by root or is world-writable. File mode suspended to prevent spoofing.",
-                        config_log_level,
-                        json_enabled,
-                    );
+                    emit_log("CRITICAL", "orchestrator", None, None, None, Some("directory_audit"), "HALTED", "Log directory unsecured. Suspended to prevent spoofing.", config_log_level, json_enabled);
                     thread::sleep(Duration::from_millis(config.monitor.check_interval_ms));
                     continue;
                 }
@@ -394,77 +274,37 @@ pub fn start_monitor_loop(config: GuardConfig, shutdown: Arc<AtomicBool>, config
                     actively_seen_paths.insert(path_str.clone());
 
                     let file_name_str = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                    let file_container_id = filename_id_extractor
-                        .captures(file_name_str)
-                        .and_then(|caps| caps.get(1).map(|m| m.as_str().to_string()));
-
-                    if file_container_id.is_none() {
-                        continue;
-                    }
+                    let file_container_id = filename_id_extractor.captures(file_name_str).and_then(|caps| caps.get(1).map(|m| m.as_str().to_string()));
+                    if file_container_id.is_none() { continue; }
 
                     #[cfg(target_os = "linux")]
-                    let current_inode = {
-                        use std::os::linux::fs::MetadataExt;
-                        path.metadata().map(|m| m.st_ino()).unwrap_or(0)
-                    };
-
+                    let current_inode = { use std::os::unix::fs::MetadataExt; path.metadata().map(|m| m.ino()).unwrap_or(0) };
                     #[cfg(not(target_os = "linux"))]
                     let current_inode = 0;
 
                     if first_run {
                         if let Ok(metadata) = path.metadata() {
-                            file_state_tracker.insert(
-                                path_str.clone(),
-                                LogDescriptor {
-                                    inode: current_inode,
-                                    position: metadata.len(),
-                                },
-                            );
+                            file_state_tracker.insert(path_str.clone(), LogDescriptor { inode: current_inode, position: metadata.len() });
                         }
                         continue;
                     }
 
                     let mut last_pos = 0;
-                    if let Some(desc) = file_state_tracker.get(&path_str) {
-                        if desc.inode == current_inode {
-                            last_pos = desc.position;
-                        }
-                    }
+                    if let Some(desc) = file_state_tracker.get(&path_str) { if desc.inode == current_inode { last_pos = desc.position; } }
 
                     #[cfg(unix)]
                     let file_result = open_log_safe(log_dir_path, path.file_name().unwrap());
-
                     #[cfg(not(unix))]
                     let file_result = fs::File::open(&path);
 
                     if let Ok(file) = file_result {
-                        #[cfg(unix)]
-                        {
+                        #[cfg(unix)] {
                             use std::os::unix::fs::MetadataExt;
-                            if let Ok(metadata) = file.metadata() {
-                                if metadata.uid() != 0 {
-                                    continue;
-                                }
-                            }
+                            if let Ok(metadata) = file.metadata() { if metadata.uid() != 0 { continue; } }
                         }
 
                         let mut reader = BufReader::new(file);
-
-                        if let Err(e) = reader.seek(SeekFrom::Start(last_pos)) {
-                            emit_log(
-                                "ERROR",
-                                "orchestrator",
-                                None,
-                                None,
-                                None,
-                                Some("seek"),
-                                "FAILURE",
-                                &format!("Failed to seek to target stream pointer: {}", e),
-                                config_log_level,
-                                json_enabled,
-                            );
-                            continue;
-                        }
+                        if reader.seek(SeekFrom::Start(last_pos)).is_err() { continue; }
 
                         const MAX_LINE_SIZE: usize = 65536;
                         let mut stream_buffer = vec![0u8; MAX_LINE_SIZE * 2];
@@ -480,10 +320,7 @@ pub fn start_monitor_loop(config: GuardConfig, shutdown: Arc<AtomicBool>, config
                             buffer_len += bytes_read;
                             let mut start_pos = 0;
 
-                            while let Some(newline_offset) = stream_buffer[start_pos..buffer_len]
-                                .iter()
-                                .position(|&b| b == b'\n')
-                            {
+                            while let Some(newline_offset) = stream_buffer[start_pos..buffer_len].iter().position(|&b| b == b'\n') {
                                 let end_pos = start_pos + newline_offset;
                                 let line_slice = String::from_utf8_lossy(&stream_buffer[start_pos..end_pos]);
                                 let trimmed = line_slice.trim_end();
@@ -491,21 +328,9 @@ pub fn start_monitor_loop(config: GuardConfig, shutdown: Arc<AtomicBool>, config
                                 if !trimmed.is_empty() {
                                     let rules_guard = regex_compiled.read();
                                     evaluate_line_signatures(
-                                        trimmed,
-                                        &rules_guard,
-                                        &id_extractor,
-                                        &worker_registry,
-                                        &whitelist,
-                                        &table,
-                                        json_enabled,
-                                        config_log_level,
-                                        &docker_socket_path,
-                                        file_container_id.clone(),
-                                        true,
-                                        &active_containers,
-                                        &anti_dos_state,
-                                        max_workers,
-                                        &global_limiter,
+                                        trimmed, &rules_guard, &id_extractor, &worker_registry, &whitelist, &table,
+                                        json_enabled, config_log_level, &docker_socket_path, file_container_id.clone(),
+                                        true, &active_containers, &anti_dos_state, max_workers, &global_limiter,
                                     );
                                 }
                                 start_pos = end_pos + 1;
@@ -514,36 +339,17 @@ pub fn start_monitor_loop(config: GuardConfig, shutdown: Arc<AtomicBool>, config
                             if start_pos < buffer_len {
                                 let remainder_len = buffer_len - start_pos;
                                 if remainder_len >= MAX_LINE_SIZE {
-                                    emit_log(
-                                        "CRITICAL",
-                                        "orchestrator",
-                                        None,
-                                        None,
-                                        None,
-                                        Some("stream"),
-                                        "OVERFLOW_FLUSHED",
-                                        "Line length exceeded 64KB security threshold. Flushing stream segment.",
-                                        config_log_level,
-                                        json_enabled,
-                                    );
+                                    emit_log("CRITICAL", "orchestrator", None, None, None, Some("stream"), "OVERFLOW_FLUSHED", "Line token bounds overflowed 64KB boundary.", config_log_level, json_enabled);
                                     buffer_len = 0;
                                 } else {
                                     stream_buffer.copy_within(start_pos..buffer_len, 0);
                                     buffer_len = remainder_len;
                                 }
-                            } else {
-                                buffer_len = 0;
-                            }
+                            } else { buffer_len = 0; }
                         }
 
                         if let Ok(pos) = reader.stream_position() {
-                            file_state_tracker.insert(
-                                path_str,
-                                LogDescriptor {
-                                    inode: current_inode,
-                                    position: pos,
-                                },
-                            );
+                            file_state_tracker.insert(path_str, LogDescriptor { inode: current_inode, position: pos });
                         }
                     }
                 }
@@ -559,7 +365,6 @@ pub fn start_monitor_loop(config: GuardConfig, shutdown: Arc<AtomicBool>, config
 #[cfg(target_os = "linux")]
 fn is_container_active_sync(container_id: &str, socket_path: &str) -> bool {
     use std::io::{Read, Write};
-
     if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(socket_path) {
         let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
         let request = format!("GET /containers/{}/json HTTP/1.0\r\n\r\n", container_id);
@@ -569,9 +374,7 @@ fn is_container_active_sync(container_id: &str, socket_path: &str) -> bool {
             let mut bytes_read = 0;
 
             loop {
-                if bytes_read >= header_buf.len() {
-                    break;
-                }
+                if bytes_read >= header_buf.len() { break; }
                 match stream.read(&mut header_buf[bytes_read..]) {
                     Ok(n) if n > 0 => bytes_read += n,
                     _ => break,
@@ -581,9 +384,7 @@ fn is_container_active_sync(container_id: &str, socket_path: &str) -> bool {
                 let mut res = httparse::Response::new(&mut headers);
 
                 match res.parse(&header_buf[..bytes_read]) {
-                    Ok(httparse::Status::Complete(_)) => {
-                        return res.code == Some(200);
-                    }
+                    Ok(httparse::Status::Complete(_)) => { return res.code == Some(200); }
                     Ok(httparse::Status::Partial) => continue,
                     Err(_) => break,
                 }
@@ -593,6 +394,7 @@ fn is_container_active_sync(container_id: &str, socket_path: &str) -> bool {
     false
 }
 
+#[allow(unused_variables)]
 pub fn evaluate_line_signatures(
     line: &str,
     rules: &[(String, Regex, Vec<AtomicAction>, Vec<AtomicAction>)],
@@ -612,55 +414,18 @@ pub fn evaluate_line_signatures(
 ) {
     if !global_limiter.acquire() {
         if global_limiter.should_warn() {
-            emit_log(
-                "WARN",
-                "orchestrator",
-                None,
-                None,
-                None,
-                Some("rate_limit"),
-                "THROTTLED",
-                "Global log ingestion rate ceiling reached. Dropping excess streams to preserve host CPU.",
-                config_log_level,
-                json_enabled,
-            );
+            emit_log("WARN", "orchestrator", None, None, None, Some("rate_limit"), "THROTTLED", "Global log ingestion ceiling reached.", config_log_level, json_enabled);
         }
         return;
     }
 
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = active_containers;
-        let _ = anti_dos_state;
-    }
-
     for (rule_name, rx, try_act, final_act) in rules.iter() {
-        // High-Volume Diagnostics: Debug trace evaluating active log boundaries
-        emit_log(
-            "DEBUG",
-            "orchestrator",
-            None,
-            None,
-            None,
-            Some("signature_eval"),
-            "EVALUATING",
-            &format!("Scanning active stream sequences against signature layout: '{}'", rule_name),
-            config_log_level,
-            json_enabled,
-        );
+        emit_log("DEBUG", "orchestrator", None, None, None, Some("signature_eval"), "EVALUATING", &format!("Scanning active stream sequences against signature layout: '{}'", rule_name), config_log_level, json_enabled);
 
         if rx.is_match(line) {
-            let container_id = if let Some(ref id) = file_container_id {
-                id.clone()
-            } else if let Some(caps) = id_extractor.captures(line) {
-                if let Some(matched_id) = caps.get(1) {
-                    matched_id.as_str().to_string()
-                } else {
-                    continue;
-                }
-            } else {
-                continue;
-            };
+            let container_id = if let Some(ref id) = file_container_id { id.clone() }
+            else if let Some(caps) = id_extractor.captures(line) { if let Some(matched_id) = caps.get(1) { matched_id.as_str().to_string() } else { continue; } }
+            else { continue; };
 
             #[cfg(target_os = "linux")]
             {
@@ -677,16 +442,13 @@ pub fn evaluate_line_signatures(
                         dos_guard.last_refill = now;
                     }
 
-                    if dos_guard.negative_cache.contains(&container_id) {
-                        continue;
-                    }
+                    if dos_guard.negative_cache.contains(&container_id) { continue; }
 
                     if dos_guard.tokens > 0 {
                         dos_guard.tokens -= 1;
                         drop(dos_guard);
 
                         let actually_exists = is_container_active_sync(&container_id, docker_socket_path);
-
                         if actually_exists {
                             let mut active_write = active_containers.write();
                             active_write.insert(container_id.clone());
@@ -694,33 +456,17 @@ pub fn evaluate_line_signatures(
                         } else {
                             let mut dos_write = anti_dos_state.lock();
                             if dos_write.negative_cache.len() >= crate::limiters::MAX_NEGATIVE_CACHE {
-                                if let Some(oldest) = dos_write.negative_queue.pop_front() {
-                                    dos_write.negative_cache.remove(&oldest);
-                                }
+                                if let Some(oldest) = dos_write.negative_queue.pop_front() { dos_write.negative_cache.remove(&oldest); }
                             }
                             dos_write.negative_cache.insert(container_id.clone());
                             dos_write.negative_queue.push_back(container_id.clone());
                         }
                     } else {
-                        emit_log(
-                            "WARN",
-                            "orchestrator",
-                            None,
-                            None,
-                            None,
-                            Some("api_rate_limit"),
-                            "DROPPED",
-                            "Container lookup token pool exhausted. Payload discarded.",
-                            config_log_level,
-                            json_enabled,
-                        );
+                        emit_log("WARN", "orchestrator", None, None, None, Some("api_rate_limit"), "DROPPED", "Lookup token pool exhausted.", config_log_level, json_enabled);
                         continue;
                     }
                 }
-
-                if !is_valid {
-                    continue;
-                }
+                if !is_valid { continue; }
             }
 
             let mut active_try = try_act.clone();
@@ -729,18 +475,9 @@ pub fn evaluate_line_signatures(
             }
 
             dispatch_to_worker(
-                registry,
-                container_id,
-                active_try,
-                final_act.clone(),
-                rule_name.clone(),
-                Arc::clone(whitelist),
-                Arc::clone(table),
-                json_enabled,
-                config_log_level,
-                docker_socket_path,
-                line.to_string(),
-                max_workers,
+                registry, container_id, active_try, final_act.clone(), rule_name.clone(),
+                Arc::clone(whitelist), Arc::clone(table), json_enabled, config_log_level,
+                docker_socket_path, line.to_string(), max_workers,
             );
         }
     }
@@ -772,32 +509,15 @@ fn dispatch_to_worker(
 
     if !reg_write.contains_key(&container_id) && reg_write.len() >= max_workers {
         emit_log(
-            "CRITICAL",
-            "orchestrator",
-            Some(&rule_name),
-            Some(&container_id),
-            None,
-            Some("route"),
-            "OOM_PREVENTION",
-            "Maximum worker thread ceiling reached. Malicious ID flood detected. Payload dropped.",
-            config_log_level,
-            json_enabled,
+            "CRITICAL", "orchestrator", Some(&rule_name), Some(&container_id), None, Some("route"), "OOM_PREVENTION",
+            "Maximum worker thread ceiling reached. Flood detected.", config_log_level, json_enabled,
         );
         return;
     }
 
-    // High-Volume Diagnostics: Worker thread serialization router event
     emit_log(
-        "DEBUG",
-        "orchestrator",
-        Some(&rule_name),
-        Some(&container_id),
-        None,
-        Some("route"),
-        "DISPATCHED",
-        "Incident response task successfully routed to specialized isolated worker context.",
-        config_log_level,
-        json_enabled,
+        "DEBUG", "orchestrator", Some(&rule_name), Some(&container_id), None, Some("route"), "DISPATCHED",
+        "Incident response task successfully routed to specialized isolated worker context.", config_log_level, json_enabled,
     );
 
     let tx = reg_write.entry(container_id.clone()).or_insert_with(|| {
@@ -810,77 +530,29 @@ fn dispatch_to_worker(
 
         thread::spawn(move || {
             run_worker_lifecycle(
-                cid_clone,
-                worker_rx,
-                reg_sharing_reference,
-                wl_clone,
-                tbl_clone,
-                json_enabled,
-                config_log_level,
-                ds_clone,
+                cid_clone, worker_rx, reg_sharing_reference, wl_clone, tbl_clone,
+                json_enabled, config_log_level, ds_clone,
             );
         });
 
         worker_tx
     });
 
-    match tx.try_send((
-        try_actions,
-        final_actions.clone(),
-        rule_name.clone(),
-        trigger_message.clone(),
-    )) {
-        Ok(_) => {}
-        Err(TrySendError::Full(_)) => {
-            emit_log(
-                "CRITICAL",
-                "orchestrator",
-                Some(&rule_name),
-                Some(&container_id),
-                None,
-                Some("route"),
-                "SATURATED",
-                "Worker execution queue full. Engaging emergency synchronous bypass for final actions.",
-                config_log_level,
-                json_enabled,
-            );
-
-            let cid_clone = container_id.clone();
-            let wl_clone = Arc::clone(&whitelist);
-            let tbl_clone = Arc::clone(&table);
-            let ds_clone = docker_socket_path.to_string();
-            let emergency_actions = final_actions;
-
-            thread::spawn(move || {
-                execute_containment_pipeline(
-                    cid_clone,
-                    vec![],
-                    emergency_actions,
-                    wl_clone,
-                    tbl_clone,
-                    config_log_level,
-                    json_enabled,
-                    rule_name,
-                    ds_clone,
-                    trigger_message,
-                );
-            });
+    let _ = tx.try_send((try_actions, final_actions.clone(), rule_name.clone(), trigger_message.clone())).map_err(|e| {
+        match e {
+            TrySendError::Full(_) => {
+                emit_log("CRITICAL", "orchestrator", Some(&rule_name), Some(&container_id), None, Some("route"), "SATURATED", "Worker queue saturated. Bypassing synchronously for final playbooks.", config_log_level, json_enabled);
+                let cid_clone = container_id.clone();
+                let wl_clone = Arc::clone(&whitelist);
+                let tbl_clone = Arc::clone(&table);
+                let ds_clone = docker_socket_path.to_string();
+                thread::spawn(move || {
+                    execute_containment_pipeline(cid_clone, vec![], final_actions, wl_clone, tbl_clone, config_log_level, json_enabled, rule_name, ds_clone, trigger_message);
+                });
+            }
+            _ => {}
         }
-        Err(TrySendError::Disconnected(_)) => {
-            emit_log(
-                "ERROR",
-                "orchestrator",
-                Some(&rule_name),
-                Some(&container_id),
-                None,
-                Some("route"),
-                "FAIL",
-                "Worker channel broken unexpectedly.",
-                config_log_level,
-                json_enabled,
-            );
-        }
-    }
+    });
 }
 
 fn run_worker_lifecycle(
@@ -899,51 +571,26 @@ fn run_worker_lifecycle(
         match rx_chan.recv_timeout(timeout_dur) {
             Ok((try_cmds, final_cmds, rule, trigger_msg)) => {
                 execute_containment_pipeline(
-                    container_id.clone(),
-                    try_cmds,
-                    final_cmds,
-                    Arc::clone(&whitelist),
-                    Arc::clone(&table),
-                    config_log_level,
-                    json_enabled,
-                    rule,
-                    docker_socket_path.clone(),
-                    trigger_msg,
+                    container_id.clone(), try_cmds, final_cmds, Arc::clone(&whitelist), Arc::clone(&table),
+                    config_log_level, json_enabled, rule, docker_socket_path.clone(), trigger_msg,
                 );
             }
             Err(_) => {
                 let mut reg = registry.write();
-
                 match rx_chan.try_recv() {
                     Ok((try_cmds, final_cmds, rule, trigger_msg)) => {
                         drop(reg);
                         execute_containment_pipeline(
-                            container_id.clone(),
-                            try_cmds,
-                            final_cmds,
-                            Arc::clone(&whitelist),
-                            Arc::clone(&table),
-                            config_log_level,
-                            json_enabled,
-                            rule,
-                            docker_socket_path.clone(),
-                            trigger_msg,
+                            container_id.clone(), try_cmds, final_cmds, Arc::clone(&whitelist), Arc::clone(&table),
+                            config_log_level, json_enabled, rule, docker_socket_path.clone(), trigger_msg,
                         );
                     }
-                    Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => {
+                    _ => {
                         reg.remove(&container_id);
-                        // Deep Forensics: Thread decay cleanup execution scope hook
                         emit_log(
-                            "TRACE",
-                            "worker_lifecycle",
-                            None,
-                            Some(&container_id),
-                            None,
-                            Some("lifecycle_decay"),
-                            "DECOMMISSIONED",
-                            "Worker context inactive past 30s ceiling. Safely flushing channels and clearing registry heap allocation footprints.",
-                            config_log_level,
-                            json_enabled,
+                            "TRACE", "worker_lifecycle", None, Some(&container_id), None, Some("lifecycle_decay"), "DECOMMISSIONED",
+                            "Worker context inactive past 30s ceiling. Safely flushing channels and clearing footprints.",
+                            config_log_level, json_enabled,
                         );
                         break;
                     }
@@ -957,14 +604,8 @@ fn notify_systemd_watchdog() {
     if let Ok(socket_path) = std::env::var("NOTIFY_SOCKET") {
         if !socket_path.is_empty() {
             use std::os::unix::net::UnixDatagram;
-            let resolved_path = if let Some(stripped) = socket_path.strip_prefix('@') {
-                format!("\0{}", stripped)
-            } else {
-                socket_path
-            };
-            if let Ok(socket) = UnixDatagram::unbound() {
-                let _ = socket.send_to(b"WATCHDOG=1\n", resolved_path);
-            }
+            let resolved_path = if let Some(stripped) = socket_path.strip_prefix('@') { format!("\0{}", stripped) } else { socket_path };
+            if let Ok(socket) = UnixDatagram::unbound() { let _ = socket.send_to(b"WATCHDOG=1\n", resolved_path); }
         }
     }
 }
@@ -973,63 +614,31 @@ pub fn notify_systemd_ready() {
     if let Ok(socket_path) = std::env::var("NOTIFY_SOCKET") {
         if !socket_path.is_empty() {
             use std::os::unix::net::UnixDatagram;
-            let resolved_path = if let Some(stripped) = socket_path.strip_prefix('@') {
-                format!("\0{}", stripped)
-            } else {
-                socket_path
-            };
-            if let Ok(socket) = UnixDatagram::unbound() {
-                let _ = socket.send_to(b"READY=1\n", resolved_path);
-            }
+            let resolved_path = if let Some(stripped) = socket_path.strip_prefix('@') { format!("\0{}", stripped) } else { socket_path };
+            if let Ok(socket) = UnixDatagram::unbound() { let _ = socket.send_to(b"READY=1\n", resolved_path); }
         }
     }
 }
 
 #[cfg(unix)]
 fn open_log_safe(dir_path: &Path, file_name: &OsStr) -> std::io::Result<fs::File> {
-    let dir_c = CString::new(dir_path.as_os_str().as_bytes())
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    let file_c = CString::new(file_name.as_bytes())
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let dir_c = CString::new(dir_path.as_os_str().as_bytes()).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let file_c = CString::new(file_name.as_bytes()).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
 
     unsafe {
-        let dir_fd = libc::open(
-            dir_c.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-        );
-        if dir_fd < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
+        let dir_fd = libc::open(dir_c.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC);
+        if dir_fd < 0 { return Err(std::io::Error::last_os_error()); }
 
-        let file_fd = libc::openat(
-            dir_fd,
-            file_c.as_ptr(),
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        );
+        let file_fd = libc::openat(dir_fd, file_c.as_ptr(), libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
         libc::close(dir_fd);
-
-        if file_fd < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
+        if file_fd < 0 { return Err(std::io::Error::last_os_error()); }
 
         Ok(fs::File::from_raw_fd(file_fd))
     }
 }
 
-fn compile_rules(
-    rules: &[crate::config::RuleConfig],
-) -> Vec<(String, Regex, Vec<AtomicAction>, Vec<AtomicAction>)> {
-    rules
-        .iter()
-        .filter_map(|r| {
-            Regex::new(&r.regex_match).ok().map(|compiled| {
-                (
-                    r.name.clone(),
-                    compiled,
-                    r.try_actions.clone(),
-                    r.final_actions.clone(),
-                )
-            })
-        })
-        .collect()
+fn compile_rules(rules: &[crate::config::RuleConfig]) -> Vec<(String, Regex, Vec<AtomicAction>, Vec<AtomicAction>)> {
+    rules.iter().filter_map(|r| {
+        Regex::new(&r.regex_match).ok().map(|compiled| { (r.name.clone(), compiled, r.try_actions.clone(), r.final_actions.clone()) })
+    }).collect()
 }

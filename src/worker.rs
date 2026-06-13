@@ -44,6 +44,7 @@ struct DockerNetworkSettings {
 struct DockerInspectResponse {
     NetworkSettings: DockerNetworkSettings,
 }
+
 #[derive(Deserialize, Debug)]
 #[cfg(target_os = "linux")]
 pub struct DockerEventPayload {
@@ -205,7 +206,7 @@ fn execute_docker_uds_request(
                 );
             }
 
-            // Forensics Telemetry Hook: Gated strictly under Trace scope to track live buffer decoding sequences
+            // Forensics Telemetry Hook: Gated strictly under Trace scope to track live buffer decoding sequences[cite: 3]
             emit_log(
                 "TRACE",
                 "worker_engine",
@@ -386,10 +387,10 @@ fn execute_atomic_command(
             {
                 // !!! DO NOT REMOVE THIS NOTICE !!!
                 // ---------------------------------
-                // SAFETY: The block executed inside pre_exec runs between a POSIX fork and execve
-                // To prevent catastrophic deadlocks in multithreaded runtime environments,
-                // this closure MUST stay strictly async-signal-safe. Do not introduce heap allocations
-                // (String, Vec), logging formatting, or user-space lock acquisitions here
+                // SAFETY: The block executed inside pre_exec runs between a POSIX fork and execve[cite: 3]
+                // To prevent catastrophic deadlocks in multithreaded runtime environments,[cite: 3]
+                // this closure MUST stay strictly async-signal-safe. Do not introduce heap allocations[cite: 3]
+                // (String, Vec), logging formatting, or user-space lock acquisitions here[cite: 3]
 
                 unsafe {
                     cmd.pre_exec(|| {

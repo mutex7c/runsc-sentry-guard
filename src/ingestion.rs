@@ -6,11 +6,13 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, TryRecvError, TrySendError};
+use std::sync::atomic::Ordering;
+use std::sync::mpsc::{Receiver, TryRecvError, TrySendError, sync_channel};
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::thread;
 use std::time::Duration;
+
 use parking_lot::{Mutex, RwLock};
 
 #[cfg(target_os = "linux")]
@@ -24,8 +26,8 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::FromRawFd;
 
 use crate::config::{AtomicAction, GuardConfig, IngestionMode, RegistryMap, WorkerChannelMessage};
-use crate::limiters::{AntiDosState, GlobalRateLimiter};
 use crate::logger::emit_log;
+use crate::limiters::{AntiDosState, GlobalRateLimiter};
 use crate::worker::execute_containment_pipeline;
 
 struct LogDescriptor {
@@ -64,7 +66,8 @@ pub fn start_monitor_loop(config: GuardConfig, shutdown: Arc<AtomicBool>, config
         let stream_shutdown = Arc::clone(&shutdown);
 
         thread::spawn(move || {
-            use std::io::Write;
+            use std::io::{Cursor, Read, Write};
+
             let stream_endpoint = "/events?filters=%7B%22type%22%3A%5B%22container%22%5D%2C%22event%22%3A%5B%22start%22%2C%22die%22%5D%7D";
 
             while !stream_shutdown.load(Ordering::SeqCst) {
@@ -80,31 +83,51 @@ pub fn start_monitor_loop(config: GuardConfig, shutdown: Arc<AtomicBool>, config
                     );
 
                     if stream.write_all(request.as_bytes()).is_ok() {
-                        let mut reader = BufReader::new(stream);
+                        let mut header_buf = [0u8; 8192];
+                        let mut bytes_read = 0;
+                        let mut header_end = 0;
                         let mut status_ok = false;
                         let mut is_chunked = false;
-                        let mut header_count = 0;
 
-                        while header_count < 100 {
-                            let mut header_line = String::new();
-                            if reader.read_line(&mut header_line).is_err() {
+                        // Safely parse headers with httparse
+                        loop {
+                            if bytes_read >= header_buf.len() {
                                 break;
                             }
-                            let trimmed = header_line.trim();
-                            if trimmed.is_empty() {
-                                break;
+                            let n = match stream.read(&mut header_buf[bytes_read..]) {
+                                Ok(n) if n > 0 => n,
+                                _ => break,
+                            };
+                            bytes_read += n;
+
+                            let mut headers = [httparse::EMPTY_HEADER; 64];
+                            let mut res = httparse::Response::new(&mut headers);
+
+                            match res.parse(&header_buf[..bytes_read]) {
+                                Ok(httparse::Status::Complete(body_start_offset)) => {
+                                    header_end = body_start_offset;
+                                    if let Some(code) = res.code {
+                                        if code == 200 { status_ok = true; }
+                                    }
+                                    for header in res.headers {
+                                        let name = header.name.to_lowercase();
+                                        let value = String::from_utf8_lossy(header.value).to_lowercase();
+                                        if name == "transfer-encoding" && value.contains("chunked") {
+                                            is_chunked = true;
+                                        }
+                                    }
+                                    break;
+                                }
+                                Ok(httparse::Status::Partial) => continue,
+                                Err(_) => break,
                             }
-                            if header_line.starts_with("HTTP/1.1 200") || header_line.starts_with("HTTP/1.0 200") {
-                                status_ok = true;
-                            }
-                            let lower = trimmed.to_lowercase();
-                            if lower.starts_with("transfer-encoding:") && lower.contains("chunked") {
-                                is_chunked = true;
-                            }
-                            header_count += 1;
                         }
 
                         if status_ok && is_chunked {
+                            // Safely read standard lines out of the leftover buffer
+                            let leftover = header_buf[header_end..bytes_read].to_vec();
+                            let mut reader = BufReader::new(Cursor::new(leftover).chain(stream));
+
                             let mut chunk_size_buf = String::new();
                             let mut line_buffer = Vec::new();
 
@@ -533,7 +556,6 @@ fn is_container_active_sync(container_id: &str, socket_path: &str) -> bool {
             let mut reader = BufReader::new(stream);
             let mut buf = Vec::new();
 
-            // Apply the standard 8192-byte safety boundary to prevent heap bloat
             if reader.by_ref().take(8192).read_until(b'\n', &mut buf).is_ok() {
                 let line = String::from_utf8_lossy(&buf);
                 return line.contains(" 200 ");
@@ -759,7 +781,6 @@ fn dispatch_to_worker(
                 json_enabled,
             );
 
-            // Bypass the saturated queue and execute critical fallbacks immediately
             let cid_clone = container_id.clone();
             let wl_clone = Arc::clone(&whitelist);
             let tbl_clone = Arc::clone(&table);
@@ -769,7 +790,7 @@ fn dispatch_to_worker(
             thread::spawn(move || {
                 execute_containment_pipeline(
                     cid_clone,
-                    vec![], // Skip standard actions, jump straight to critical containment
+                    vec![],
                     emergency_actions,
                     wl_clone,
                     tbl_clone,

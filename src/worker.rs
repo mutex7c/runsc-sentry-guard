@@ -10,16 +10,17 @@ use std::process::Command;
 use std::sync::Arc;
 
 #[cfg(target_os = "linux")]
-use std::io::BufRead;
-#[cfg(target_os = "linux")]
 use serde::Deserialize;
 #[cfg(target_os = "linux")]
 use std::collections::HashMap;
+#[cfg(target_os = "linux")]
+use std::io::BufRead;
 #[cfg(target_os = "linux")]
 use std::net::IpAddr;
 #[cfg(target_os = "linux")]
 use std::sync::OnceLock;
 
+// Platform-gated import strictly to Linux to eliminate macOS/Windows unused-trait warnings
 #[cfg(target_os = "linux")]
 use std::os::unix::process::CommandExt;
 
@@ -82,6 +83,7 @@ fn read_bounded_line<R: std::io::BufRead>(reader: &mut R, limit: u64) -> Result<
 // Zero-Fork Native HTTP Over Unix Domain Socket Engine (Linux Production Mode Only)
 #[cfg(target_os = "linux")]
 const MAX_UDS_PAYLOAD_SIZE: usize = 10 * 1024 * 1024; // 10 MB Heap Ceiling
+
 #[cfg(target_os = "linux")]
 fn execute_docker_uds_request(
     method: &str,
@@ -89,7 +91,7 @@ fn execute_docker_uds_request(
     body: Option<&str>,
     socket_path: &str,
 ) -> Result<(u16, String)> {
-    use std::io::{BufReader, Read, Write};
+    use std::io::{BufReader, Cursor, Read, Write};
     use std::os::unix::net::UnixStream;
     use std::time::Duration;
 
@@ -125,51 +127,55 @@ fn execute_docker_uds_request(
         .flush()
         .map_err(|e| anyhow!("Failed to flush UDS stream: {}", e))?;
 
-    let mut reader = BufReader::new(stream);
+    let mut header_buf = [0u8; 8192];
+    let mut bytes_read = 0;
 
-    let status_line = read_bounded_line(&mut reader, 8192)?;
-
-    if status_line.is_empty() {
-        bail!("Received completely empty frame stream from container daemon socket.");
-    }
-
-    let status_code = status_line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|code| code.parse::<u16>().ok())
-        .unwrap_or(500);
+    let header_end;
+    let status_code;
 
     let mut is_chunked = false;
     let mut content_length: Option<usize> = None;
 
-    let mut header_count = 0;
-    const MAX_HTTP_HEADERS: usize = 100;
-
+    // Safely read and validate HTTP headers using httparse
     loop {
-        if header_count > MAX_HTTP_HEADERS {
-            bail!("UDS Error: Maximum HTTP header count exceeded. Aborting to prevent thread lockup.");
+        if bytes_read >= header_buf.len() {
+            bail!("UDS Error: HTTP Headers exceeded 8KB maximum boundary.");
         }
 
-        let line = read_bounded_line(&mut reader, 8192)?;
-        let trimmed = line.trim();
-
-        if trimmed.is_empty() {
-            break;
+        let n = stream
+            .read(&mut header_buf[bytes_read..])
+            .map_err(|e| anyhow!("Failed to read UDS stream: {}", e))?;
+        if n == 0 {
+            bail!("UDS Error: Stream closed prematurely.");
         }
+        bytes_read += n;
 
-        let lower_line = trimmed.to_lowercase();
-        if lower_line.starts_with("transfer-encoding:") && lower_line.contains("chunked") {
-            is_chunked = true;
-        }
-        if lower_line.starts_with("content-length:") {
-            let parts: Vec<&str> = trimmed.splitn(2, ':').collect();
-            if parts.len() == 2 {
-                content_length = parts[1].trim().parse::<usize>().ok();
+        let mut headers = [httparse::EMPTY_HEADER; 64];
+        let mut res = httparse::Response::new(&mut headers);
+
+        match res.parse(&header_buf[..bytes_read]) {
+            Ok(httparse::Status::Complete(body_start_offset)) => {
+                header_end = body_start_offset;
+                status_code = res.code.unwrap_or(500);
+                for header in res.headers {
+                    let name = header.name.to_lowercase();
+                    let value = String::from_utf8_lossy(header.value).to_lowercase();
+                    if name == "transfer-encoding" && value.contains("chunked") {
+                        is_chunked = true;
+                    } else if name == "content-length" {
+                        content_length = String::from_utf8_lossy(header.value).trim().parse::<usize>().ok();
+                    }
+                }
+                break;
             }
+            Ok(httparse::Status::Partial) => continue,
+            Err(e) => bail!("UDS Error: Malformed HTTP response format intercepted: {}", e),
         }
-        header_count += 1;
     }
 
+    // Process the remaining body bytes
+    let leftover = header_buf[header_end..bytes_read].to_vec();
+    let mut reader = BufReader::new(Cursor::new(leftover).chain(stream));
     let mut body_payload = String::new();
 
     if is_chunked {
@@ -899,10 +905,6 @@ mod tests {
     }
 }
 
-// Completely closed trust boundary forgery
-// Identity resolution is migrated
-// exclusively to a unified single-pass
-// loop traversing kernel-managed cgroup tracks
 #[cfg(target_os = "linux")]
 pub fn extract_id_from_pid(pid: i32) -> Option<String> {
     use std::fs;
@@ -963,7 +965,6 @@ pub fn cleanup_stale_firewall_elements(config: &crate::config::GuardConfig) {
                         }
                     }
 
-                    // Dispatch a single transactional batch command to the host kernel
                     if !stale_ips.is_empty() {
                         let elements_payload = format!("{{ {} }}", stale_ips.join(", "));
 

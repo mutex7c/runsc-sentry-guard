@@ -2,6 +2,7 @@
 // Handles the secure ingestion, parsing,
 // and type-safe validation of the declarative `config.toml` structure
 
+use regex::Regex;
 use anyhow::{anyhow, Context, Result};
 use ipnet::IpNet;
 use serde::Deserialize;
@@ -104,12 +105,29 @@ pub fn load_config<P: AsRef<Path>>(path: P) -> Result<GuardConfig> {
         return Err(anyhow!("Security Constraint Violation: At least one active detection [[rules]] block must be defined."));
     }
 
+    // Safely bubble up the regex compilation error using ? and anyhow::Context
+    let timeout_regex = Regex::new(r"^\d+[smhd]$")
+        .context("Internal Architecture Error: Failed to compile firewall timeout validation regex")?;
+
     for rule in &config.rules {
         if rule.try_actions.is_empty() && rule.final_actions.is_empty() {
             return Err(anyhow!(
                 "Validation Error: Rule '{}' contains no operational try/final actions.",
                 rule.name
             ));
+        }
+
+        // Enforce strict boot-time validation for firewall payloads
+        let combined_actions = rule.try_actions.iter().chain(rule.final_actions.iter());
+        for action in combined_actions {
+            if let AtomicAction::NftBlacklist { timeout, .. } = action {
+                if !timeout_regex.is_match(timeout) {
+                    return Err(anyhow!(
+                        "Security Constraint Violation: Rule '{}' contains an invalid firewall timeout format: '{}'",
+                        rule.name, timeout
+                    ));
+                }
+            }
         }
     }
 

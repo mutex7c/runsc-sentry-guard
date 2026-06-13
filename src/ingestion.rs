@@ -525,15 +525,18 @@ pub fn start_monitor_loop(config: GuardConfig, shutdown: Arc<AtomicBool>, config
 
 #[cfg(target_os = "linux")]
 fn is_container_active_sync(container_id: &str, socket_path: &str) -> bool {
-    use std::io::Write;
+    use std::io::{Write, Read};
     if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(socket_path) {
         let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
         let request = format!("GET /containers/{}/json HTTP/1.0\r\n\r\n", container_id);
 
         if stream.write_all(request.as_bytes()).is_ok() {
             let mut reader = BufReader::new(stream);
-            let mut line = String::new();
-            if reader.read_line(&mut line).is_ok() {
+            let mut buf = Vec::new();
+
+            // Apply the standard 8192-byte safety boundary to prevent heap bloat
+            if reader.by_ref().take(8192).read_until(b'\n', &mut buf).is_ok() {
+                let line = String::from_utf8_lossy(&buf);
                 return line.contains(" 200 ");
             }
         }
@@ -737,7 +740,7 @@ fn dispatch_to_worker(
         worker_tx
     });
 
-    match tx.try_send((try_actions, final_actions, rule_name.clone(), trigger_message)) {
+    match tx.try_send((try_actions, final_actions.clone(), rule_name.clone(), trigger_message.clone())) {
         Ok(_) => {}
         Err(TrySendError::Full(_)) => {
             emit_log(
@@ -747,10 +750,31 @@ fn dispatch_to_worker(
                 Some(&container_id),
                 None,
                 Some("route"),
-                "DROPPED",
-                "Worker execution queue full. Action dropped to prevent OOM.",
+                "SATURATED",
+                "Worker execution queue full. Engaging emergency synchronous bypass for final actions.",
                 json_enabled,
             );
+
+            // Bypass the saturated queue and execute critical fallbacks immediately
+            let cid_clone = container_id.clone();
+            let wl_clone = Arc::clone(&whitelist);
+            let tbl_clone = Arc::clone(&table);
+            let ds_clone = docker_socket_path.to_string();
+            let emergency_actions = final_actions;
+
+            thread::spawn(move || {
+                execute_containment_pipeline(
+                    cid_clone,
+                    vec![], // Skip standard actions, jump straight to critical containment
+                    emergency_actions,
+                    wl_clone,
+                    tbl_clone,
+                    json_enabled,
+                    rule_name,
+                    ds_clone,
+                    trigger_message,
+                );
+            });
         }
         Err(TrySendError::Disconnected(_)) => {
             emit_log(

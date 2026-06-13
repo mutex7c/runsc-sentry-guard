@@ -951,23 +951,29 @@ pub fn cleanup_stale_firewall_elements(config: &crate::config::GuardConfig) {
 
                 if let Ok(out) = output {
                     let stdout_str = String::from_utf8_lossy(&out.stdout);
+                    let mut stale_ips = Vec::new();
+
                     for line in stdout_str.lines() {
                         if line.contains("comment \"runsc-sentry-guard\"") {
                             if let Some(caps) = ip_regex.captures(line) {
                                 if let Some(matched_ip) = caps.get(0) {
-                                    let ip_str = matched_ip.as_str();
-                                    let element_payload = format!("{{ {} }}", ip_str);
-
-                                    let _ = Command::new("nft")
-                                        .arg("delete")
-                                        .arg("element")
-                                        .args(table.split_whitespace())
-                                        .arg(set_name)
-                                        .arg(&element_payload)
-                                        .status();
+                                    stale_ips.push(matched_ip.as_str().to_string());
                                 }
                             }
                         }
+                    }
+
+                    // Dispatch a single transactional batch command to the host kernel
+                    if !stale_ips.is_empty() {
+                        let elements_payload = format!("{{ {} }}", stale_ips.join(", "));
+
+                        let _ = Command::new("nft")
+                            .arg("delete")
+                            .arg("element")
+                            .args(table.split_whitespace())
+                            .arg(set_name)
+                            .arg(&elements_payload)
+                            .status();
                     }
                 }
             }

@@ -1,5 +1,4 @@
 // Ingestion Pipeline Engine
-
 // Operates fast file tailers and parallel UDS socket tracking pipelines
 // Features active DoS-resistant TOCTOU mitigations, SO_PEERCRED trust boundaries, and lock safety
 
@@ -22,6 +21,9 @@ use std::ffi::{CString, OsStr};
 use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
 use std::os::unix::io::FromRawFd;
+
+// Import AtomicBool layer mapping for structural coordination references
+use std::sync::atomic::AtomicBool;
 
 use crate::config::{AtomicAction, GuardConfig, IngestionMode};
 use crate::logger::emit_log;
@@ -49,7 +51,7 @@ const MAX_NEGATIVE_CACHE: usize = 1000;
 #[allow(dead_code)]
 const MAX_LOOKUP_TOKENS: u32 = 10; // Max API queries per second for unknown IDs
 
-pub fn start_monitor_loop(config: GuardConfig) {
+pub fn start_monitor_loop(config: GuardConfig, shutdown: Arc<AtomicBool>) {
     let mode = &config.monitor.mode;
     let json_enabled = config.monitor.json_logging_enabled;
     let docker_socket_path = config.monitor.docker_socket_path.clone();
@@ -61,8 +63,12 @@ pub fn start_monitor_loop(config: GuardConfig) {
 
     // Spawn a dedicated, decoupled watchdog heartbeat thread
     if watchdog_interval > 0 {
+        // Capture shutdown context mapping references inside thread bounds
+        let watchdog_shutdown = Arc::clone(&shutdown);
         thread::spawn(move || {
-            loop {
+
+            // Terminate loop checks immediately when token flag updates to true
+            while !watchdog_shutdown.load(Ordering::SeqCst) {
                 notify_systemd_watchdog();
                 thread::sleep(Duration::from_millis(watchdog_interval));
             }
@@ -86,13 +92,16 @@ pub fn start_monitor_loop(config: GuardConfig) {
         let cache_clone = Arc::clone(&active_containers);
         let ds_path = docker_socket_path.clone();
 
+        let stream_shutdown = Arc::clone(&shutdown);
+
         thread::spawn(move || {
             use std::io::Write;
 
             // Target container filter query string explicitly tracking asset creation and destruction
             let stream_endpoint = "/events?filters=%7B%22type%22%3A%5B%22container%22%5D%2C%22event%22%3A%5B%22start%22%2C%22die%22%5D%7D";
 
-            loop {
+            // Bound connection monitoring tracking loop to the state token boundary
+            while !stream_shutdown.load(Ordering::SeqCst) {
                 if let Ok(mut stream) = UnixStream::connect(&ds_path) {
 
                     // Re-seed active container cache
@@ -143,7 +152,8 @@ pub fn start_monitor_loop(config: GuardConfig) {
                             // to accumulate fragments across boundary straddles
                             let mut line_buffer = Vec::new();
 
-                            loop {
+                            // Map state checks inside the line fragment unwrapper iteration loops
+                            while !stream_shutdown.load(Ordering::SeqCst) {
                                 chunk_size_buf.clear();
                                 if reader.read_line(&mut chunk_size_buf).is_err() {
                                     break;
@@ -212,6 +222,11 @@ pub fn start_monitor_loop(config: GuardConfig) {
                         }
                     }
                 }
+                // Prevent retry sleep loops from spawning after shutdown requests execute
+                if stream_shutdown.load(Ordering::SeqCst) {
+                    break;
+                }
+
                 // Secure connection retry backing delay handling socket crashes gracefully
                 thread::sleep(Duration::from_secs(1));
             }
@@ -250,6 +265,7 @@ pub fn start_monitor_loop(config: GuardConfig) {
         let uds_socket_path = docker_socket_path.clone();
         let uds_cache = Arc::clone(&active_containers);
         let uds_anti_dos = Arc::clone(&anti_dos_state);
+        let uds_shutdown = Arc::clone(&shutdown);
 
         thread::spawn(move || {
             run_uds_server(
@@ -262,6 +278,7 @@ pub fn start_monitor_loop(config: GuardConfig) {
                 uds_socket_path,
                 uds_cache,
                 uds_anti_dos,
+                uds_shutdown,
             );
         });
     }
@@ -278,9 +295,11 @@ pub fn start_monitor_loop(config: GuardConfig) {
             "Out-of-band UDS streaming receiver active. Filesystem parsing idle.",
             json_enabled,
         );
-        loop {
-            thread::park();
+
+        while !shutdown.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(250));
         }
+        return;
     }
 
     emit_log(
@@ -299,7 +318,7 @@ pub fn start_monitor_loop(config: GuardConfig) {
         notify_systemd_ready();
     }
 
-    loop {
+    while !shutdown.load(Ordering::SeqCst) {
         let log_dir_path = Path::new(&config.monitor.log_dir);
 
         if !log_dir_path.exists() {
@@ -544,6 +563,7 @@ fn run_uds_server(
     docker_socket_path: String,
     active_containers: Arc<RwLock<HashSet<String>>>,
     anti_dos_state: Arc<Mutex<AntiDosState>>,
+    shutdown: Arc<AtomicBool>, // CHANGED: Added tracking argument parameters to accept coordinates
 ) {
     let socket_path = "/var/run/runsc-sentry-guard.sock";
     let _ = fs::remove_file(socket_path);
@@ -584,69 +604,93 @@ fn run_uds_server(
         return;
     }
 
+    if listener.set_nonblocking(true).is_err() {
+        emit_log(
+            "ERROR",
+            "uds_server",
+            None,
+            None,
+            None,
+            None,
+            "CRASH",
+            "Failed to transition tracking socket boundaries into non-blocking context modes.",
+            json_enabled,
+        );
+        return;
+    }
+
     notify_systemd_ready();
 
     let active_connections = Arc::new(AtomicUsize::new(0));
     const MAX_UDS_CONNECTIONS: usize = 50;
 
-    for stream in listener.incoming() {
-        if let Ok(stream) = stream {
+    while !shutdown.load(Ordering::SeqCst) {
+        match listener.accept() {
+            Ok((stream, _)) => {
 
-            // Extract Peer Credentials using raw libc to bypass unstable std features
-            #[cfg(target_os = "linux")]
-            {
-                if let Ok(peer_uid) = get_peer_uid(&stream) {
-                    // Reject connection if not root (or map specifically to 'docker' group if required)
-                    if peer_uid != 0 {
-                        emit_log(
-                            "WARN",
-                            "uds_server",
-                            None,
-                            None,
-                            None,
-                            Some("trust_boundary"),
-                            "REJECTED",
-                            &format!("Unauthorized UID {} attempted UDS connection. Payload dropped.", peer_uid),
-                            json_enabled,
-                        );
-                        continue;
+                // Extract Peer Credentials using raw libc to bypass unstable std features
+                #[cfg(target_os = "linux")]
+                {
+                    if let Ok(peer_uid) = get_peer_uid(&stream) {
+                        // Reject connection if not root (or map specifically to 'docker' group if required)
+                        if peer_uid != 0 {
+                            emit_log(
+                                "WARN",
+                                "uds_server",
+                                None,
+                                None,
+                                None,
+                                Some("trust_boundary"),
+                                "REJECTED",
+                                &format!("Unauthorized UID {} attempted UDS connection. Payload dropped.", peer_uid),
+                                json_enabled,
+                            );
+                            continue;
+                        }
+                    } else {
+                        continue; // Drop unverified origins safely
                     }
-                } else {
-                    continue; // Drop unverified origins safely
                 }
+
+                if active_connections.load(Ordering::SeqCst) >= MAX_UDS_CONNECTIONS {
+                    continue;
+                }
+
+                active_connections.fetch_add(1, Ordering::SeqCst);
+                let conn_tracker = Arc::clone(&active_connections);
+
+                let reg_clone = Arc::clone(&registry);
+                let rules_clone = Arc::clone(&regex_rules);
+                let id_clone = id_extractor.clone();
+                let wl_clone = Arc::clone(&whitelist);
+                let tbl_clone = Arc::clone(&table);
+                let ds_path_clone = docker_socket_path.clone();
+                let cache_clone = Arc::clone(&active_containers);
+                let dos_clone = Arc::clone(&anti_dos_state);
+
+                thread::spawn(move || {
+                    let _guard = ConnectionGuard(conn_tracker);
+                    handle_uds_stream(
+                        stream,
+                        reg_clone,
+                        rules_clone,
+                        id_clone,
+                        wl_clone,
+                        tbl_clone,
+                        json_enabled,
+                        ds_path_clone,
+                        cache_clone,
+                        dos_clone,
+                    );
+                });
             }
-
-            if active_connections.load(Ordering::SeqCst) >= MAX_UDS_CONNECTIONS {
-                continue;
+            // Handle standard non-blocking return sequences to cycle validation passes safely
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(50));
             }
-
-            active_connections.fetch_add(1, Ordering::SeqCst);
-            let conn_tracker = Arc::clone(&active_connections);
-
-            let reg_clone = Arc::clone(&registry);
-            let rules_clone = Arc::clone(&regex_rules);
-            let id_clone = id_extractor.clone();
-            let wl_clone = Arc::clone(&whitelist);
-            let tbl_clone = Arc::clone(&table);
-            let ds_path_clone = docker_socket_path.clone();
-            let cache_clone = Arc::clone(&active_containers);
-            let dos_clone = Arc::clone(&anti_dos_state);
-
-            thread::spawn(move || {
-                let _guard = ConnectionGuard(conn_tracker);
-                handle_uds_stream(
-                    stream,
-                    reg_clone,
-                    rules_clone,
-                    id_clone,
-                    wl_clone,
-                    tbl_clone,
-                    json_enabled,
-                    ds_path_clone,
-                    cache_clone,
-                    dos_clone,
-                );
-            });
+            Err(_) => {
+                break;
+            }
         }
     }
 }

@@ -7,6 +7,7 @@ ip_whitelist = ["127.0.0.1/32", "10.11.11.0/24", "192.168.3.0/24"]
 nftables_default_table = "inet security_ops"
 json_logging_enabled = true
 systemd_watchdog_interval_ms = 5000
+flush_firewall_on_shutdown = false
 
 [[rules]]
 name = "unauthorized_interactive_shells"

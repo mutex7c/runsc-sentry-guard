@@ -1,8 +1,6 @@
 // Configuration Engine Module
 // Handles the secure ingestion, parsing,
 // and type-safe validation of the declarative `config.toml` structure
-// Enforces strict schema validations
-// via Serde to ensure safe startup aborts on anomaly detection
 
 use anyhow::{anyhow, Context, Result};
 use ipnet::IpNet;
@@ -59,6 +57,7 @@ pub struct MonitorConfig {
     pub json_logging_enabled: bool,
     pub docker_socket_path: String,
     pub systemd_watchdog_interval_ms: u64,
+    pub flush_firewall_on_shutdown: bool,
 }
 
 // Threat Identification Rules Mapping Signatures to Incident Containment Playbooks
@@ -66,7 +65,6 @@ pub struct MonitorConfig {
 #[serde(deny_unknown_fields)]
 pub struct RuleConfig {
     pub name: String,
-    // Preserved to support declarative glob patterns in infrastructure manifests
     #[allow(dead_code)]
     pub file_pattern: String,
     pub regex_match: String,
@@ -74,7 +72,7 @@ pub struct RuleConfig {
     pub final_actions: Vec<AtomicAction>,
 }
 
-// Root Node Structure for the Entire Configuration Manifest Mapping.
+// Root Node Structure for Configuration Manifest Mapping
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GuardConfig {
@@ -82,9 +80,6 @@ pub struct GuardConfig {
     pub rules: Vec<RuleConfig>,
 }
 
-// Fail-Safe Configuration Loader
-// Securely reads the raw profile manifest from the host system,
-// executing deep structural syntax validations
 pub fn load_config<P: AsRef<Path>>(path: P) -> Result<GuardConfig> {
     let path_ref = path.as_ref();
 
@@ -137,6 +132,7 @@ mod tests {
             json_logging_enabled = true
             docker_socket_path = "/var/run/docker.sock"
             systemd_watchdog_interval_ms = 5000
+            flush_firewall_on_shutdown = false
 
             [[rules]]
             name = "test_rule"
@@ -162,7 +158,6 @@ mod tests {
         let result = load_config("/path/that/absolutely/does/not/exist/config.toml");
         assert!(result.is_err());
 
-        // Extract the error and convert it to a string to verify the context
         let err_msg = result.unwrap_err().to_string();
         assert!(err_msg.contains("Configuration missing, inaccessible, or tampered"));
     }

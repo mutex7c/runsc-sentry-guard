@@ -21,14 +21,12 @@ sudo journalctl -u runsc-sentry-guard -f
 
 **Objective:** Verify that the Token Bucket rate limiter and Negative Cache successfully intercept a massive flood of spoofed container IDs without saturating the Docker API or locking the worker threads.
 
-**Execution:**
-Run this bash script to violently flood the ingestion directory with 5,000 unique, malformed container IDs containing a malicious shell signature.
+**Execution:** Run this bash script to violently flood the ingestion directory with 5,000 unique, malformed container IDs containing a malicious shell signature.
 
 ```bash
 #!/bin/bash
 echo "[TEST] Initiating API Exhaustion Flood..."
 for i in {1..5000}; do
-  # Generate a sequential padded ID (e.g., 000000000001)
   FAKE_ID=$(printf "%012d" "$i")
   echo "execve(/bin/sh) --id=${FAKE_ID}" >> /var/log/gvisor/flood_test.boot
 done
@@ -45,14 +43,10 @@ echo "[TEST] Flood complete."
 
 **Objective:** Verify that unprivileged local processes (e.g., a container escapee) cannot inject fabricated telemetry directly into the Unix Domain Socket to trigger false-positive isolations.
 
-**Execution:**
-Switch to a standard, non-root user account and attempt to write directly to the daemon's UDS socket utilizing `socat`.
+**Execution:** Switch to a standard, non-root user account and attempt to write directly to the daemon's UDS socket utilizing `socat`.
 
 ```bash
-# Switch to an unprivileged user
 su - unprivileged_user
-
-# Attempt to stream a fake payload to the protected socket
 echo 'execve(/bin/nc) --id=valid_container_id_here' | socat - UNIX-CONNECT:/var/run/runsc-sentry-guard.sock
 ```
 
@@ -72,10 +66,7 @@ echo 'execve(/bin/nc) --id=valid_container_id_here' | socat - UNIX-CONNECT:/var/
 3. Manually trigger a malicious signature inside the container's namespace:
 
 ```bash
-# Get the container ID
 CID=$(docker run -d --runtime=runsc alpine sleep 3600)
-
-# Simulate a malicious interactive shell launch
 docker exec $CID /bin/sh -c "nc -l -p 4444"
 ```
 
@@ -89,8 +80,7 @@ docker exec $CID /bin/sh -c "nc -l -p 4444"
 
 **Objective:** Verify that the worker registry caps thread spawning at the `MAX_WORKERS` ceiling (100 threads) to prevent out-of-memory (OOM) host crashes.
 
-**Execution:**
-This requires configuring a mock rule that executes a long-running `run_custom_script` (e.g., a script containing `sleep 10`). Trigger that rule simultaneously across 105 distinct, valid container contexts.
+**Execution:** This requires configuring a mock rule that executes a long-running `run_custom_script` (e.g., a script containing `sleep 10`). Trigger that rule simultaneously across 105 distinct, valid container contexts.
 
 **Expected Result:**
 
@@ -123,9 +113,30 @@ This requires configuring a mock rule that executes a long-running `run_custom_s
 2. Execute a single command that creates a container and immediately triggers a known malicious signature within the same millisecond:
 
 ```bash
-   docker run --rm --runtime=runsc alpine sh -c "nc -l -p 4444"
+docker run --rm --runtime=runsc alpine sh -c "nc -l -p 4444"
 ```
+
 **Expected Result:**
 
 1. The journal must provide clear telemetry on whether the payload was caught.
 2. If the payload is captured, verify whether it was resolved via the primary cache (meaning the UDS stream beat the file tailer) or if it required a synchronous fallback lookup via the Anti-DoS queue. If it is dropped, this establishes the strict baseline latency required for production `check_interval_ms` tuning.
+
+### Scenario G: Graceful Shutdown & Configuration-Driven Firewall Flush
+
+**Objective:** Verify that the daemon hooks native OS signals (`SIGINT`, `SIGTERM`) cleanly, terminates ingest workers without leaking state loops, and conditionally purges host `nftables` isolation rules according to configuration profiles.
+
+**Execution:**
+
+1. Provision `config.toml` to declare `flush_firewall_on_shutdown = true`.
+2. Generate an active incident context using Scenario C to populate a target blacklist set inside `nftables`.
+3. Forcefully dispatch a termination signal command directly straight onto the active process handle:
+
+```bash
+sudo systemctl stop runsc-sentry-guard
+```
+
+**Expected Result:**
+
+1. The engine journal must cleanly output `[INFO] ... Decommissioning sequence initialized. Processing cleanup contexts.`.
+2. The daemon must exit with status `0` without leaving hanging background socket listeners or thread leaks behind.
+3. Query `sudo nft list ruleset` on the host processor interface; the target isolation blacklist set elements must be entirely cleared out, confirming the completion of the configuration-driven post-termination purge.

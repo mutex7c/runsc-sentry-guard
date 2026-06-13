@@ -670,7 +670,8 @@ fn execute_firewall_mutation(
     }
 
     // Safely construct the final nftables element block
-    let element_payload = format!("{{ {} timeout {} }}", ip, timeout);
+    // Appended tracking metadata comment payload to allow deterministic post-crash discovery
+    let element_payload = format!("{{ {} timeout {} comment \"runsc-sentry-guard\" }}", ip, timeout);
 
     // Split the table string (e.g., "inet security_ops") into discrete string tokens
     // to prevent execve from rejecting the command as a single malformed argument.

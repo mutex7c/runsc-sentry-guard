@@ -45,6 +45,10 @@ pub enum IngestionMode {
     Dual,
 }
 
+fn default_max_workers() -> usize {
+    100
+}
+
 // Global Daemon Engine Metric Parameters
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -58,6 +62,8 @@ pub struct MonitorConfig {
     pub docker_socket_path: String,
     pub systemd_watchdog_interval_ms: u64,
     pub flush_firewall_on_shutdown: bool,
+    #[serde(default = "default_max_workers")]
+    pub max_workers: usize,
 }
 
 // Threat Identification Rules Mapping Signatures to Incident Containment Playbooks

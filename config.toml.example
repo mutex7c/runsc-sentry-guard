@@ -8,6 +8,7 @@ nftables_default_table = "inet security_ops"
 json_logging_enabled = true
 systemd_watchdog_interval_ms = 5000
 flush_firewall_on_shutdown = false
+max_workers = 100
 
 [[rules]]
 name = "unauthorized_interactive_shells"

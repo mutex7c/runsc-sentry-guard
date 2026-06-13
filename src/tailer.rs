@@ -1,4 +1,5 @@
 // Ingestion Pipeline Engine
+
 // Operates fast file tailers and parallel UDS socket tracking pipelines
 // Features active DoS-resistant TOCTOU mitigations, SO_PEERCRED trust boundaries, and lock safety
 
@@ -56,6 +57,7 @@ pub fn start_monitor_loop(config: GuardConfig, shutdown: Arc<AtomicBool>) {
     let json_enabled = config.monitor.json_logging_enabled;
     let docker_socket_path = config.monitor.docker_socket_path.clone();
     let watchdog_interval = config.monitor.systemd_watchdog_interval_ms;
+    let max_workers = config.monitor.max_workers;
 
     // Prevent expensive heap cloning during incident routing
     let whitelist = Arc::new(config.monitor.ip_whitelist);
@@ -284,6 +286,7 @@ pub fn start_monitor_loop(config: GuardConfig, shutdown: Arc<AtomicBool>) {
                 uds_cache,
                 uds_anti_dos,
                 uds_shutdown,
+                max_workers,
             );
         });
     }
@@ -496,6 +499,7 @@ pub fn start_monitor_loop(config: GuardConfig, shutdown: Arc<AtomicBool>) {
                                         true,
                                         &active_containers,
                                         &anti_dos_state,
+                                        max_workers,
                                     );
                                 }
                                 start_pos = end_pos + 1;
@@ -599,6 +603,7 @@ fn run_uds_server(
     active_containers: Arc<RwLock<HashSet<String>>>,
     anti_dos_state: Arc<Mutex<AntiDosState>>,
     shutdown: Arc<AtomicBool>,
+    max_workers: usize,
 ) {
     let socket_path = "/var/run/runsc-sentry-guard.sock";
     let _ = fs::remove_file(socket_path);
@@ -735,6 +740,7 @@ fn run_uds_server(
                         cache_clone,
                         dos_clone,
                         cid_socket_clone,
+                        max_workers,
                     );
                 });
             }
@@ -761,6 +767,7 @@ fn handle_uds_stream(
     active_containers: Arc<RwLock<HashSet<String>>>,
     anti_dos_state: Arc<Mutex<AntiDosState>>,
     socket_container_id: Option<String>,
+    max_workers: usize,
 ) {
     if let Err(e) = stream.set_read_timeout(Some(Duration::from_millis(100))) {
         emit_log(
@@ -825,6 +832,7 @@ fn handle_uds_stream(
                     false,
                     &active_containers,
                     &anti_dos_state,
+                    max_workers,
                 );
             }
             Err(_) => break,
@@ -866,6 +874,7 @@ fn evaluate_line_signatures(
     is_from_file: bool,
     active_containers: &Arc<RwLock<HashSet<String>>>,
     anti_dos_state: &Arc<Mutex<AntiDosState>>,
+    max_workers: usize,
 ) {
     // Consume variables on non-Linux targets to silence compiler warnings
     #[cfg(not(target_os = "linux"))]
@@ -978,6 +987,7 @@ fn evaluate_line_signatures(
                 json_enabled,
                 docker_socket_path,
                 line.to_string(),
+                max_workers,
             );
         }
     }
@@ -994,9 +1004,8 @@ fn dispatch_to_worker(
     json_enabled: bool,
     docker_socket_path: &str,
     trigger_message: String,
+    max_workers: usize,
 ) {
-    const MAX_WORKERS: usize = 100;
-
     // FAST PATH: Acquire parallel, non-blocking read lock to pass telemetry frames on active mailboxes
     {
         let reg_read = registry
@@ -1014,7 +1023,7 @@ fn dispatch_to_worker(
         .expect("CRITICAL: Worker registry lock poisoned. Aborting.");
 
     // Double-Checked Locking Pattern validation check
-    if !reg_write.contains_key(&container_id) && reg_write.len() >= MAX_WORKERS {
+    if !reg_write.contains_key(&container_id) && reg_write.len() >= max_workers {
         emit_log(
             "CRITICAL",
             "orchestrator",

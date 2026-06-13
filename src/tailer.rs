@@ -52,6 +52,54 @@ const MAX_NEGATIVE_CACHE: usize = 1000;
 #[allow(dead_code)]
 const MAX_LOOKUP_TOKENS: u32 = 10; // Max API queries per second for unknown IDs
 
+// Global Rate Limiting Tracker to protect host CPU against regex-exhaustion log-flooding DoS attacks
+struct GlobalRateLimiter {
+    state: Mutex<(Instant, usize)>,
+    last_warning: Mutex<Instant>,
+    max_per_second: usize,
+}
+
+impl GlobalRateLimiter {
+    fn new(max_per_second: usize) -> Self {
+        Self {
+            state: Mutex::new((Instant::now(), 0)),
+            last_warning: Mutex::new(Instant::now() - Duration::from_secs(5)),
+            max_per_second,
+        }
+    }
+
+    /// Attempts to consume a token window slot. Returns true if allowed.
+    fn acquire(&self) -> bool {
+        let mut guard = self.state.lock().expect("Global rate limiter lock poisoned");
+        let now = Instant::now();
+
+        // Reset the window bucket count if a full second has passed
+        if now.duration_since(guard.0) >= Duration::from_secs(1) {
+            guard.0 = now;
+            guard.1 = 0;
+        }
+
+        if guard.1 < self.max_per_second {
+            guard.1 += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Rate-limits the warning log itself to once every 5 seconds to avoid log bloat.
+    fn should_warn(&self) -> bool {
+        let mut guard = self.last_warning.lock().expect("Rate limiter warning lock poisoned");
+        let now = Instant::now();
+        if now.duration_since(*guard) >= Duration::from_secs(5) {
+            *guard = now;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 pub fn start_monitor_loop(config: GuardConfig, shutdown: Arc<AtomicBool>, config_path: String) {
     let mode = &config.monitor.mode;
     let json_enabled = config.monitor.json_logging_enabled;
@@ -87,6 +135,9 @@ pub fn start_monitor_loop(config: GuardConfig, shutdown: Arc<AtomicBool>, config
         tokens: MAX_LOOKUP_TOKENS,
         last_refill: Instant::now(),
     }));
+
+    // Establish a global 10,000 events/sec baseline ingestion ceiling
+    let global_limiter = Arc::new(GlobalRateLimiter::new(10000));
 
     // Detached event-driven background thread utilizing zero-delay socket streaming context
     #[cfg(target_os = "linux")]
@@ -317,6 +368,7 @@ pub fn start_monitor_loop(config: GuardConfig, shutdown: Arc<AtomicBool>, config
         let uds_cache = Arc::clone(&active_containers);
         let uds_anti_dos = Arc::clone(&anti_dos_state);
         let uds_shutdown = Arc::clone(&shutdown);
+        let limiter_clone = Arc::clone(&global_limiter); // CHANGED: Cloned rate limiter reference
 
         thread::spawn(move || {
             run_uds_server(
@@ -331,6 +383,7 @@ pub fn start_monitor_loop(config: GuardConfig, shutdown: Arc<AtomicBool>, config
                 uds_anti_dos,
                 uds_shutdown,
                 max_workers,
+                limiter_clone,
             );
         });
     }
@@ -546,6 +599,7 @@ pub fn start_monitor_loop(config: GuardConfig, shutdown: Arc<AtomicBool>, config
                                         &active_containers,
                                         &anti_dos_state,
                                         max_workers,
+                                        &global_limiter,
                                     );
                                 }
                                 start_pos = end_pos + 1;
@@ -650,6 +704,7 @@ fn run_uds_server(
     anti_dos_state: Arc<Mutex<AntiDosState>>,
     shutdown: Arc<AtomicBool>,
     max_workers: usize,
+    global_limiter: Arc<GlobalRateLimiter>,
 ) {
     let socket_path = "/var/run/runsc-sentry-guard.sock";
     let _ = fs::remove_file(socket_path);
@@ -771,6 +826,7 @@ fn run_uds_server(
                 let cache_clone = Arc::clone(&active_containers);
                 let dos_clone = Arc::clone(&anti_dos_state);
                 let cid_socket_clone = socket_container_id.clone();
+                let limiter_clone = Arc::clone(&global_limiter);
 
                 thread::spawn(move || {
                     let _guard = ConnectionGuard(conn_tracker);
@@ -787,6 +843,7 @@ fn run_uds_server(
                         dos_clone,
                         cid_socket_clone,
                         max_workers,
+                        limiter_clone,
                     );
                 });
             }
@@ -804,7 +861,7 @@ fn run_uds_server(
 fn handle_uds_stream(
     stream: UnixStream,
     registry: Arc<RwLock<RegistryMap>>,
-    regex_rules: Arc<RwLock<Vec<(String, Regex, Vec<AtomicAction>, Vec<AtomicAction>)>>>, // CHANGED: Fixed type wrapper matching signature maps
+    regex_rules: Arc<RwLock<Vec<(String, Regex, Vec<AtomicAction>, Vec<AtomicAction>)>>>,
     id_extractor: Regex,
     whitelist: Arc<Vec<ipnet::IpNet>>,
     table: Arc<String>,
@@ -814,6 +871,7 @@ fn handle_uds_stream(
     anti_dos_state: Arc<Mutex<AntiDosState>>,
     socket_container_id: Option<String>,
     max_workers: usize,
+    global_limiter: Arc<GlobalRateLimiter>,
 ) {
     if let Err(e) = stream.set_read_timeout(Some(Duration::from_millis(100))) {
         emit_log(
@@ -881,6 +939,7 @@ fn handle_uds_stream(
                     &active_containers,
                     &anti_dos_state,
                     max_workers,
+                    &global_limiter,
                 );
             }
             Err(_) => break,
@@ -923,7 +982,27 @@ fn evaluate_line_signatures(
     active_containers: &Arc<RwLock<HashSet<String>>>,
     anti_dos_state: &Arc<Mutex<AntiDosState>>,
     max_workers: usize,
+    global_limiter: &GlobalRateLimiter,
 ) {
+    // Early Abort check: Drop processing immediately if the
+    // global ceiling is exhausted, saving valuable host CPU cycles
+    if !global_limiter.acquire() {
+        if global_limiter.should_warn() {
+            emit_log(
+                "WARN",
+                "orchestrator",
+                None,
+                None,
+                None,
+                Some("rate_limit"),
+                "THROTTLED",
+                "Global log ingestion rate ceiling reached. Dropping excess streams to preserve host CPU.",
+                json_enabled,
+            );
+        }
+        return;
+    }
+
     // Consume variables on non-Linux targets to silence compiler warnings
     #[cfg(not(target_os = "linux"))]
     {

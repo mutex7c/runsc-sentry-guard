@@ -119,3 +119,85 @@ echo "[EXT-HOOK] Raw Log Signature Match: ${RAW_LOG_TRIGGER}"
 # Example Automation Action: Dump standard container logs to out-of-band space
 docker logs "${TARGET_CONTAINER_ID}" > "/var/log/forensics/incident-${TARGET_CONTAINER_ID}.log" 2>&1
 ```
+
+## 5. Host-Side nftables Policy Layouts
+
+> ⚠️ **ARCHITECTURAL BOUNDARY WARNING**
+> The `runsc-sentry-guard` daemon operates strictly as an **out-of-band set populator**. When an incident response pipeline triggers, the engine appends the container's internal bridge IP address directly into a named kernel set.
+>
+>
+> The daemon **does not** create base tables, routing chains, or packet-filtering hooks on the host. Firewall policy enforcement is entirely delegated to the system supervisor. Implementing overly broad filtering postures risks inflicting an accidental self-inflicted Denial of Service (DoS) on legitimate, concurrent user sessions running within the same compromised namespace.
+>
+>
+
+To prevent collateral damage, administrators must deploy surgical packet-filtering layouts on the host network edge. The following three blueprints use the daemon's default `inet security_ops` table and `container_blacklist` set references to achieve varying security profiles.
+
+### ### Blueprint A: Total Isolation (Air-Gap Containment)
+
+* **Use Case:** Maximum containment severity. Completely severs all inbound, outbound, and inter-container network connectivity for the compromised container instantly.
+
+* **Impact:** High blast radius. Best suited for highly critical data-leak environments where active forensic preservation is preferred over application availability.
+
+```text
+table inet security_ops {
+    set container_blacklist {
+        type ipv4_addr
+        flags timeout
+    }
+
+    chain forward {
+        type filter hook forward priority filter; policy accept;
+
+        # Drop ALL traffic to and from the quarantined container IP
+        ip saddr @container_blacklist drop
+        ip daddr @container_blacklist drop
+    }
+}
+```
+
+### ### Blueprint B: Outbound Suppression (Egress Quarantine)
+
+* **Use Case:** Neutralizes reverse shells, out-of-band data exfiltration, and lateral internal network scanning.
+
+* **Impact:** Controlled blast radius. Allows the container to continue receiving or responding to incoming ingress traffic normally, preserving external application uptime while stopping the compromise from spreading outward.
+
+```text
+table inet security_ops {
+    set container_blacklist {
+        type ipv4_addr
+        flags timeout
+    }
+
+    chain forward {
+        type filter hook forward priority filter; policy accept;
+        
+        # Block ONLY traffic originating FROM the container going OUT
+        ip saddr @container_blacklist drop
+    }
+}
+```
+
+### ### Blueprint C: Connection-Tracking State Filtration (Zero-Collateral)
+
+* **Use Case:** Highly recommended for dense, high-traffic production application nodes. Bypasses the "crossfire" dilemma entirely.
+
+* **Impact:** Zero blast radius for valid users. Uses the Linux kernel connection tracking (`conntrack`) subsystem to permit already-established, legitimate user sessions (`established,related`) to complete their lifecycles seamlessly. Concurrently, it blocks the container from initializing **any** fresh outbound socket requests, trapping reverse shell dial-backs or malicious command-and-control (C2) setups instantly.
+
+```text
+table inet security_ops {
+    set container_blacklist {
+        type ipv4_addr
+        flags timeout
+    }
+
+    chain forward {
+        type filter hook forward priority filter; policy accept;
+
+        # Allow active, pre-existing connections to complete safely
+        ct state established,related accept
+
+        # Drop any NEW connections initiated by the flagged container IP
+        ip saddr @container_blacklist ct state new drop
+    }
+}
+```

@@ -10,10 +10,18 @@ Ensure your service file contains these defensive parameters:
 
 ```ini
 [Service]
-ExecStart=/usr/sbin/runsc-sentry-guard
+Type=notify
 User=root
+WorkingDirectory=/var/log/gvisor
+ExecStart=$BIN_DEST
+Restart=always
+RestartSec=3
+WatchdogSec=10
 
-# File System Restrictions
+# Security Hardening & Sandboxing Matrix
+NoNewPrivileges=true
+CapabilityBoundingSet=CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_ADMIN
 ProtectSystem=strict
 ProtectHome=yes
 ReadWritePaths=/var/log/gvisor /var/run/
@@ -21,15 +29,6 @@ ProtectControlGroups=yes
 ProtectKernelModules=yes
 ProtectKernelTunables=yes
 PrivateTmp=yes
-
-# Linux Kernel Capability Restrictions
-CapabilityBoundingSet=CAP_NET_ADMIN
-AmbientCapabilities=CAP_NET_ADMIN
-NoNewPrivileges=true
-
-# System Call Filters (Built-in Seccomp engine)
-SystemCallFilter=@system-service
-SystemCallFilter=~@privileged @resources @mount
 ```
 
 ## 2. AppArmor Security Profile
@@ -51,6 +50,10 @@ Create `/etc/apparmor.d/usr.sbin.runsc-sentry-guard`:
   # Strict directory access rules
   /var/log/gvisor/ r,
   /var/log/gvisor/** r,
+  
+  # Allow the daemon to read foreign process command lines
+  # This lets the UDS track securely resolve true container identities
+  /proc/[0-9]*/cmdline r,
   
   # Allow execution of Docker and Nftables control commands
   /usr/bin/docker rcx,

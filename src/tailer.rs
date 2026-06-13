@@ -95,8 +95,7 @@ pub fn start_monitor_loop(config: GuardConfig) {
             loop {
                 if let Ok(mut stream) = UnixStream::connect(&ds_path) {
 
-                    // Re-seed the cache immediately upon initial connection and
-                    // any subsequent reconnection, to prevent state drift blind spots
+                    // Re-seed active container cache
                     let current_ids = crate::worker::fetch_running_container_ids(&ds_path);
                     if let Ok(mut guard) = cache_clone.write() {
                         *guard = current_ids;
@@ -140,6 +139,10 @@ pub fn start_monitor_loop(config: GuardConfig) {
                         if status_ok && is_chunked {
                             let mut chunk_size_buf = String::new();
 
+                            // Instantiate a persistent byte buffer outside the chunk loop
+                            // to accumulate fragments across boundary straddles
+                            let mut line_buffer = Vec::new();
+
                             loop {
                                 chunk_size_buf.clear();
                                 if reader.read_line(&mut chunk_size_buf).is_err() {
@@ -171,20 +174,39 @@ pub fn start_monitor_loop(config: GuardConfig) {
                                     break;
                                 }
 
-                                let payload_str = String::from_utf8_lossy(&chunk_buf);
-                                for line in payload_str.lines() {
-                                    if let Ok(event) = serde_json::from_str::<
-                                        crate::worker::DockerEventPayload,
-                                    >(line)
-                                    {
-                                        if let Ok(mut guard) = cache_clone.write() {
-                                            if event.action == "start" {
-                                                guard.insert(event.actor.id);
-                                            } else if event.action == "die" {
-                                                guard.remove(&event.actor.id);
+                                // Append the raw chunk bytes to the continuous accumulator
+                                // and parse uniform lines out of it rather than cutting lines short
+                                // Also execute a safety buffer-bloat threshold flush
+                                line_buffer.extend_from_slice(&chunk_buf);
+
+                                if line_buffer.len() > 65536 {
+                                    line_buffer.clear(); // Protect memory spaces from unbound growth
+                                }
+
+                                let mut start_pos = 0;
+                                while let Some(newline_offset) = line_buffer[start_pos..].iter().position(|&b| b == b'\n') {
+                                    let end_pos = start_pos + newline_offset;
+                                    let line_slice = String::from_utf8_lossy(&line_buffer[start_pos..end_pos]);
+                                    let trimmed = line_slice.trim_end();
+
+                                    if !trimmed.is_empty() {
+                                        if let Ok(event) = serde_json::from_str::<
+                                            crate::worker::DockerEventPayload,
+                                        >(trimmed) {
+                                            if let Ok(mut guard) = cache_clone.write() {
+                                                if event.action == "start" {
+                                                    guard.insert(event.actor.id);
+                                                } else if event.action == "die" {
+                                                    guard.remove(&event.actor.id);
+                                                }
                                             }
                                         }
                                     }
+                                    start_pos = end_pos + 1;
+                                }
+
+                                if start_pos > 0 {
+                                    line_buffer.drain(0..start_pos);
                                 }
                             }
                         }
@@ -399,8 +421,8 @@ pub fn start_monitor_loop(config: GuardConfig) {
                             continue;
                         }
 
-                        // 64 KB Line-bounded streaming evaluator defeats
-                        // truncation padding and prevents context leakage
+                        // 64 KB Line-bounded streaming evaluator
+                        // Defeats truncation padding and prevents context leakage
                         const MAX_LINE_SIZE: usize = 65536;
                         let mut stream_buffer = vec![0u8; MAX_LINE_SIZE * 2];
                         let mut buffer_len = 0;
@@ -863,8 +885,7 @@ fn dispatch_to_worker(
 ) {
     const MAX_WORKERS: usize = 100;
 
-    // FAST PATH: Acquire parallel, non-blocking read lock
-    // to pass telemetry frames on active mailboxes
+    // FAST PATH: Acquire parallel, non-blocking read lock to pass telemetry frames on active mailboxes
     {
         let reg_read = registry
             .read()
@@ -875,8 +896,7 @@ fn dispatch_to_worker(
         }
     }
 
-    // SLOW PATH: Channel context does not exist
-    // Acquire exclusive write lock to initialize pipeline workers
+    // SLOW PATH: Channel context does not exist. Acquire exclusive write lock to initialize pipeline workers
     let mut reg_write = registry
         .write()
         .expect("CRITICAL: Worker registry lock poisoned. Aborting.");
@@ -983,8 +1003,7 @@ fn run_worker_lifecycle(
                 );
             }
             Err(_) => {
-                // Decay phase
-                // Acquire exclusive write lock strictly on worker termination
+                // Decay phase: Acquire exclusive write lock strictly on worker termination
                 let mut reg = registry
                     .write()
                     .expect("CRITICAL: Worker registry lock poisoned. Aborting.");

@@ -102,4 +102,58 @@ else
 
 fi
 
+# ==============================================================================
+# Mandatory Access Control (MAC) Provisioning: AppArmor
+# ==============================================================================
+
+if [ -f "/sys/module/apparmor/parameters/enabled" ] && [ "$(cat /sys/module/apparmor/parameters/enabled)" = "Y" ]; then
+    echo "AppArmor MAC detected on host kernel. Provisioning security profile..."
+    AA_PROFILE="/etc/apparmor.d/usr.sbin.runsc-sentry-guard"
+
+    cat << 'EOF' > "$AA_PROFILE"
+#include <tunables/global>
+
+/usr/sbin/runsc-sentry-guard {
+  #include <abstractions/base>
+  #include <abstractions/nameservice>
+
+  # Allow standard logging outputs
+  /usr/sbin/runsc-sentry-guard mr,
+
+  # Strict directory access rules
+  /var/log/gvisor/ r,
+  /var/log/gvisor/** r,
+
+  # Allow the daemon to read foreign process states for UDS resolution
+  /proc/[0-9]*/cmdline r,
+  /proc/[0-9]*/cgroup r,
+
+  # Allow execution of Docker and Nftables control commands
+  /usr/bin/docker rcx,
+  /usr/sbin/nft rcx,
+  /usr/bin/curl rcx,
+
+  # Socket communication lines for Docker/Podman communication
+  /var/run/docker.sock rw,
+  /run/docker.sock rw,
+  /run/podman/podman.sock rw,
+
+  # Deny all other administrative or home access vectors explicitly
+  deny /home/** rw,
+  deny /root/** rw,
+}
+EOF
+
+    chmod 644 "$AA_PROFILE"
+
+    if command -v apparmor_parser >/dev/null 2>&1; then
+        apparmor_parser -r "$AA_PROFILE"
+        echo "AppArmor profile successfully compiled and loaded into the active kernel."
+    else
+        echo "Warning: apparmor_parser binary not found in PATH. Profile staged at $AA_PROFILE but not loaded."
+    fi
+else
+    echo "AppArmor not active on this host kernel. Skipping MAC profile deployment."
+fi
+
 echo "Installation complete!"

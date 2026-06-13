@@ -7,11 +7,14 @@ use std::collections::HashSet;
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::{UnixListener, UnixStream};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering}; 
+use std::os::unix::io::{FromRawFd, IntoRawFd};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
+
+use mio::{Events, Interest, Poll, Token};
+use mio::net::UnixListener as MioUnixListener;
 
 use crate::config::{AtomicAction, RegistryMap};
 use crate::logger::emit_log;
@@ -26,7 +29,7 @@ impl Drop for ConnectionGuard {
 }
 
 #[cfg(target_os = "linux")]
-fn get_peer_creds(stream: &UnixStream) -> std::io::Result<(u32, i32)> {
+fn get_peer_creds(stream: &std::os::unix::net::UnixStream) -> std::io::Result<(u32, i32)> {
     use std::os::unix::io::AsRawFd;
     let fd = stream.as_raw_fd();
     let mut ucred = libc::ucred { pid: 0, uid: 0, gid: 0 };
@@ -66,7 +69,7 @@ pub fn run_uds_server(
     let socket_path = "/var/run/runsc-sentry-guard.sock";
     let _ = fs::remove_file(socket_path);
 
-    let listener = match UnixListener::bind(socket_path) {
+    let mut listener = match MioUnixListener::bind(socket_path) {
         Ok(l) => l,
         Err(e) => {
             emit_log(
@@ -99,7 +102,26 @@ pub fn run_uds_server(
         return;
     }
 
-    if listener.set_nonblocking(true).is_err() {
+    let mut poll = match Poll::new() {
+        Ok(p) => p,
+        Err(e) => {
+            emit_log(
+                "ERROR",
+                "uds_server",
+                None,
+                None,
+                None,
+                None,
+                "CRASH",
+                &format!("Failed to initialize mio Poll instance: {}", e),
+                json_enabled,
+            );
+            return;
+        }
+    };
+
+    const SERVER: Token = Token(0);
+    if let Err(e) = poll.registry().register(&mut listener, SERVER, Interest::READABLE) {
         emit_log(
             "ERROR",
             "uds_server",
@@ -108,7 +130,7 @@ pub fn run_uds_server(
             None,
             None,
             "CRASH",
-            "Failed to transition tracking socket boundaries into non-blocking context modes.",
+            &format!("Failed to register UDS listener with mio registry: {}", e),
             json_enabled,
         );
         return;
@@ -118,98 +140,126 @@ pub fn run_uds_server(
 
     let active_connections = Arc::new(AtomicUsize::new(0));
     const MAX_UDS_CONNECTIONS: usize = 50;
+    let mut events = Events::with_capacity(128);
 
     while !shutdown.load(Ordering::SeqCst) {
-        match listener.accept() {
-            Ok((stream, _)) => {
-                #[cfg(target_os = "linux")]
-                let socket_container_id = match get_peer_creds(&stream) {
-                    Ok((peer_uid, peer_pid)) => {
-                        if peer_uid != 0 {
-                            emit_log(
-                                "WARN",
-                                "uds_server",
-                                None,
-                                None,
-                                None,
-                                Some("trust_boundary"),
-                                "REJECTED",
-                                &format!("Unauthorized UID {} attempted UDS connection. Payload dropped.", peer_uid),
-                                json_enabled,
-                            );
-                            continue;
-                        }
 
-                        let id = crate::worker::extract_id_from_pid(peer_pid);
-                        if id.is_none() {
-                            emit_log(
-                                "WARN",
-                                "uds_server",
-                                None,
-                                None,
-                                None,
-                                Some("trust_boundary"),
-                                "REJECTED",
-                                &format!("Failed to resolve container ID from peer PID {}. Connection dropped.", peer_pid),
-                                json_enabled,
-                            );
-                            continue;
+        // Let the OS handle the sleep and notification states efficiently
+        if let Err(e) = poll.poll(&mut events, Some(Duration::from_millis(100))) {
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            break;
+        }
+
+        for event in events.iter() {
+            if event.token() == SERVER && event.is_readable() {
+                loop {
+                    match listener.accept() {
+                        Ok((mio_stream, _)) => {
+                            // Safely unpack and consume the mio file descriptor into standard library structures
+                            let stream = unsafe {
+                                std::os::unix::net::UnixStream::from_raw_fd(mio_stream.into_raw_fd())
+                            };
+
+                            // Revert the stream to blocking mode before handing it off
+                            // to the synchronous BufReader in the worker thread
+                            if let Err(e) = stream.set_nonblocking(false) {
+                                emit_log("ERROR", "uds_server", None, None, None, None, "CRASH", &format!("Failed to set blocking mode: {}", e), json_enabled);
+                                continue;
+                            }
+
+                            #[cfg(target_os = "linux")]
+                            let socket_container_id = match get_peer_creds(&stream) {
+                                Ok((peer_uid, peer_pid)) => {
+                                    if peer_uid != 0 {
+                                        emit_log(
+                                            "WARN",
+                                            "uds_server",
+                                            None,
+                                            None,
+                                            None,
+                                            Some("trust_boundary"),
+                                            "REJECTED",
+                                            &format!("Unauthorized UID {} attempted UDS connection. Payload dropped.", peer_uid),
+                                            json_enabled,
+                                        );
+                                        continue;
+                                    }
+
+                                    let id = crate::worker::extract_id_from_pid(peer_pid);
+                                    if id.is_none() {
+                                        emit_log(
+                                            "WARN",
+                                            "uds_server",
+                                            None,
+                                            None,
+                                            None,
+                                            Some("trust_boundary"),
+                                            "REJECTED",
+                                            &format!("Failed to resolve container ID from peer PID {}. Connection dropped.", peer_pid),
+                                            json_enabled,
+                                        );
+                                        continue;
+                                    }
+                                    id
+                                }
+                                Err(_) => continue,
+                            };
+
+                            #[cfg(not(target_os = "linux"))]
+                            let socket_container_id: Option<String> = None;
+
+                            if active_connections.load(Ordering::SeqCst) >= MAX_UDS_CONNECTIONS {
+                                continue;
+                            }
+
+                            active_connections.fetch_add(1, Ordering::SeqCst);
+                            let conn_tracker = Arc::clone(&active_connections);
+
+                            let reg_clone = Arc::clone(&registry);
+                            let rules_clone = Arc::clone(&regex_rules);
+                            let id_clone = id_extractor.clone();
+                            let wl_clone = Arc::clone(&whitelist);
+                            let tbl_clone = Arc::clone(&table);
+                            let ds_path_clone = docker_socket_path.clone();
+                            let cache_clone = Arc::clone(&active_containers);
+                            let dos_clone = Arc::clone(&anti_dos_state);
+                            let cid_socket_clone = socket_container_id.clone();
+                            let limiter_clone = Arc::clone(&global_limiter);
+
+                            thread::spawn(move || {
+                                let _guard = ConnectionGuard(conn_tracker);
+                                handle_uds_stream(
+                                    stream,
+                                    reg_clone,
+                                    rules_clone,
+                                    id_clone,
+                                    wl_clone,
+                                    tbl_clone,
+                                    json_enabled,
+                                    ds_path_clone,
+                                    cache_clone,
+                                    dos_clone,
+                                    cid_socket_clone,
+                                    max_workers,
+                                    limiter_clone,
+                                );
+                            });
                         }
-                        id
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            break;
+                        }
+                        Err(_) => break,
                     }
-                    Err(_) => continue,
-                };
-
-                #[cfg(not(target_os = "linux"))]
-                let socket_container_id: Option<String> = None;
-
-                if active_connections.load(Ordering::SeqCst) >= MAX_UDS_CONNECTIONS {
-                    continue;
                 }
-
-                active_connections.fetch_add(1, Ordering::SeqCst);
-                let conn_tracker = Arc::clone(&active_connections);
-
-                let reg_clone = Arc::clone(&registry);
-                let rules_clone = Arc::clone(&regex_rules);
-                let id_clone = id_extractor.clone();
-                let wl_clone = Arc::clone(&whitelist);
-                let tbl_clone = Arc::clone(&table);
-                let ds_path_clone = docker_socket_path.clone();
-                let cache_clone = Arc::clone(&active_containers);
-                let dos_clone = Arc::clone(&anti_dos_state);
-                let cid_socket_clone = socket_container_id.clone();
-                let limiter_clone = Arc::clone(&global_limiter);
-
-                thread::spawn(move || {
-                    let _guard = ConnectionGuard(conn_tracker);
-                    handle_uds_stream(
-                        stream,
-                        reg_clone,
-                        rules_clone,
-                        id_clone,
-                        wl_clone,
-                        tbl_clone,
-                        json_enabled,
-                        ds_path_clone,
-                        cache_clone,
-                        dos_clone,
-                        cid_socket_clone,
-                        max_workers,
-                        limiter_clone,
-                    );
-                });
             }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(50));
-            }
-            Err(_) => break,
         }
     }
 }
 
 fn handle_uds_stream(
-    stream: UnixStream,
+    stream: std::os::unix::net::UnixStream,
     registry: Arc<RwLock<RegistryMap>>,
     regex_rules: Arc<RwLock<Vec<(String, Regex, Vec<AtomicAction>, Vec<AtomicAction>)>>>,
     id_extractor: Regex,
@@ -263,17 +313,25 @@ fn handle_uds_stream(
                         json_enabled,
                     );
 
-                    let mut discard_buf = Vec::new();
-                    match reader.read_until(b'\n', &mut discard_buf) {
-                        Ok(_) => continue,
-                        Err(_) => break,
+                    let mut sink_buf = [0u8; 1024];
+                    loop {
+                        match reader.read(&mut sink_buf) {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                if sink_buf[..n].contains(&b'\n') {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
                     }
+                    continue;
                 }
 
                 let current_line = String::from_utf8_lossy(&buf);
                 let trimmed = current_line.trim_end();
 
-                let rules_guard = regex_rules.read().expect("CRITICAL: Signatures lock poisoned.");
+                let rules_guard = regex_rules.read().unwrap_or_else(|e| e.into_inner());
                 crate::ingestion::evaluate_line_signatures(
                     trimmed,
                     &rules_guard,
@@ -299,22 +357,31 @@ fn handle_uds_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicUsize;
 
     #[test]
     fn test_uds_connection_guard_raii_lifecycles() {
         let counter = Arc::new(AtomicUsize::new(10));
-
         {
             let _guard = ConnectionGuard(Arc::clone(&counter));
-            // Scope retention mimics an active open UDS streaming socket session channel
             assert_eq!(counter.load(Ordering::SeqCst), 10);
-        } // Guard drops out of scope here as the simulated stream closes
+        }
+        assert_eq!(counter.load(Ordering::SeqCst), 9);
+    }
 
-        assert_eq!(
-            counter.load(Ordering::SeqCst),
-            9,
-            "ConnectionGuard RAII destructor failed to decrement active tracking bounds upon closure!"
-        );
+    #[test]
+    fn test_uds_connection_saturation_rejections() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        const MAX_UDS_CONNECTIONS: usize = 50;
+        let mut allocated_guards = Vec::new();
+
+        for _ in 0..55 {
+            if counter.load(Ordering::SeqCst) < MAX_UDS_CONNECTIONS {
+                counter.fetch_add(1, Ordering::SeqCst);
+                allocated_guards.push(ConnectionGuard(Arc::clone(&counter)));
+            }
+        }
+
+        assert_eq!(counter.load(Ordering::SeqCst), 50);
+        assert_eq!(allocated_guards.len(), 50);
     }
 }

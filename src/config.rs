@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 // Strictly typed operational matrix definitions mapping onto specific automated containment actions
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[serde(deny_unknown_fields)] // Enforces strict structural errors for deprecated/unknown dictionary keys
 pub enum AtomicAction {
     ValidateState,
     LogJson,
@@ -131,7 +132,6 @@ mod tests {
         temp_path.push("runsc_valid_test_config.toml");
 
         let mut file = File::create(&temp_path).unwrap();
-
         let toml_data = r#"
             [monitor]
             mode = "file"

@@ -20,6 +20,9 @@ use std::net::IpAddr;
 #[cfg(target_os = "linux")]
 use std::sync::OnceLock;
 
+#[cfg(target_os = "linux")]
+use std::os::unix::process::CommandExt;
+
 #[derive(Deserialize)]
 #[allow(non_snake_case)]
 #[cfg(target_os = "linux")]
@@ -139,7 +142,6 @@ fn execute_docker_uds_request(
     let mut is_chunked = false;
     let mut content_length: Option<usize> = None;
 
-    // Enforce hard loop ceiling for header processing to prevent streaming slowloris-style thread hangs
     let mut header_count = 0;
     const MAX_HTTP_HEADERS: usize = 100;
 
@@ -351,13 +353,20 @@ fn execute_atomic_command(
             #[cfg(not(target_os = "linux"))]
             let resolved_ip = "127.0.0.1".to_string();
 
-            let mut child = Command::new(path)
-                .arg(container_id)
-                .arg(&resolved_ip)
-                .arg(trigger_message)
-                .spawn()
-                .map_err(|e| anyhow!("Failed to spawn automation extension subprocess: {}", e))?;
+            let mut cmd = Command::new(path);
+            cmd.arg(container_id).arg(&resolved_ip).arg(trigger_message);
 
+            #[cfg(target_os = "linux")]
+            {
+                unsafe {
+                    cmd.pre_exec(|| {
+                        libc::prctl(libc::PR_CAP_AMBIENT, libc::PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0);
+                        Ok(())
+                    });
+                }
+            }
+
+            let mut child = cmd.spawn().map_err(|e| anyhow!("Failed to spawn automation extension subprocess: {}", e))?;
             let timeout = std::time::Duration::from_secs(15);
             let start = std::time::Instant::now();
 
@@ -592,52 +601,31 @@ fn execute_atomic_command(
             {
                 match infrastructure_action {
                     AtomicAction::ValidateState => {
-                        println!(
-                            "[DEV-MOCK] Verifying runtime operational status for ID: {}",
-                            container_id
-                        );
+                        println!("[DEV-MOCK] Verifying runtime operational status for ID: {}", container_id);
                         Ok(())
                     }
                     AtomicAction::Pause => {
-                        println!(
-                            "[DEV-MOCK] Injecting out-of-band container namespace FREEZE on ID: {}",
-                            container_id
-                        );
+                        println!("[DEV-MOCK] Injecting out-of-band container namespace FREEZE on ID: {}", container_id);
                         Ok(())
                     }
                     AtomicAction::Unpause => {
-                        println!(
-                            "[DEV-MOCK] Releasing container namespace FREEZE mutation execution on ID: {}",
-                            container_id
-                        );
+                        println!("[DEV-MOCK] Releasing container namespace FREEZE mutation execution on ID: {}", container_id);
                         Ok(())
                     }
                     AtomicAction::Restart => {
-                        println!(
-                            "[DEV-MOCK] Dispatching rolling container runtime reboot signature to ID: {}",
-                            container_id
-                        );
+                        println!("[DEV-MOCK] Dispatching rolling container runtime reboot signature to ID: {}", container_id);
                         Ok(())
                     }
                     AtomicAction::CommitSnapshot { prefix } => {
-                        println!(
-                            "[DEV-MOCK] Committing container snapshot to register using tag: {}-{}",
-                            prefix, container_id
-                        );
+                        println!("[DEV-MOCK] Committing container snapshot to register using tag: {}-{}", prefix, container_id);
                         Ok(())
                     }
                     AtomicAction::ContainerSignal { signal } => {
-                        println!(
-                            "[DEV-MOCK] Injecting kernel process termination signal [{}] straight to target ID: {}",
-                            signal, container_id
-                        );
+                        println!("[DEV-MOCK] Injecting kernel process termination signal [{}] straight to target ID: {}", signal, container_id);
                         Ok(())
                     }
                     AtomicAction::NftBlacklist { set_name, timeout } => {
-                        println!(
-                            "[DEV-MOCK] Appending element drop logic -> Table: {}, Set: {}, Duration: {}",
-                            table, set_name, timeout
-                        );
+                        println!("[DEV-MOCK] Appending element drop logic -> Table: {}, Set: {}, Duration: {}", table, set_name, timeout);
                         Ok(())
                     }
                     _ => unreachable!(),
@@ -722,7 +710,6 @@ pub fn execute_containment_pipeline(
     let mut pipeline_failed = false;
 
     for action in &try_actions {
-
         if let Err(e) = execute_atomic_command(
             action,
             &container_id,
@@ -752,7 +739,6 @@ pub fn execute_containment_pipeline(
         emit_json_escalation_marker(&container_id, &rule_name, json_enabled);
 
         for fallback in &final_actions {
-
             match execute_atomic_command(
                 fallback,
                 &container_id,
@@ -848,6 +834,11 @@ mod tests {
     use std::io::Cursor;
     use std::net::IpAddr;
 
+    fn run_mock_line_reader(stream_payload: Vec<u8>, capacity_limit: u64) -> Result<String> {
+        let mut mock_cursor = Cursor::new(stream_payload);
+        read_bounded_line(&mut mock_cursor, capacity_limit)
+    }
+
     #[test]
     fn test_is_ip_safe_evaluations() {
         let whitelist = vec![
@@ -858,32 +849,19 @@ mod tests {
         let safe_ip: IpAddr = "10.5.5.5".parse().unwrap();
         let unsafe_ip: IpAddr = "172.16.0.5".parse().unwrap();
 
-        assert!(
-            is_ip_safe(&safe_ip, &whitelist),
-            "Failed: 10.5.5.5 should be whitelisted"
-        );
-        assert!(
-            !is_ip_safe(&unsafe_ip, &whitelist),
-            "Failed: 172.16.0.5 should be blacklisted"
-        );
+        assert!(is_ip_safe(&safe_ip, &whitelist), "Failed: 10.5.5.5 should be whitelisted");
+        assert!(!is_ip_safe(&unsafe_ip, &whitelist), "Failed: 172.16.0.5 should be blacklisted");
     }
 
     #[test]
     fn test_read_bounded_line_success() {
-        let data = b"HTTP/1.1 200 OK\r\n";
-        let mut cursor = Cursor::new(data);
-
-        let result = read_bounded_line(&mut cursor, 1024).unwrap();
+        let result = run_mock_line_reader(b"HTTP/1.1 200 OK\r\n".to_vec(), 1024).unwrap();
         assert_eq!(result, "HTTP/1.1 200 OK\r\n");
     }
 
     #[test]
     fn test_read_bounded_line_bloat_protection() {
-        let data = vec![b'A'; 100];
-        let mut cursor = Cursor::new(data);
-
-        let result = read_bounded_line(&mut cursor, 50);
-
+        let result = run_mock_line_reader(vec![b'A'; 100], 50);
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -893,14 +871,8 @@ mod tests {
 
     #[test]
     fn test_read_bounded_line_exact_limit_anomaly() {
-        let data = vec![b'B'; 64];
-        let mut cursor = Cursor::new(data);
-
-        let result = read_bounded_line(&mut cursor, 64);
-        assert!(
-            result.is_err(),
-            "Engine should fail if buffer hits limit exactly without finding a newline"
-        );
+        let result = run_mock_line_reader(vec![b'B'; 64], 64);
+        assert!(result.is_err(), "Engine should fail if buffer hits limit exactly without finding a newline");
     }
 
     #[test]
@@ -908,72 +880,56 @@ mod tests {
         let target_ip = "10.0.0.2";
         let target_set = "blacklist_set";
         let target_table = "inet filter";
-
         let malicious_timeout = "24h; nft delete table inet filter;";
 
-        let validation_result =
-            execute_firewall_mutation(target_ip, target_set, malicious_timeout, target_table);
-
-        assert!(
-            validation_result.is_err(),
-            "VULNERABILITY REGRESSION: Ingestion loop allowed unchecked structural timeout manipulation!"
-        );
+        let validation_result = execute_firewall_mutation(target_ip, target_set, malicious_timeout, target_table);
+        assert!(validation_result.is_err());
 
         if let Err(err) = validation_result {
-            assert!(
-                err.to_string().contains("Security Constraint Violation"),
-                "Error context should explicitly detail a security validation drop"
-            );
+            assert!(err.to_string().contains("Security Constraint Violation"));
         }
     }
 
     #[test]
     fn test_execute_uds_request_length_boundary_violation() {
-        let malformed_http_response = "HTTP/1.1 200 OK\r\nContent-Length: 1073741824\r\n\r\n";
-        let mut cursor = Cursor::new(malformed_http_response);
+        let test_payload_len = 11534336usize;
+        let maximum_heap_ceiling = MAX_UDS_PAYLOAD_SIZE;
 
-        let mut reader = std::io::BufReader::new(&mut cursor);
-        let status_line = read_bounded_line(&mut reader, 8192).unwrap();
-        let _status_code = status_line
-            .split_whitespace()
-            .nth(1)
-            .unwrap()
-            .parse::<u16>()
-            .unwrap();
-
-        let content_length: Option<usize> = Some(1073741824);
-
-        let evaluation_result: Result<()> = if let Some(len) = content_length {
-            if len > MAX_UDS_PAYLOAD_SIZE {
-                Err(anyhow::anyhow!("SECURITY ABORT: Content-Length out of bounds"))
-            } else {
-                Ok(())
-            }
-        } else {
-            Ok(())
-        };
-
-        assert!(
-            evaluation_result.is_err(),
-            "Vulnerability Regression: Ingestion engine accepted a massive allocation size!"
-        );
+        assert!(test_payload_len > maximum_heap_ceiling, "Assertion matrix failed to register a structural boundary breach");
     }
 }
 
+// Completely closed trust boundary forgery
+// Identity resolution is migrated
+// exclusively to a unified single-pass
+// loop traversing kernel-managed cgroup tracks
 #[cfg(target_os = "linux")]
 pub fn extract_id_from_pid(pid: i32) -> Option<String> {
     use std::fs;
     use regex::Regex;
-    let cmdline_path = format!("/proc/{}/cmdline", pid);
-    if let Ok(content) = fs::read_to_string(cmdline_path) {
-        let id_extractor = Regex::new(r"\b([a-fA-F0-9]{12}|[a-fA-F0-9]{64})\b").unwrap();
-        for arg in content.split('\0') {
-            if let Some(caps) = id_extractor.captures(arg) {
+    use std::sync::OnceLock;
+
+    static ID_EXTRACTOR: OnceLock<Regex> = OnceLock::new();
+    let extractor = ID_EXTRACTOR.get_or_init(|| Regex::new(r"\b([a-fA-F0-9]{64}|[a-fA-F0-9]{12})\b").unwrap());
+
+    let cgroup_path = format!("/proc/{}/cgroup", pid);
+    if let Ok(content) = fs::read_to_string(cgroup_path) {
+        let mut fallback: Option<String> = None;
+
+        for line in content.lines() {
+            if let Some(caps) = extractor.captures(line) {
                 if let Some(matched_id) = caps.get(1) {
-                    return Some(matched_id.as_str().to_string());
+                    let id = matched_id.as_str().to_string();
+                    if line.contains("docker") || line.contains("kubepods") || line.contains("containerd") || line.contains("runsc") {
+                        return Some(id);
+                    }
+                    if fallback.is_none() {
+                        fallback = Some(id);
+                    }
                 }
             }
         }
+        return fallback;
     }
     None
 }

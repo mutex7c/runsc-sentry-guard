@@ -240,6 +240,7 @@ dependencies = [
  "caps",
  "ipnet",
  "libc",
+ "mio",
  "notify",
  "regex",
  "serde",

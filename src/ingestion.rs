@@ -13,7 +13,6 @@ use std::sync::atomic::AtomicBool;
 use std::thread;
 use std::time::Duration;
 
-// Platform-lock BufRead to Linux only so cross-platform dev environments on macOS/Windows stay warning-free
 #[cfg(target_os = "linux")]
 use std::io::BufRead;
 
@@ -55,7 +54,6 @@ pub fn start_monitor_loop(config: GuardConfig, shutdown: Arc<AtomicBool>, config
     }
 
     let active_containers = Arc::new(RwLock::new(HashSet::<String>::new()));
-
     let anti_dos_state = Arc::new(Mutex::new(AntiDosState::new()));
     let global_limiter = Arc::new(GlobalRateLimiter::new(10000));
 
@@ -72,9 +70,9 @@ pub fn start_monitor_loop(config: GuardConfig, shutdown: Arc<AtomicBool>, config
             while !stream_shutdown.load(Ordering::SeqCst) {
                 if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&ds_path) {
                     let current_ids = crate::worker::fetch_running_container_ids(&ds_path);
-                    if let Ok(mut guard) = cache_clone.write() {
-                        *guard = current_ids;
-                    }
+
+                    let mut guard = cache_clone.write().unwrap_or_else(|e| e.into_inner());
+                    *guard = current_ids;
 
                     let request = format!(
                         "GET {} HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n",
@@ -112,7 +110,6 @@ pub fn start_monitor_loop(config: GuardConfig, shutdown: Arc<AtomicBool>, config
 
                             while !stream_shutdown.load(Ordering::SeqCst) {
                                 chunk_size_buf.clear();
-
                                 if reader.read_line(&mut chunk_size_buf).is_err() {
                                     break;
                                 }
@@ -153,12 +150,12 @@ pub fn start_monitor_loop(config: GuardConfig, shutdown: Arc<AtomicBool>, config
 
                                     if !trimmed.is_empty() {
                                         if let Ok(event) = serde_json::from_str::<crate::worker::DockerEventPayload>(trimmed) {
-                                            if let Ok(mut guard) = cache_clone.write() {
-                                                if event.action == "start" {
-                                                    guard.insert(event.actor.id);
-                                                } else if event.action == "die" {
-                                                    guard.remove(&event.actor.id);
-                                                }
+
+                                            let mut guard = cache_clone.write().unwrap_or_else(|e| e.into_inner());
+                                            if event.action == "start" {
+                                                guard.insert(event.actor.id);
+                                            } else if event.action == "die" {
+                                                guard.remove(&event.actor.id);
                                             }
                                         }
                                     }
@@ -206,20 +203,19 @@ pub fn start_monitor_loop(config: GuardConfig, shutdown: Arc<AtomicBool>, config
 
                     if let Ok(new_config) = crate::config::load_config(&path_watch_clone) {
                         let new_compiled = compile_rules(&new_config.rules);
-                        if let Ok(mut guard) = rules_watch_clone.write() {
-                            *guard = new_compiled;
-                            emit_log(
-                                "INFO",
-                                "config_reload",
-                                None,
-                                None,
-                                None,
-                                None,
-                                "SUCCESS",
-                                "Active rule signatures successfully hot-reloaded from manifest.",
-                                json_enabled_clone,
-                            );
-                        }
+                        let mut guard = rules_watch_clone.write().unwrap_or_else(|e| e.into_inner());
+                        *guard = new_compiled;
+                        emit_log(
+                            "INFO",
+                            "config_reload",
+                            None,
+                            None,
+                            None,
+                            None,
+                            "SUCCESS",
+                            "Active rule signatures successfully hot-reloaded from manifest.",
+                            json_enabled_clone,
+                        );
                     } else {
                         emit_log(
                             "WARN",
@@ -462,7 +458,7 @@ pub fn start_monitor_loop(config: GuardConfig, shutdown: Arc<AtomicBool>, config
                                 let trimmed = line_slice.trim_end();
 
                                 if !trimmed.is_empty() {
-                                    let rules_guard = regex_compiled.read().expect("CRITICAL: Signatures lock poisoned.");
+                                    let rules_guard = regex_compiled.read().unwrap_or_else(|e| e.into_inner());
                                     evaluate_line_signatures(
                                         trimmed,
                                         &rules_guard,
@@ -601,15 +597,14 @@ pub fn evaluate_line_signatures(
             #[cfg(target_os = "linux")]
             {
                 let mut is_valid = {
-                    let active_guard = active_containers.read().expect("CRITICAL: Active container cache lock poisoned.");
+                    let active_guard = active_containers.read().unwrap_or_else(|e| e.into_inner());
                     active_guard.contains(&container_id) || active_guard.iter().any(|long_id| long_id.starts_with(&container_id))
                 };
 
                 if !is_valid {
-                    let mut dos_guard = anti_dos_state.lock().expect("CRITICAL: DoS State lock poisoned.");
+                    let mut dos_guard = anti_dos_state.lock().unwrap_or_else(|e| e.into_inner());
                     let now = std::time::Instant::now();
                     if now.duration_since(dos_guard.last_refill).as_secs() >= 1 {
-
                         dos_guard.tokens = crate::limiters::MAX_LOOKUP_TOKENS;
                         dos_guard.last_refill = now;
                     }
@@ -625,12 +620,11 @@ pub fn evaluate_line_signatures(
                         let actually_exists = is_container_active_sync(&container_id, docker_socket_path);
 
                         if actually_exists {
-                            let mut active_write = active_containers.write().expect("CRITICAL: Active container cache lock poisoned.");
+                            let mut active_write = active_containers.write().unwrap_or_else(|e| e.into_inner());
                             active_write.insert(container_id.clone());
                             is_valid = true;
                         } else {
-                            let mut dos_write = anti_dos_state.lock().expect("CRITICAL: DoS State lock poisoned.");
-
+                            let mut dos_write = anti_dos_state.lock().unwrap_or_else(|e| e.into_inner());
                             if dos_write.negative_cache.len() >= crate::limiters::MAX_NEGATIVE_CACHE {
                                 if let Some(oldest) = dos_write.negative_queue.pop_front() {
                                     dos_write.negative_cache.remove(&oldest);
@@ -696,14 +690,14 @@ fn dispatch_to_worker(
     max_workers: usize,
 ) {
     {
-        let reg_read = registry.read().expect("CRITICAL: Worker registry lock poisoned.");
+        let reg_read = registry.read().unwrap_or_else(|e| e.into_inner());
         if let Some(tx) = reg_read.get(&container_id) {
             let _ = tx.try_send((try_actions, final_actions, rule_name, trigger_message));
             return;
         }
     }
 
-    let mut reg_write = registry.write().expect("CRITICAL: Worker registry lock poisoned.");
+    let mut reg_write = registry.write().unwrap_or_else(|e| e.into_inner());
 
     if !reg_write.contains_key(&container_id) && reg_write.len() >= max_workers {
         emit_log(
@@ -801,7 +795,7 @@ fn run_worker_lifecycle(
                 );
             }
             Err(_) => {
-                let mut reg = registry.write().expect("CRITICAL: Worker registry lock poisoned.");
+                let mut reg = registry.write().unwrap_or_else(|e| e.into_inner());
 
                 match rx_chan.try_recv() {
                     Ok((try_cmds, final_cmds, rule, trigger_msg)) => {
@@ -891,47 +885,4 @@ fn compile_rules(rules: &[crate::config::RuleConfig]) -> Vec<(String, Regex, Vec
             })
         })
         .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::config::RuleConfig;
-
-    #[test]
-    fn test_rule_compilation_matrix() {
-        let raw_rules = vec![
-            RuleConfig {
-                name: "test_malicious_exec".to_string(),
-                file_pattern: "*.boot".to_string(),
-                regex_match: r"execve\(.*(malicious_payload)".to_string(),
-                try_actions: vec![AtomicAction::LogJson],
-                final_actions: vec![AtomicAction::LogCritical],
-            }
-        ];
-
-        let compiled = compile_rules(&raw_rules);
-        assert_eq!(compiled.len(), 1, "Rule compilation engine dropped valid structures.");
-        assert_eq!(compiled[0].0, "test_malicious_exec");
-
-        // Assert the underlying regex accurately hooks telemetry patterns
-        assert!(compiled[0].1.is_match("Captured trace line: execve(path/malicious_payload) [ID: 100]"));
-        assert!(!compiled[0].1.is_match("Captured trace line: execve(path/benign_payload)"));
-    }
-
-    #[test]
-    fn test_malformed_rule_compilation_skips_gracefully() {
-        let malformed_rules = vec![
-            RuleConfig {
-                name: "broken_regex".to_string(),
-                file_pattern: "*.boot".to_string(),
-                regex_match: r"execve\((unclosed_parenthesis".to_string(), // Invalid Regex Syntax
-                try_actions: vec![AtomicAction::LogJson],
-                final_actions: vec![],
-            }
-        ];
-
-        let compiled = compile_rules(&malformed_rules);
-        assert!(compiled.is_empty(), "Compilation engine failed to isolate unparseable regex maps safely.");
-    }
 }

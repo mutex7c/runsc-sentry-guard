@@ -90,8 +90,6 @@ pub struct MonitorConfig {
 #[serde(deny_unknown_fields)]
 pub struct RuleConfig {
     pub name: String,
-    #[allow(dead_code)]
-    pub file_pattern: String,
     pub regex_match: String,
     pub try_actions: Vec<AtomicAction>,
     pub final_actions: Vec<AtomicAction>,

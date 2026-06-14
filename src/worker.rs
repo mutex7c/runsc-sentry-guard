@@ -967,23 +967,6 @@ where
     fallback
 }
 
-#[cfg(target_os = "linux")]
-#[allow(dead_code)]
-pub fn extract_id_from_pid(pid: i32) -> Option<String> {
-    use std::fs;
-    use regex::Regex;
-    use std::sync::OnceLock;
-
-    static ID_EXTRACTOR: OnceLock<Regex> = OnceLock::new();
-    let extractor = ID_EXTRACTOR.get_or_init(|| Regex::new(r"\b([a-fA-F0-9]{64}|[a-fA-F0-9]{12})\b").unwrap());
-
-    let cgroup_path = format!("/proc/{}/cgroup", pid);
-    if let Ok(content) = fs::read_to_string(cgroup_path) {
-        return extract_id_from_lines(content.lines(), extractor);
-    }
-    None
-}
-
 pub fn cleanup_stale_firewall_elements(config: &crate::config::GuardConfig) {
     let table = &config.monitor.nftables_default_table;
     let ip_regex = regex::Regex::new(r"\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b|([a-fA-F0-9:]+:+[a-fA-F0-9:]+)\b").unwrap();

@@ -20,8 +20,8 @@ that stands outside that vault. It safely listens to the vault's internal
 diagnostic chatter from the host side without ever stepping foot inside.
 
 The absolute millisecond it senses anyone trying to do something malicious 
-inside your container—like launching a forbidden terminal shell or setting 
-up a hidden hacking tool—the guard springs into action automatically:
+inside your container, like launching a forbidden terminal shell or setting 
+up a hidden hacking tool, the guard takes action automatically:
 
 *   **Freeze the Threat:** It instantly locks down and pauses the compromised 
 container so the intruder's scripts can't even execute a single line of automated code.
@@ -107,6 +107,18 @@ the visibility and latency flaws inherent in legacy detection tools.
 | **Response Latency**   | **Passive Logging & Triage:** Collects events, streams them to a centralized SIEM, and waits for human security engineers to execute a script or manually isolate the infrastructure.                                                                                                                                                                 | **Active Automated Mitigation:** Bridges detection and containment into a single real-time loop. It mutates host firewalls and freezes task states the moment a signature is detected.                                                   |
 | **Concurrency Scale**  | **Monolithic Event FIFO Queues:** Processes incoming logs sequentially. A single high-volume attack or a hanging mitigation script can block the entire event pipeline for adjacent workloads.                                                                                                                                                        | **Key-Based Serialization:** Spawns isolated, independent worker threads pinned to unique Container IDs. A complex containment routine on container A never stalls defenses for container B.                                             |
 | **Ingestion Latency**  | **Disk Log Tailers:** Relies on gVisor writing `.boot` files to the host storage layer, introducing minor filesystem write overhead and potential TOCTOU (Time-of-Check to Time-of-Use) security latency. This option is supported by `runsc-sentry-guard` for testing, but UDS Stream Receiver / Socket Mode is strictly recommended for production. | **UDS Stream Receiver:** Bypasses host disk I/O completely. Runtimes stream telemetry straight into the daemon's user-space memory, dropping response latency to sub-millisecond intervals and eliminating disk-spoofing risks entirely. |
+
+> **The Unix Philosophy: Do One Thing and Do It Well**
+>
+> Instead of attempting to be a bloated, monolithic "Swiss Army knife" agent that 
+> tries to handle everything from static vulnerability scanning to compliance auditing, 
+> `runsc-sentry-guard` focuses strictly on a single, clear objective: **ultra-low-latency, 
+> out-of-band threat containment for docker gVisor sandboxes**.
+>
+> We do not attempt to reinvent the wheel. The daemon purposefully delegates base firewall 
+> policy rulesets to `nftables`, background process management to `systemd`, and application 
+> isolation to `runsc`. By maintaining this functional focus, we keep 
+> a lean footprint, a minimized attack surface, and real-time containment speed.
 
 ## 4. Core Documentation & Context Links
 

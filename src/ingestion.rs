@@ -71,96 +71,107 @@ pub fn start_monitor_loop(config: GuardConfig, shutdown: Arc<AtomicBool>, config
             let stream_endpoint = "/events?filters=%7B%22type%22%3A%5B%22container%22%5D%2C%22event%22%3A%5B%22start%22%2C%22die%22%5D%7D";
 
             while !stream_shutdown.load(Ordering::SeqCst) {
-                if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&ds_path) {
-                    let current_ids = crate::worker::fetch_running_container_ids(&ds_path);
-                    {
-                        let mut guard = cache_clone.write();
-                        *guard = current_ids;
-                    }
-
-                    let request = format!("GET {} HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n", stream_endpoint);
-
-                    if stream.write_all(request.as_bytes()).is_ok() {
-                        let mut header_buf = [0u8; 8192];
-                        let mut bytes_read = 0;
-                        let mut header_end = 0;
-                        let mut status_ok = false;
-                        let mut is_chunked = false;
-
-                        loop {
-                            if bytes_read >= header_buf.len() { break; }
-                            let n = match stream.read(&mut header_buf[bytes_read..]) {
-                                Ok(n) if n > 0 => n,
-                                _ => break,
-                            };
-                            bytes_read += n;
-
-                            let mut headers = [httparse::EMPTY_HEADER; 64];
-                            let mut res = httparse::Response::new(&mut headers);
-
-                            match res.parse(&header_buf[..bytes_read]) {
-                                Ok(httparse::Status::Complete(body_start_offset)) => {
-                                    header_end = body_start_offset;
-                                    if let Some(code) = res.code { if code == 200 { status_ok = true; } }
-                                    for header in res.headers {
-                                        let name = header.name.to_lowercase();
-                                        let value = String::from_utf8_lossy(header.value).to_lowercase();
-                                        if name == "transfer-encoding" && value.contains("chunked") { is_chunked = true; }
-                                    }
-                                    break;
-                                }
-                                Ok(httparse::Status::Partial) => continue,
-                                Err(_) => break,
-                            }
+                // Explicit matching on connection result to log runtime IPC failure
+                match std::os::unix::net::UnixStream::connect(&ds_path) {
+                    Ok(mut stream) => {
+                        let current_ids = crate::worker::fetch_running_container_ids(&ds_path);
+                        {
+                            let mut guard = cache_clone.write();
+                            *guard = current_ids;
                         }
 
-                        if status_ok && is_chunked {
-                            let leftover = header_buf[header_end..bytes_read].to_vec();
-                            let mut reader = BufReader::new(Cursor::new(leftover).chain(stream));
-                            let mut chunk_size_buf = String::new();
-                            let mut line_buffer = Vec::new();
+                        let request = format!("GET {} HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n", stream_endpoint);
 
-                            while !stream_shutdown.load(Ordering::SeqCst) {
-                                chunk_size_buf.clear();
-                                if reader.read_line(&mut chunk_size_buf).is_err() { break; }
-                                let trimmed_size = chunk_size_buf.trim();
-                                if trimmed_size.is_empty() { continue; }
+                        if stream.write_all(request.as_bytes()).is_ok() {
+                            let mut header_buf = [0u8; 8192];
+                            let mut bytes_read = 0;
+                            let mut header_end = 0;
+                            let mut status_ok = false;
+                            let mut is_chunked = false;
 
-                                let chunk_size = match usize::from_str_radix(trimmed_size, 16) {
-                                    Ok(size) => size,
-                                    Err(_) => break,
+                            loop {
+                                if bytes_read >= header_buf.len() { break; }
+                                let n = match stream.read(&mut header_buf[bytes_read..]) {
+                                    Ok(n) if n > 0 => n,
+                                    _ => break,
                                 };
-                                if chunk_size == 0 { break; }
+                                bytes_read += n;
 
-                                let mut chunk_buf = vec![0u8; chunk_size];
-                                if reader.read_exact(&mut chunk_buf).is_err() { break; }
+                                let mut headers = [httparse::EMPTY_HEADER; 64];
+                                let mut res = httparse::Response::new(&mut headers);
 
-                                let mut crlf = [0u8; 2];
-                                if reader.read_exact(&mut crlf).is_err() { break; }
-
-                                line_buffer.extend_from_slice(&chunk_buf);
-                                if line_buffer.len() > 65536 { line_buffer.clear(); }
-
-                                let mut start_pos = 0;
-                                while let Some(newline_offset) = line_buffer[start_pos..].iter().position(|&b| b == b'\n') {
-                                    let end_pos = start_pos + newline_offset;
-                                    let line_slice = String::from_utf8_lossy(&line_buffer[start_pos..end_pos]);
-                                    let trimmed = line_slice.trim_end();
-
-                                    if !trimmed.is_empty() {
-                                        if let Ok(event) = serde_json::from_str::<crate::worker::DockerEventPayload>(trimmed) {
-                                            let mut guard = cache_clone.write();
-                                            if event.action == "start" { guard.insert(event.actor.id); }
-                                            else if event.action == "die" { guard.remove(&event.actor.id); }
+                                match res.parse(&header_buf[..bytes_read]) {
+                                    Ok(httparse::Status::Complete(body_start_offset)) => {
+                                        header_end = body_start_offset;
+                                        if let Some(code) = res.code { if code == 200 { status_ok = true; } }
+                                        for header in res.headers {
+                                            let name = header.name.to_lowercase();
+                                            let value = String::from_utf8_lossy(header.value).to_lowercase();
+                                            if name == "transfer-encoding" && value.contains("chunked") { is_chunked = true; }
                                         }
+                                        break;
                                     }
-                                    start_pos = end_pos + 1;
+                                    Ok(httparse::Status::Partial) => continue,
+                                    Err(_) => break,
                                 }
-                                if start_pos > 0 { line_buffer.drain(0..start_pos); }
+                            }
+
+                            if status_ok && is_chunked {
+                                let leftover = header_buf[header_end..bytes_read].to_vec();
+                                let mut reader = BufReader::new(Cursor::new(leftover).chain(stream));
+                                let mut chunk_size_buf = String::new();
+                                let mut line_buffer = Vec::new();
+
+                                while !stream_shutdown.load(Ordering::SeqCst) {
+                                    chunk_size_buf.clear();
+                                    if reader.read_line(&mut chunk_size_buf).is_err() { break; }
+                                    let trimmed_size = chunk_size_buf.trim();
+                                    if trimmed_size.is_empty() { continue; }
+
+                                    let chunk_size = match usize::from_str_radix(trimmed_size, 16) {
+                                        Ok(size) => size,
+                                        Err(_) => break,
+                                    };
+                                    if chunk_size == 0 { break; }
+
+                                    let mut chunk_buf = vec![0u8; chunk_size];
+                                    if reader.read_exact(&mut chunk_buf).is_err() { break; }
+
+                                    let mut crlf = [0u8; 2];
+                                    if reader.read_exact(&mut crlf).is_err() { break; }
+
+                                    line_buffer.extend_from_slice(&chunk_buf);
+                                    if line_buffer.len() > 65536 { line_buffer.clear(); }
+
+                                    let mut start_pos = 0;
+                                    while let Some(newline_offset) = line_buffer[start_pos..].iter().position(|&b| b == b'\n') {
+                                        let end_pos = start_pos + newline_offset;
+                                        let line_slice = String::from_utf8_lossy(&line_buffer[start_pos..end_pos]);
+                                        let trimmed = line_slice.trim_end();
+
+                                        if !trimmed.is_empty() {
+                                            if let Ok(event) = serde_json::from_str::<crate::worker::DockerEventPayload>(trimmed) {
+                                                let mut guard = cache_clone.write();
+                                                if event.action == "start" { guard.insert(event.actor.id); }
+                                                else if event.action == "die" { guard.remove(&event.actor.id); }
+                                            }
+                                        }
+                                        start_pos = end_pos + 1;
+                                    }
+                                    if start_pos > 0 { line_buffer.drain(0..start_pos); }
+                                }
                             }
                         }
+                    }
+                    Err(e) => {
+                        emit_log(
+                            "ERROR", "orchestrator", None, None, None, Some("runtime_ipc"), "DISCONNECTED",
+                            &format!("Container engine socket link unavailable. Retrying: {:#}", e),
+                            config_log_level, json_enabled
+                        );
                     }
                 }
+
                 if stream_shutdown.load(Ordering::SeqCst) { break; }
                 thread::sleep(Duration::from_secs(1));
             }
@@ -179,7 +190,14 @@ pub fn start_monitor_loop(config: GuardConfig, shutdown: Arc<AtomicBool>, config
         let (tx, rx) = std::sync::mpsc::channel();
 
         let watcher_res = notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
-            if let Ok(event) = res { if event.kind.is_modify() || event.kind.is_create() { let _ = tx.send(()); } }
+            if let Ok(event) = res {
+                if event.kind.is_modify() || event.kind.is_create() {
+                    // Verify coordinate transmission succeeds and log broken channel failures
+                    if let Err(e) = tx.send(()) {
+                        eprintln!("[CRITICAL] Hot-reload notification pipeline broken: {:#}", e);
+                    }
+                }
+            }
         });
 
         if let Ok(mut watcher) = watcher_res {
@@ -500,7 +518,40 @@ fn dispatch_to_worker(
     {
         let reg_read = registry.read();
         if let Some(tx) = reg_read.get(&container_id) {
-            let _ = tx.try_send((try_actions, final_actions, rule_name, trigger_message));
+            // Fast-path channel transmission protection matrix
+            if let Err(e) = tx.try_send((try_actions, final_actions, rule_name, trigger_message)) {
+                match e {
+                    TrySendError::Full((_, final_acts, rule, msg)) => {
+                        emit_log(
+                            "CRITICAL", "orchestrator", Some(&rule), Some(&container_id), None, Some("route"), "FAST_PATH_SATURATED",
+                            "Worker queue saturated on fast-path lookup. Invoking emergency synchronous bypass thread.",
+                            config_log_level, json_enabled
+                        );
+                        let cid_clone = container_id.clone();
+                        let wl_clone = Arc::clone(&whitelist);
+                        let tbl_clone = Arc::clone(&table);
+                        let ds_clone = docker_socket_path.to_string();
+                        thread::spawn(move || {
+                            execute_containment_pipeline(cid_clone, vec![], final_acts, wl_clone, tbl_clone, config_log_level, json_enabled, rule, ds_clone, msg);
+                        });
+                    }
+                    TrySendError::Disconnected((_, final_acts, rule, msg)) => {
+                        emit_log(
+                            "CRITICAL", "orchestrator", Some(&rule), Some(&container_id), None, Some("route"), "FAST_PATH_BROKEN_PIPE",
+                            "Catastrophic Error: Fast-path ingestion channel disconnected. Spawning recovery thread loop.",
+                            config_log_level, json_enabled
+                        );
+                        let cid_clone = container_id.clone();
+                        let wl_clone = Arc::clone(&whitelist);
+                        let tbl_clone = Arc::clone(&table);
+                        let ds_clone = docker_socket_path.to_string();
+                        thread::spawn(move || {
+                            execute_containment_pipeline(cid_clone, vec![], final_acts, wl_clone, tbl_clone, config_log_level, json_enabled, rule, ds_clone, msg);
+                        });
+                    }
+                }
+            }
+
             return;
         }
     }
@@ -538,10 +589,14 @@ fn dispatch_to_worker(
         worker_tx
     });
 
+    // Explicit mapping for Disconnected slow-path states to handle dropped worker instances cleanly
     let _ = tx.try_send((try_actions, final_actions.clone(), rule_name.clone(), trigger_message.clone())).map_err(|e| {
         match e {
             TrySendError::Full(_) => {
-                emit_log("CRITICAL", "orchestrator", Some(&rule_name), Some(&container_id), None, Some("route"), "SATURATED", "Worker queue saturated. Bypassing synchronously for final playbooks.", config_log_level, json_enabled);
+                emit_log(
+                    "CRITICAL", "orchestrator", Some(&rule_name), Some(&container_id), None, Some("route"), "SATURATED",
+                    "Worker queue saturated. Bypassing synchronously for final playbooks.", config_log_level, json_enabled
+                );
                 let cid_clone = container_id.clone();
                 let wl_clone = Arc::clone(&whitelist);
                 let tbl_clone = Arc::clone(&table);
@@ -550,7 +605,20 @@ fn dispatch_to_worker(
                     execute_containment_pipeline(cid_clone, vec![], final_actions, wl_clone, tbl_clone, config_log_level, json_enabled, rule_name, ds_clone, trigger_message);
                 });
             }
-            _ => {}
+            TrySendError::Disconnected(_) => {
+                emit_log(
+                    "CRITICAL", "orchestrator", Some(&rule_name), Some(&container_id), None, Some("route"), "SLOW_PATH_BROKEN_PIPE",
+                    "Catastrophic Error: Slow-path ingestion channel disconnected. Worker has ceased execution!",
+                    config_log_level, json_enabled
+                );
+                let cid_clone = container_id.clone();
+                let wl_clone = Arc::clone(&whitelist);
+                let tbl_clone = Arc::clone(&table);
+                let ds_clone = docker_socket_path.to_string();
+                thread::spawn(move || {
+                    execute_containment_pipeline(cid_clone, vec![], final_actions, wl_clone, tbl_clone, config_log_level, json_enabled, rule_name, ds_clone, trigger_message);
+                });
+            }
         }
     });
 }

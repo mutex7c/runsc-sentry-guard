@@ -206,7 +206,7 @@ fn execute_docker_uds_request(
                 );
             }
 
-            // Forensics Telemetry Hook: Gated strictly under Trace scope to track live buffer decoding sequences[cite: 3]
+            // Forensics Telemetry Hook: Gated strictly under Trace scope to track live buffer decoding sequences
             emit_log(
                 "TRACE",
                 "worker_engine",
@@ -387,10 +387,10 @@ fn execute_atomic_command(
             {
                 // !!! DO NOT REMOVE THIS NOTICE !!!
                 // ---------------------------------
-                // SAFETY: The block executed inside pre_exec runs between a POSIX fork and execve[cite: 3]
-                // To prevent catastrophic deadlocks in multithreaded runtime environments,[cite: 3]
-                // this closure MUST stay strictly async-signal-safe. Do not introduce heap allocations[cite: 3]
-                // (String, Vec), logging formatting, or user-space lock acquisitions here[cite: 3]
+                // SAFETY: The block executed inside pre_exec runs between a POSIX fork and execve
+                // To prevent catastrophic deadlocks in multithreaded runtime environments,
+                // this closure MUST stay strictly async-signal-safe. Do not introduce heap allocations
+                // (String, Vec), logging formatting, or user-space lock acquisitions here
 
                 unsafe {
                     cmd.pre_exec(|| {
@@ -418,8 +418,15 @@ fn execute_atomic_command(
                     }
                     Ok(None) => {
                         if start.elapsed() > timeout {
-                            let _ = child.kill();
-                            let _ = child.wait();
+                            // Deterministic handling of script termination and reaping states
+                            if let Err(e) = child.kill() {
+                                emit_log("ERROR", "worker_engine", None, Some(container_id), None, Some("script_kill"), "LEAK", &format!("Failed to kill runaway script process: {:#}", e), config_log_level, json_enabled);
+                            }
+                            match child.wait() {
+                                Ok(status) => emit_log("INFO", "worker_engine", None, Some(container_id), None, Some("script_reap"), "SUCCESS", &format!("Runaway script reaped. Status: {}", status), config_log_level, json_enabled),
+                                Err(e) => emit_log("ERROR", "worker_engine", None, Some(container_id), None, Some("script_reap"), "ZOMBIE", &format!("Failed to wait for killed child: {:#}", e), config_log_level, json_enabled),
+                            }
+
                             bail!("Custom extension script exceeded 15-second execution boundary. Process forcefully terminated.");
                         }
                         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -981,6 +988,8 @@ pub fn extract_id_from_pid(pid: i32) -> Option<String> {
 pub fn cleanup_stale_firewall_elements(config: &crate::config::GuardConfig) {
     let table = &config.monitor.nftables_default_table;
     let ip_regex = regex::Regex::new(r"\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b|([a-fA-F0-9:]+:+[a-fA-F0-9:]+)\b").unwrap();
+    let json_enabled = config.monitor.json_logging_enabled;
+    let config_log_level = config.monitor.log_level;
 
     for rule in &config.rules {
         let combined_actions = rule.try_actions.iter().chain(rule.final_actions.iter());
@@ -1010,13 +1019,18 @@ pub fn cleanup_stale_firewall_elements(config: &crate::config::GuardConfig) {
                     if !stale_ips.is_empty() {
                         let elements_payload = format!("{{ {} }}", stale_ips.join(", "));
 
-                        let _ = Command::new("nft")
+                        match Command::new("nft")
                             .arg("delete")
                             .arg("element")
                             .args(table.split_whitespace())
                             .arg(set_name)
                             .arg(&elements_payload)
-                            .status();
+                            .status()
+                        {
+                            Ok(s) if s.success() => {},
+                            Ok(s) => emit_log("WARN", "bootstrap_cleanup", None, None, None, Some("nft"), "FAILURE", &format!("nft delete exited with code: {:?}", s.code()), config_log_level, json_enabled),
+                            Err(e) => emit_log("ERROR", "bootstrap_cleanup", None, None, None, Some("nft"), "CRASH", &format!("Failed to execute nft binary: {:#}", e), config_log_level, json_enabled),
+                        }
                     }
                 }
             }

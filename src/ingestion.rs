@@ -441,9 +441,24 @@ pub fn evaluate_line_signatures(
         emit_log("DEBUG", "orchestrator", None, None, None, Some("signature_eval"), "EVALUATING", &format!("Scanning active stream sequences against signature layout: '{}'", rule_name), config_log_level, json_enabled);
 
         if rx.is_match(line) {
-            let container_id = if let Some(ref id) = file_container_id { id.clone() }
-            else if let Some(caps) = id_extractor.captures(line) { if let Some(matched_id) = caps.get(1) { matched_id.as_str().to_string() } else { continue; } }
-            else { continue; };
+            let container_id = if let Some(ref id) = file_container_id {
+                id.clone()
+            } else if !is_from_file {
+                emit_log(
+                    "WARN", "uds_server", Some(rule_name), None, None, Some("trust_boundary"), "REJECTED",
+                    "Socket stream failed kernel identity resolution. Dropping unauthenticated payload.",
+                    config_log_level, json_enabled
+                );
+                continue;
+            } else if let Some(caps) = id_extractor.captures(line) {
+                if let Some(matched_id) = caps.get(1) {
+                    matched_id.as_str().to_string()
+                } else {
+                    continue;
+                }
+            } else {
+                continue;
+            };
 
             #[cfg(target_os = "linux")]
             {
@@ -480,7 +495,29 @@ pub fn evaluate_line_signatures(
                             dos_write.negative_queue.push_back(container_id.clone());
                         }
                     } else {
-                        emit_log("WARN", "orchestrator", None, None, None, Some("api_rate_limit"), "DROPPED", "Lookup token pool exhausted.", config_log_level, json_enabled);
+
+                        // ANTI-BLINDNESS SAFEGUARD
+                        // If tokens are exhausted, we don't drop the event blindly
+                        // We route the signature breach using a dedicated "UNKNOWN_OR_UNSYNCED"
+                        // fallback routing marker to ensure corporate SIEM visibility under flood
+                        drop(dos_guard);
+                        emit_log(
+                            "CRITICAL", "orchestrator", Some(rule_name), Some(&container_id), None, Some("api_backpressure"), "RECOURSE_ROUTED",
+                            "Lookup token pool exhausted. Container identity unverified but threat signature matches. Enforcing fallback routing.",
+                            config_log_level, json_enabled
+                        );
+
+                        let fallback_id = format!("UNSYNCED_ID_{}", &container_id[..std::cmp::min(12, container_id.len())]);
+                        let mut active_try = try_act.clone();
+                        if is_from_file && active_try.first() != Some(&AtomicAction::ValidateState) {
+                            active_try.insert(0, AtomicAction::ValidateState);
+                        }
+
+                        dispatch_to_worker(
+                            registry, fallback_id, active_try, final_act.clone(), rule_name.clone(),
+                            Arc::clone(whitelist), Arc::clone(table), json_enabled, config_log_level,
+                            docker_socket_path, line.to_string(), max_workers,
+                        );
                         continue;
                     }
                 }

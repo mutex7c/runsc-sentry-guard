@@ -337,7 +337,7 @@ fn execute_atomic_command(
             let payload = serde_json::to_string(&payload_obj)
                 .map_err(|e| anyhow!("Failed to serialize webhook alert payload: {}", e))?;
 
-            let s = Command::new("curl")
+            let s = Command::new("/usr/bin/curl")
                 .args(&[
                     "-X", "POST",
                     "-H", "Content-Type: application/json",
@@ -690,7 +690,7 @@ fn execute_firewall_mutation(
 
     let element_payload = format!("{{ {} timeout {} comment \"runsc-sentry-guard\" }}", ip, timeout);
 
-    let s = Command::new("nft")
+    let s = Command::new("/usr/sbin/nft")
         .arg("add")
         .arg("element")
         .arg(family)
@@ -985,7 +985,7 @@ pub fn cleanup_stale_firewall_elements(config: &crate::config::GuardConfig) {
         let combined_actions = rule.try_actions.iter().chain(rule.final_actions.iter());
         for action in combined_actions {
             if let AtomicAction::NftBlacklist { set_name, .. } = action {
-                let output = Command::new("nft")
+                let output = Command::new("/usr/sbin/nft")
                     .arg("list")
                     .arg("set")
                     .arg(family)
@@ -1010,7 +1010,7 @@ pub fn cleanup_stale_firewall_elements(config: &crate::config::GuardConfig) {
                     if !stale_ips.is_empty() {
                         let elements_payload = format!("{{ {} }}", stale_ips.join(", "));
 
-                        match Command::new("nft")
+                        match Command::new("/usr/sbin/nft")
                             .arg("delete")
                             .arg("element")
                             .arg(family)

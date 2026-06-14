@@ -97,7 +97,7 @@ fn main() {
 
             if flush_firewall {
                 for set_name in sets_to_flush {
-                    let status = std::process::Command::new("nft")
+                    let status = std::process::Command::new("/usr/sbin/nft")
                         .arg("flush")
                         .arg("set")
                         .args(nft_table.split_whitespace())

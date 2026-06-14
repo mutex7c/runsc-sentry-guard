@@ -7,15 +7,86 @@ for `runsc` (gVisor) sandboxes written in Rust.
 > 
 > DO NOT USE in production environments yet!
 
-## 1. Motivation
+## 1. Executive Summary & Core Concept (the TL;DR)
 
-`runsc` (gVisor) provides exceptional kernel-level isolation for 
-containers, but traditional container detection tools 
+Imagine your application is running inside a high-security vault 
+(which is what a gVisor container is). While the vault is designed to
+prevent an adversary from easily taking over your entire server, 
+it doesn't automatically stop them from making a mess *inside* the vault 
+if they find a loophole in your app or manage to deploy a zero-day exploit.
+
+`runsc-sentry-guard` is like an **automated, invisible security guard** 
+that stands outside that vault. It safely listens to the vault's internal 
+diagnostic chatter from the host side without ever stepping foot inside.
+
+The absolute millisecond it senses anyone trying to do something malicious 
+inside your container—like launching a forbidden terminal shell or setting 
+up a hidden hacking tool—the guard springs into action automatically:
+
+*   **Freeze the Threat:** It instantly locks down and pauses the compromised 
+container so the intruder's scripts can't even execute a single line of automated code.
+*   **Air-Gap the Network:** It snaps a digital shield around the container's network, 
+preventing the intruder from stealing data or attacking other services.
+*   **Save the Evidence:** It takes a forensic snapshot of the container's 
+memory and file system so your team can investigate exactly how the intruder got in.
+*   **Ring the Alarm:** It dispatches structured audit logs straight to your security 
+operations team or sounds the alarm via webhooks.
+
+
+> **Our Mission: Provide Open and Free Enterprise Grade Cyber Defense for Everyone**
+> 
+> While the operational abstraction is kept as straightforward 
+> as possible for administrators, the underlying runtime engine 
+> is engineered to satisfy strict regulatory compliance 
+> flight-checks (including NIS2, DORA, and the Cyber Resilience Act).
+> 
+
+
+### Why this should matter to you:
+
+Traditional security tools sit *inside* the container alongside your app. 
+If an intruder gets root access, they can simply blind, trick, or turn off 
+the security tool.
+
+Because `runsc-sentry-guard` operates entirely **out-of-band** (from the outside host edge), 
+the workload has zero visibility into the guard daemon. To an intruder, the guard is 
+completely invisible, tamper-proof, and impossible to bypass. 
+
+Our goal is to provide even beginner administrators enterprise-grade, real-time 
+cyber response capabilities with **zero** performance impact on their running applications.
+
+### Turnkey Quick Start (Run in 60 Seconds)
+
+For rapid evaluations on staging instances, you can bypass native toolchain 
+compilation entirely by fetching our pre-compiled release artifacts directly.
+
+> **Platform Compatibility Warning:** These turnkey commands and real-time containment loops require a native Linux operating system. Attempting to run this binary directly on a macOS terminal or Windows PowerShell prompt will invoke our safe simulation layer (`[DEV-MOCK]`) rather than executing active host firewall or container mutations.
+>
+
+```bash
+# 1. Grab the latest stable release asset and sample manifests
+curl -L -O https://github.com/mutex7c/runsc-sentry-guard/releases/latest/download/runsc-sentry-guard
+curl -L -O https://github.com/mutex7c/runsc-sentry-guard/releases/latest/download/config.toml.example
+curl -L -O https://github.com/mutex7c/runsc-sentry-guard/releases/latest/download/rules.json.example
+
+# 2. Initialize your secure decoupled blueprints
+mv config.toml.example config.toml
+mv rules.json.example rules.json
+
+# 3. Arm the executable and start out-of-band monitoring
+chmod +x runsc-sentry-guard
+sudo ./runsc-sentry-guard config.toml
+```
+
+## 2. Motivation
+
+While `runsc` (gVisor) provides exceptional kernel-level isolation for 
+containers, traditional container detection tools 
 often struggle or introduce unnecessary performance 
 overhead when trying to intercept deep sandbox system calls. 
 
 When a container running inside a runsc profile experiences an 
-exploit, it generates various indicators of compromise (IOC) 
+exploit, it generates various Indicators Of Compromise (IOC) 
 inside the host-side debug streams. `runsc-sentry-guard` intercepts 
 these events out-of-band directly from the host edge. 
 
@@ -24,7 +95,7 @@ kernel-hooking architectures (like eBPF) or intrusive container
 modifications, enabling real-time, zero-dependency 
 active containment.
 
-## 2. Architectural Design Philosophy
+## 3. Architectural Design Philosophy
 
 `runsc-sentry-guard` challenges traditional container security conventions. 
 By shifting the defense boundary from inside the workload to the host edge, it fixes 
@@ -37,121 +108,12 @@ the visibility and latency flaws inherent in legacy detection tools.
 | **Concurrency Scale**  | **Monolithic Event FIFO Queues:** Processes incoming logs sequentially. A single high-volume attack or a hanging mitigation script can block the entire event pipeline for adjacent workloads.                                                                                                                                                        | **Key-Based Serialization:** Spawns isolated, independent worker threads pinned to unique Container IDs. A complex containment routine on container A never stalls defenses for container B.                                             |
 | **Ingestion Latency**  | **Disk Log Tailers:** Relies on gVisor writing `.boot` files to the host storage layer, introducing minor filesystem write overhead and potential TOCTOU (Time-of-Check to Time-of-Use) security latency. This option is supported by `runsc-sentry-guard` for testing, but UDS Stream Receiver / Socket Mode is strictly recommended for production. | **UDS Stream Receiver:** Bypasses host disk I/O completely. Runtimes stream telemetry straight into the daemon's user-space memory, dropping response latency to sub-millisecond intervals and eliminating disk-spoofing risks entirely. |
 
-## 3. Core Documentation & Context Links
+## 4. Core Documentation & Context Links
 
+* [Source Compilation & System Installation Guide](./BUILD_INSTALL.md)
 * [Product Requirements & Compliance Specs (CRA & NIS2)](./REQUIREMENTS_AND_COMPLIANCE.md)
 * [Technical Implementation Specification](./TECHNICAL_SPECIFICATION.md)
 * [Configuration & Script Specs](./CONFIG.md)
 * [Host Hardening Profiles (AppArmor, Systemd)](./SECURITY_HARDENING.md)
 * [Integration Testing & Threat Simulation Playbook](./TESTING_AND_SIMULATION.md)
 
-## 4. Compilation & Assembly
-
-Choose **one** of the following compilation workflows based on your host environment 
-constraints:
-
-### Path A: Local Rust Toolchain Execution (Developers)
-
-If you have the stable Rust compiler toolchain installed natively on your local 
-development machine, run:
-
-```bash
-cargo build --release
-```
-
-The optimized artifact will be output directly to `./target/release/runsc-sentry-guard`.
-
-### Path B: Toolchain-Free Containerized Compilation (Production Servers)
-
-If you do not want to install the Rust compiler natively on your production host machine, 
-you can build the binary inside an ephemeral, official container wrapper:
-
-```bash
-docker run --rm -v "$PWD":/usr/src/guard -w /usr/src/guard rust:1.96-alpine cargo build --release
-```
-
-This command mounts your local source directories, leverages the isolated build container cache, 
-and drops the compiled native Linux binary smoothly into your local `./target/release/` output 
-path without polluting your host engine dependencies.
-
-### Path C: Automated CI/CD Image Assembly (Cloud-Native)
-
-To distribute and run the guard inside containerized or orchestrated environments 
-(like Kubernetes), use this multi-stage `Dockerfile`. It compiles the binary within 
-an isolated build layer and copies it into a highly stripped, minimal runtime image 
-to keep the attack surface negligible.
-
-Create a file named `Dockerfile` in your root folder:
-
-```dockerfile
-# Stage 1: Build Environment
-FROM rust:1.96-alpine AS builder
-WORKDIR /usr/src/runsc-sentry-guard
-COPY . .
-RUN cargo build --release
-
-# Stage 2: Minimal Production Image
-FROM alpine:3.23
-RUN apk add --no-cache nftables iptables docker-cli
-COPY --from=builder /usr/src/runsc-sentry-guard/target/release/runsc-sentry-guard /usr/sbin/runsc-sentry-guard
-ENTRYPOINT ["/usr/sbin/runsc-sentry-guard"]
-```
-
-## 5. Installation & Deployment
-
-### 5.1 Prerequisites
-
-* A Linux host system running a supported modern kernel distribution (Debian, Ubuntu, RHEL, Fedora, Arch).
-* Docker or Podman running workloads utilizing the gVisor `runsc` runtime wrapper.
-* `nftables` active on the host edge for automated network isolation support.
-* If mode = "socket" or "dual" is selected, the deployment environment must allow socket allocation under /var/run/.
-
-### 5.2 Step 1: Acquire the Source Code
-
-Choose the method that matches your environment setup:
-
-* **Option 1: Using Git (Standard Clone)**
-  ```bash
-  git clone https://github.com/mutex7c/runsc-sentry-guard.git
-  cd runsc-sentry-guard
-  ```
-
-* **Option 2: Without Git (Tarball curl for minimal servers)**
-  ```bash
-  curl -L https://github.com/mutex7c/runsc-sentry-guard/tarball/main | tar -xz
-  cd mutex7c-runsc-sentry-guard-*
-  ```
-
-### 5.3 Step 2: Establish Configuration Profile
-
-Provision your centralized environment configuration and your threat rules manifest blueprints:
-
-```bash
-cp config.toml.example config.toml
-cp rules.json.example rules.json
-```
-
-1. Open `config.toml` to declare your system environment baselines, network whitelists, and paths to your manifests.
-2. Modify `rules.json` to manage reusable, automated active containment playbooks and group threat intelligence patterns seamlessly.
-
-### 5.4 Step 3: Run the System Installer
-
-Ensure the installer script has administrative execution permissions 
-on the host system:
-
-```bash
-chmod +x install.sh
-```
-
-Execute the automated installer shell script with root privileges 
-to establish FHS directory structures, copy binaries to `/usr/sbin/`, and register the background engine:
-
-```bash
-sudo ./install.sh
-```
-
-Enable and boot the service container loop via systemd:
-
-```bash
-sudo systemctl enable --now runsc-sentry-guard
-```

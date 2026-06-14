@@ -5,6 +5,7 @@ set -e
 BIN_DEST="/usr/sbin/runsc-sentry-guard"
 CONF_DIR="/etc/runsc-sentry-guard"
 CONF_DEST="$CONF_DIR/config.toml"
+RULES_DEST="$CONF_DIR/rules.json"
 SERVICE_DEST="/etc/systemd/system/runsc-sentry-guard.service"
 
 # Enforcement Boundary: Enforce administrative privileges check
@@ -15,13 +16,16 @@ fi
 
 echo "Bootstrapping runsc-sentry-guard installation pipeline..."
 
-# Locate build artifact from both native or containerized cargo paths
+# Locate build artifact from native cargo, containerized cargo, or turnkey download path
 if [ -f "./target/release/runsc-sentry-guard" ]; then
     echo "Verified local release build target artifact. Deploying..."
     cp "./target/release/runsc-sentry-guard" "$BIN_DEST"
+elif [ -f "./runsc-sentry-guard" ]; then
+    echo "Verified turnkey/pre-compiled binary in current directory. Deploying..."[cite: 1]
+    cp "./runsc-sentry-guard" "$BIN_DEST"[cite: 1]
 else
-    echo "Execution Error: Compiled binary artifact not found at './target/release/runsc-sentry-guard'." >&2
-    echo "Please compile the application via 'cargo build --release' or your Docker workflow before deploying." >&2
+    echo "Execution Error: Compiled binary artifact not found at './target/release/runsc-sentry-guard' or './runsc-sentry-guard'." >&2[cite: 1]
+    echo "Please compile the application via 'cargo build --release' or download a release binary before deploying." >&2[cite: 1]
     exit 1
 fi
 
@@ -47,6 +51,7 @@ if [ ! -d "/var/log/runsc-sentry-guard" ]; then
     chmod 750 "/var/log/runsc-sentry-guard"
 fi
 
+# Deploy centralized environment config profile[cite: 1]
 if [ ! -f "$CONF_DEST" ]; then
     if [ -f "./config.toml" ]; then
         echo "Found personalized config.toml file. Deploying to production folder..."
@@ -56,10 +61,26 @@ if [ ! -f "$CONF_DEST" ]; then
         cp "./config.toml.example" "$CONF_DEST"
     fi
     chmod 640 "$CONF_DEST"
-    chown -R root:root "$CONF_DIR"
 else
     echo "Active profile detected at $CONF_DEST. Skipping file overwrite rules."
 fi
+
+# Deploy decoupled decoupled rules manifest profile
+if [ ! -f "$RULES_DEST" ]; then
+    if [ -f "./rules.json" ]; then
+        echo "Found personalized rules.json file. Deploying to production folder..."
+        cp "./rules.json" "$RULES_DEST"
+    else
+        echo "No active rules manifest found. Deploying system defaults via configuration template..."
+        cp "./rules.json.example" "$RULES_DEST"
+    fi
+    chmod 640 "$RULES_DEST"
+else
+    echo "Active rules manifest detected at $RULES_DEST. Skipping file overwrite rules."
+fi
+
+# Ensure correct root ownership across the entire configuration directory container
+chown -R root:root "$CONF_DIR"
 
 # Provision host systemd service structures if native paths are present
 if [ -d "/run/systemd/system" ]; then
@@ -140,7 +161,7 @@ if [ -f "/sys/module/apparmor/parameters/enabled" ] && [ "$(cat /sys/module/appa
   /usr/bin/curl rcx,
 
   # ─────────────────────────────────────────────────────────────────
-  # SURGICAL SCRIPT EXTENSION GATES
+  # SCRIPT EXTENSION GATES
   # ─────────────────────────────────────────────────────────────────
   # Allow the daemon to execute standard shells under inheritance (ix)
   /bin/sh ix,

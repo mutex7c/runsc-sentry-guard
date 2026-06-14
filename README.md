@@ -12,14 +12,14 @@ for `runsc` (gVisor) sandboxes written in Rust.
 Imagine your application is running inside a high-security vault 
 (which is what a gVisor container is). While the vault is designed to
 prevent an adversary from easily taking over your entire server, 
-it doesn't automatically stop them from making a mess *inside* the vault 
+it doesn't automatically stop them from making a mess *inside* the container 
 if they find a loophole in your app or manage to deploy a zero-day exploit.
 
 `runsc-sentry-guard` is like an **automated, invisible security guard** 
 that stands outside that vault. It safely listens to the vault's internal 
 diagnostic chatter from the host side without ever stepping foot inside.
 
-The absolute millisecond it senses anyone trying to do something malicious 
+The moment it senses anyone trying to do something malicious 
 inside your container, like launching a forbidden terminal shell or setting 
 up a hidden hacking tool, the guard takes action automatically:
 

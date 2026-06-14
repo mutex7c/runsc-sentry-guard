@@ -518,40 +518,26 @@ fn dispatch_to_worker(
     {
         let reg_read = registry.read();
         if let Some(tx) = reg_read.get(&container_id) {
-            // Fast-path channel transmission protection matrix
+            // Fast-Path Event Routing Check
             if let Err(e) = tx.try_send((try_actions, final_actions, rule_name, trigger_message)) {
                 match e {
-                    TrySendError::Full((_, final_acts, rule, msg)) => {
+                    TrySendError::Full((_, _, rule, _)) => {
+
                         emit_log(
-                            "CRITICAL", "orchestrator", Some(&rule), Some(&container_id), None, Some("route"), "FAST_PATH_SATURATED",
-                            "Worker queue saturated on fast-path lookup. Invoking emergency synchronous bypass thread.",
+                            "CRITICAL", "orchestrator", Some(&rule), Some(&container_id), None, Some("route"), "FAST_PATH_DROPPED",
+                            "Queue saturated on fast-path lookup. Enforcing rigid backpressure: Event dropped to prevent host OOM.",
                             config_log_level, json_enabled
                         );
-                        let cid_clone = container_id.clone();
-                        let wl_clone = Arc::clone(&whitelist);
-                        let tbl_clone = Arc::clone(&table);
-                        let ds_clone = docker_socket_path.to_string();
-                        thread::spawn(move || {
-                            execute_containment_pipeline(cid_clone, vec![], final_acts, wl_clone, tbl_clone, config_log_level, json_enabled, rule, ds_clone, msg);
-                        });
                     }
-                    TrySendError::Disconnected((_, final_acts, rule, msg)) => {
+                    TrySendError::Disconnected((_, _, rule, _)) => {
                         emit_log(
                             "CRITICAL", "orchestrator", Some(&rule), Some(&container_id), None, Some("route"), "FAST_PATH_BROKEN_PIPE",
-                            "Catastrophic Error: Fast-path ingestion channel disconnected. Spawning recovery thread loop.",
+                            "Catastrophic Failure: Fast-path ingestion channel disconnected. Worker thread has terminated unexpectedly!",
                             config_log_level, json_enabled
                         );
-                        let cid_clone = container_id.clone();
-                        let wl_clone = Arc::clone(&whitelist);
-                        let tbl_clone = Arc::clone(&table);
-                        let ds_clone = docker_socket_path.to_string();
-                        thread::spawn(move || {
-                            execute_containment_pipeline(cid_clone, vec![], final_acts, wl_clone, tbl_clone, config_log_level, json_enabled, rule, ds_clone, msg);
-                        });
                     }
                 }
             }
-
             return;
         }
     }
@@ -589,35 +575,23 @@ fn dispatch_to_worker(
         worker_tx
     });
 
-    // Explicit mapping for Disconnected slow-path states to handle dropped worker instances cleanly
-    let _ = tx.try_send((try_actions, final_actions.clone(), rule_name.clone(), trigger_message.clone())).map_err(|e| {
+    // Slow-Path Event Routing Execution
+    let _ = tx.try_send((try_actions, final_actions, rule_name.clone(), trigger_message)).map_err(|e| {
         match e {
             TrySendError::Full(_) => {
+
                 emit_log(
-                    "CRITICAL", "orchestrator", Some(&rule_name), Some(&container_id), None, Some("route"), "SATURATED",
-                    "Worker queue saturated. Bypassing synchronously for final playbooks.", config_log_level, json_enabled
+                    "CRITICAL", "orchestrator", Some(&rule_name), Some(&container_id), None, Some("route"), "SLOW_PATH_DROPPED",
+                    "Worker execution queue full. Enforcing rigid backpressure: Event dropped to prevent host thread exhaustion.",
+                    config_log_level, json_enabled
                 );
-                let cid_clone = container_id.clone();
-                let wl_clone = Arc::clone(&whitelist);
-                let tbl_clone = Arc::clone(&table);
-                let ds_clone = docker_socket_path.to_string();
-                thread::spawn(move || {
-                    execute_containment_pipeline(cid_clone, vec![], final_actions, wl_clone, tbl_clone, config_log_level, json_enabled, rule_name, ds_clone, trigger_message);
-                });
             }
             TrySendError::Disconnected(_) => {
                 emit_log(
                     "CRITICAL", "orchestrator", Some(&rule_name), Some(&container_id), None, Some("route"), "SLOW_PATH_BROKEN_PIPE",
-                    "Catastrophic Error: Slow-path ingestion channel disconnected. Worker has ceased execution!",
+                    "CRITICAL ERROR: Slow-path ingestion channel disconnected. Worker has ceased execution!",
                     config_log_level, json_enabled
                 );
-                let cid_clone = container_id.clone();
-                let wl_clone = Arc::clone(&whitelist);
-                let tbl_clone = Arc::clone(&table);
-                let ds_clone = docker_socket_path.to_string();
-                thread::spawn(move || {
-                    execute_containment_pipeline(cid_clone, vec![], final_actions, wl_clone, tbl_clone, config_log_level, json_enabled, rule_name, ds_clone, trigger_message);
-                });
             }
         }
     });

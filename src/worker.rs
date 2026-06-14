@@ -331,23 +331,19 @@ fn execute_atomic_command(
 
     match action {
         AtomicAction::WebhookAlert { url } => {
-            let payload = format!(
-                "{{\"text\":\"[SENTRY-GUARD] Active containment pipeline triggered for container context: {}\"}}",
-                container_id
-            );
+            let payload_obj = serde_json::json!({
+                "text": format!("[SENTRY-GUARD] Active containment pipeline triggered for container context: {}", container_id)
+            });
+            let payload = serde_json::to_string(&payload_obj)
+                .map_err(|e| anyhow!("Failed to serialize webhook alert payload: {}", e))?;
 
             let s = Command::new("curl")
                 .args(&[
-                    "-X",
-                    "POST",
-                    "-H",
-                    "Content-Type: application/json",
-                    "--max-time",
-                    "5",
-                    "--connect-timeout",
-                    "3",
-                    "--data",
-                    &payload,
+                    "-X", "POST",
+                    "-H", "Content-Type: application/json",
+                    "--max-time", "5",
+                    "--connect-timeout", "3",
+                    "--data", &payload,
                     url,
                 ])
                 .status()
@@ -356,10 +352,7 @@ fn execute_atomic_command(
             if s.success() {
                 Ok(())
             } else {
-                bail!(
-                    "Webhook dispatch failed. curl exited with non-zero status code: {:?}",
-                    s.code()
-                );
+                bail!("Webhook dispatch failed. curl exited with non-zero status code: {:?}", s.code());
             }
         }
 
@@ -370,10 +363,7 @@ fn execute_atomic_command(
                 if ips.is_empty() {
                     "UNKNOWN_IP".to_string()
                 } else {
-                    ips.iter()
-                        .map(|ip| ip.to_string())
-                        .collect::<Vec<_>>()
-                        .join(",")
+                    ips.iter().map(|ip| ip.to_string()).collect::<Vec<_>>().join(",")
                 }
             };
 
@@ -385,13 +375,6 @@ fn execute_atomic_command(
 
             #[cfg(target_os = "linux")]
             {
-                // !!! DO NOT REMOVE THIS NOTICE !!!
-                // ---------------------------------
-                // SAFETY: The block executed inside pre_exec runs between a POSIX fork and execve
-                // To prevent catastrophic deadlocks in multithreaded runtime environments,
-                // this closure MUST stay strictly async-signal-safe. Do not introduce heap allocations
-                // (String, Vec), logging formatting, or user-space lock acquisitions here
-
                 unsafe {
                     cmd.pre_exec(|| {
                         libc::prctl(libc::PR_CAP_AMBIENT, libc::PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0);
@@ -410,15 +393,11 @@ fn execute_atomic_command(
                         if status.success() {
                             return Ok(());
                         } else {
-                            bail!(
-                                "Custom extension script exited with failure footprint: {}",
-                                status
-                            );
+                            bail!("Custom extension script exited with failure footprint: {}", status);
                         }
                     }
                     Ok(None) => {
                         if start.elapsed() > timeout {
-                            // Deterministic handling of script termination and reaping states
                             if let Err(e) = child.kill() {
                                 emit_log("ERROR", "worker_engine", None, Some(container_id), None, Some("script_kill"), "LEAK", &format!("Failed to kill runaway script process: {:#}", e), config_log_level, json_enabled);
                             }
@@ -426,7 +405,6 @@ fn execute_atomic_command(
                                 Ok(status) => emit_log("INFO", "worker_engine", None, Some(container_id), None, Some("script_reap"), "SUCCESS", &format!("Runaway script reaped. Status: {}", status), config_log_level, json_enabled),
                                 Err(e) => emit_log("ERROR", "worker_engine", None, Some(container_id), None, Some("script_reap"), "ZOMBIE", &format!("Failed to wait for killed child: {:#}", e), config_log_level, json_enabled),
                             }
-
                             bail!("Custom extension script exceeded 15-second execution boundary. Process forcefully terminated.");
                         }
                         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -689,15 +667,25 @@ fn execute_firewall_mutation(
     table: &str,
 ) -> Result<()> {
     use regex::Regex;
-    static VALIDATION_RULE: OnceLock<Regex> = OnceLock::new();
+    static TIMEOUT_RULE: OnceLock<Regex> = OnceLock::new();
+    static IDENTIFIER_RULE: OnceLock<Regex> = OnceLock::new();
 
-    let rule = VALIDATION_RULE.get_or_init(|| Regex::new(r"^\d+[smhd]$").unwrap());
+    let t_rule = TIMEOUT_RULE.get_or_init(|| Regex::new(r"^\d+[smhd]$").unwrap());
+    let id_rule = IDENTIFIER_RULE.get_or_init(|| Regex::new(r"^[a-zA-Z0-9_]+$").unwrap());
 
-    if !rule.is_match(timeout) {
-        bail!(
-            "Security Constraint Violation: Intercepted malformed firewall duration payload: '{}'",
-            timeout
-        );
+    if !t_rule.is_match(timeout) {
+        bail!("Security Constraint Violation: Intercepted malformed firewall duration payload: '{}'", timeout);
+    }
+
+    let table_parts: Vec<&str> = table.split_whitespace().collect();
+    if table_parts.len() != 2 {
+        bail!("Security Error: Malformed nftables table format configuration. Expected exact 'family name' (e.g., 'inet filter').");
+    }
+    let family = table_parts[0];
+    let table_name = table_parts[1];
+
+    if !id_rule.is_match(family) || !id_rule.is_match(table_name) || !id_rule.is_match(set) {
+        bail!("Security Error: Malformed firewall identifier detected. Arguments must match alphanumeric/underscore boundaries.");
     }
 
     let element_payload = format!("{{ {} timeout {} comment \"runsc-sentry-guard\" }}", ip, timeout);
@@ -705,7 +693,8 @@ fn execute_firewall_mutation(
     let s = Command::new("nft")
         .arg("add")
         .arg("element")
-        .args(table.split_whitespace())
+        .arg(family)
+        .arg(table_name)
         .arg(set)
         .arg(&element_payload)
         .status()
@@ -817,7 +806,7 @@ pub fn execute_containment_pipeline(
                             if signal == "SIGKILL" || signal == "SIGSTOP" {
                                 emit_log(
                                     "CRITICAL",
-                                    "worker_engine",
+                                    "runsc_sentry_guard",
                                     Some(&rule_name),
                                     Some(&container_id),
                                     None,
@@ -833,7 +822,7 @@ pub fn execute_containment_pipeline(
                         AtomicAction::Restart => {
                             emit_log(
                                 "CRITICAL",
-                                "worker_engine",
+                                "runsc_sentry_guard",
                                 Some(&rule_name),
                                 Some(&container_id),
                                 None,
@@ -941,7 +930,7 @@ mod tests {
         assert!(validation_result.is_err());
 
         if let Err(err) = validation_result {
-            assert!(err.to_string().contains("Security Constraint Violation"));
+            assert!(err.to_string().contains("Security Error"));
         }
     }
 
@@ -954,7 +943,32 @@ mod tests {
     }
 }
 
+#[allow(dead_code)]
+pub fn extract_id_from_lines<I, S>(lines: I, id_extractor: &regex::Regex) -> Option<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut fallback: Option<String> = None;
+    for line_ref in lines {
+        let line = line_ref.as_ref();
+        if let Some(caps) = id_extractor.captures(line) {
+            if let Some(matched_id) = caps.get(1) {
+                let id = matched_id.as_str().to_string();
+                if line.contains("docker") || line.contains("kubepods") || line.contains("containerd") || line.contains("runsc") {
+                    return Some(id);
+                }
+                if fallback.is_none() {
+                    fallback = Some(id);
+                }
+            }
+        }
+    }
+    fallback
+}
+
 #[cfg(target_os = "linux")]
+#[allow(dead_code)]
 pub fn extract_id_from_pid(pid: i32) -> Option<String> {
     use std::fs;
     use regex::Regex;
@@ -965,22 +979,7 @@ pub fn extract_id_from_pid(pid: i32) -> Option<String> {
 
     let cgroup_path = format!("/proc/{}/cgroup", pid);
     if let Ok(content) = fs::read_to_string(cgroup_path) {
-        let mut fallback: Option<String> = None;
-
-        for line in content.lines() {
-            if let Some(caps) = extractor.captures(line) {
-                if let Some(matched_id) = caps.get(1) {
-                    let id = matched_id.as_str().to_string();
-                    if line.contains("docker") || line.contains("kubepods") || line.contains("containerd") || line.contains("runsc") {
-                        return Some(id);
-                    }
-                    if fallback.is_none() {
-                        fallback = Some(id);
-                    }
-                }
-            }
-        }
-        return fallback;
+        return extract_id_from_lines(content.lines(), extractor);
     }
     None
 }
@@ -991,6 +990,14 @@ pub fn cleanup_stale_firewall_elements(config: &crate::config::GuardConfig) {
     let json_enabled = config.monitor.json_logging_enabled;
     let config_log_level = config.monitor.log_level;
 
+    let table_parts: Vec<&str> = table.split_whitespace().collect();
+    if table_parts.len() != 2 {
+        emit_log("ERROR", "bootstrap_cleanup", None, None, None, Some("config"), "FAILURE", "Malformed table definition in manifest. Cleanup skipped.", config_log_level, json_enabled);
+        return;
+    }
+    let family = table_parts[0];
+    let table_name = table_parts[1];
+
     for rule in &config.rules {
         let combined_actions = rule.try_actions.iter().chain(rule.final_actions.iter());
         for action in combined_actions {
@@ -998,7 +1005,8 @@ pub fn cleanup_stale_firewall_elements(config: &crate::config::GuardConfig) {
                 let output = Command::new("nft")
                     .arg("list")
                     .arg("set")
-                    .args(table.split_whitespace())
+                    .arg(family)
+                    .arg(table_name)
                     .arg(set_name)
                     .output();
 
@@ -1022,7 +1030,8 @@ pub fn cleanup_stale_firewall_elements(config: &crate::config::GuardConfig) {
                         match Command::new("nft")
                             .arg("delete")
                             .arg("element")
-                            .args(table.split_whitespace())
+                            .arg(family)
+                            .arg(table_name)
                             .arg(set_name)
                             .arg(&elements_payload)
                             .status()

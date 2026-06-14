@@ -5,15 +5,13 @@
 use regex::Regex;
 use std::collections::HashSet;
 use std::fs;
-use std::io::{BufRead, BufReader, Read};
+use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::io::{FromRawFd, IntoRawFd};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::thread;
 use std::time::Duration;
 
-use mio::net::UnixListener as MioUnixListener;
+use mio::net::{UnixListener as MioUnixListener, UnixStream as MioUnixStream};
 use mio::{Events, Interest, Poll, Token};
 use parking_lot::{Mutex, RwLock};
 
@@ -21,18 +19,11 @@ use crate::config::{AtomicAction, LogLevel, RegistryMap};
 use crate::limiters::{AntiDosState, GlobalRateLimiter};
 use crate::logger::emit_log;
 
-struct ConnectionGuard(Arc<AtomicUsize>);
-
-impl Drop for ConnectionGuard {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
-    }
-}
+const SERVER: Token = Token(0);
+const FIRST_CLIENT_TOKEN: usize = 1;
 
 #[cfg(target_os = "linux")]
-fn get_peer_creds(stream: &std::os::unix::net::UnixStream) -> std::io::Result<(u32, i32)> {
-    use std::os::unix::io::AsRawFd;
-    let fd = stream.as_raw_fd();
+fn get_peer_creds(fd: std::os::unix::io::RawFd) -> std::io::Result<(u32, i32)> {
     let mut ucred = libc::ucred {
         pid: 0,
         uid: 0,
@@ -57,6 +48,112 @@ fn get_peer_creds(stream: &std::os::unix::net::UnixStream) -> std::io::Result<(u
     }
 }
 
+// RACE-FREE IDENTITY RESOLUTION (ANTI-PID RECYCLING)
+// Uses pidfd_open to pin the exact process instance, enforces strict DAC ownership
+// verification via fstat, and leverages openat semantics to close the TOCTOU window
+#[cfg(target_os = "linux")]
+fn extract_id_race_free(peer_pid: i32, peer_uid: u32) -> Option<String> {
+    use std::ffi::CString;
+    use std::io::BufRead;
+    use std::os::unix::io::FromRawFd;
+    use std::sync::OnceLock;
+
+    static ID_EXTRACTOR: OnceLock<Regex> = OnceLock::new();
+    let extractor = ID_EXTRACTOR.get_or_init(|| Regex::new(r"\b([a-fA-F0-9]{64}|[a-fA-F0-9]{12})\b").unwrap());
+
+    // RAII Guard to ensure raw file descriptors are reliably closed on all return paths
+    struct FdGuard(std::os::unix::io::RawFd);
+    impl Drop for FdGuard {
+        fn drop(&mut self) {
+            if self.0 >= 0 {
+                unsafe { libc::close(self.0); }
+            }
+        }
+    }
+
+    // Uniquely pin the process instance using pidfd_open
+    // This creates an immutable handle tied to this specific process lifecycle,
+    // ensuring the target PID cannot be recycled underneath us
+    let pidfd = unsafe {
+        libc::syscall(libc::SYS_pidfd_open, peer_pid, 0) as std::os::unix::io::RawFd
+    };
+    if pidfd < 0 {
+        return None;
+    }
+    let _pidfd_guard = FdGuard(pidfd);
+
+    // Open the process directory under /proc
+    let proc_path = format!("/proc/{}", peer_pid);
+    let proc_dir_c = CString::new(proc_path).ok()?;
+
+    let proc_dir_fd = unsafe {
+        libc::open(
+            proc_dir_c.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if proc_dir_fd < 0 {
+        return None;
+    }
+    let _proc_dir_guard = FdGuard(proc_dir_fd);
+
+    // Cross-examine directory ownership against trusted SO_PEERCRED metadata
+    // Since the owner UID of a /proc/<PID> directory matches the process's effective UID,
+    // fstat detects if the PID was recycled by a different user before our open() call
+    unsafe {
+        let mut statbuf = std::mem::zeroed::<libc::stat>();
+        if libc::fstat(proc_dir_fd, &mut statbuf) < 0 || statbuf.st_uid != peer_uid {
+            return None;
+        }
+    }
+
+    // Securely isolate path resolution via openat
+    let cgroup_c = CString::new("cgroup").unwrap();
+    let cgroup_fd = unsafe {
+        libc::openat(
+            proc_dir_fd,
+            cgroup_c.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC,
+        )
+    };
+    if cgroup_fd < 0 {
+        return None;
+    }
+    let cgroup_guard = FdGuard(cgroup_fd);
+
+    // Final Validation: Dispatch signal 0 via the pinned pidfd
+    // If the process was recycled by the *same* user between step 1 and step 2,
+    // the original process pinned by our pidfd will be dead/zombie, causing
+    // pidfd_send_signal to return an error (or reveal status drift), failing the gate
+    let is_same_process = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            pidfd,
+            0,
+            std::ptr::null::<libc::siginfo_t>(),
+            0
+        ) == 0
+    };
+    if !is_same_process {
+        return None;
+    }
+
+    // Hand over the validated descriptor to the Rust standard library file wrapper
+    // We disarm the guard so the standard library's File type safely owns and closes it
+    std::mem::forget(cgroup_guard);
+    let file = unsafe { fs::File::from_raw_fd(cgroup_fd) };
+    let reader = std::io::BufReader::new(file);
+
+    let lines_iter = reader.lines().filter_map(|l| l.ok());
+    crate::worker::extract_id_from_lines(lines_iter, extractor)
+}
+
+struct AsyncClientConnection {
+    stream: MioUnixStream,
+    buffer: Vec<u8>,
+    container_id: Option<String>,
+}
+
 pub fn run_uds_server(
     registry: Arc<RwLock<RegistryMap>>,
     regex_rules: Arc<RwLock<Vec<(String, Regex, Vec<AtomicAction>, Vec<AtomicAction>)>>>,
@@ -78,82 +175,43 @@ pub fn run_uds_server(
     let mut listener = match MioUnixListener::bind(socket_path) {
         Ok(l) => l,
         Err(e) => {
-            emit_log(
-                "ERROR",
-                "uds_server",
-                None,
-                None,
-                None,
-                None,
-                "CRASH",
-                &format!("UDS bind failed: {}", e),
-                config_log_level,
-                json_enabled,
-            );
+            emit_log("ERROR", "uds_server", None, None, None, None, "CRASH", &format!("UDS bind failed: {}", e), config_log_level, json_enabled);
             return;
         }
     };
 
     if let Err(e) = fs::set_permissions(socket_path, fs::Permissions::from_mode(0o660)) {
-        emit_log(
-            "ERROR",
-            "uds_server",
-            None,
-            None,
-            None,
-            Some("permissions"),
-            "CRASH",
-            &format!(
-                "Failed to enforce secure access permissions on UDS socket: {}",
-                e
-            ),
-            config_log_level,
-            json_enabled,
-        );
+        emit_log("ERROR", "uds_server", None, None, None, Some("permissions"), "CRASH", &format!(
+            "Failed to enforce secure access permissions on UDS socket: {}",
+            e
+        ), config_log_level, json_enabled);
         return;
     }
 
     let mut poll = match Poll::new() {
         Ok(p) => p,
         Err(e) => {
-            emit_log(
-                "ERROR",
-                "uds_server",
-                None,
-                None,
-                None,
-                None,
-                "CRASH",
-                &format!("Failed to initialize mio Poll instance: {}", e),
-                config_log_level,
-                json_enabled,
-            );
+            emit_log("ERROR", "uds_server", None, None, None, None, "CRASH", &format!("Failed to initialize mio Poll instance: {}", e), config_log_level, json_enabled);
             return;
         }
     };
 
-    const SERVER: Token = Token(0);
     if let Err(e) = poll.registry().register(&mut listener, SERVER, Interest::READABLE) {
-        emit_log(
-            "ERROR",
-            "uds_server",
-            None,
-            None,
-            None,
-            None,
-            "CRASH",
-            &format!("Failed to register UDS listener with mio registry: {}", e),
-            config_log_level,
-            json_enabled,
-        );
+        emit_log("ERROR", "uds_server", None, None, None, None, "CRASH", &format!("Failed to register UDS listener with mio registry: {}", e), config_log_level, json_enabled);
         return;
     }
 
     crate::ingestion::notify_systemd_ready();
 
-    let active_connections = Arc::new(AtomicUsize::new(0));
-    const MAX_UDS_CONNECTIONS: usize = 50;
+    let mut connection_pool: std::collections::HashMap<Token, AsyncClientConnection> = std::collections::HashMap::new();
+    let mut unique_token_counter = FIRST_CLIENT_TOKEN;
     let mut events = Events::with_capacity(128);
+
+    // KERNEL BACKLOG STATE TRACKER
+    // Tracks if the OS kernel listener queue contains pending connections
+    // that were deferred due to the user-space pool reaching its ceiling
+    let mut backlog_pending = false;
+    const MAX_UDS_CONNECTIONS: usize = 50;
 
     while !shutdown.load(Ordering::SeqCst) {
         if let Err(e) = poll.poll(&mut events, Some(Duration::from_millis(100))) {
@@ -163,267 +221,146 @@ pub fn run_uds_server(
             break;
         }
 
+        let mut slot_freed = false;
+
         for event in events.iter() {
-            if event.token() == SERVER && event.is_readable() {
-                loop {
-                    match listener.accept() {
-                        Ok((mio_stream, _)) => {
-                            let stream = unsafe {
-                                std::os::unix::net::UnixStream::from_raw_fd(
-                                    mio_stream.into_raw_fd(),
-                                )
-                            };
-
-                            if let Err(e) = stream.set_nonblocking(false) {
-                                emit_log(
-                                    "ERROR",
-                                    "uds_server",
-                                    None,
-                                    None,
-                                    None,
-                                    None,
-                                    "CRASH",
-                                    &format!("Failed to set blocking mode: {}", e),
-                                    config_log_level,
-                                    json_enabled,
-                                );
-                                continue;
-                            }
-
-                            #[cfg(target_os = "linux")]
-                            let socket_container_id = match get_peer_creds(&stream) {
-                                Ok((peer_uid, peer_pid)) => {
-                                    if peer_uid != 0 {
-                                        emit_log(
-                                            "WARN",
-                                            "uds_server",
-                                            None,
-                                            None,
-                                            None,
-                                            Some("trust_boundary"),
-                                            "REJECTED",
-                                            &format!("Unauthorized UID {} attempted UDS connection. Payload dropped.", peer_uid),
-                                            config_log_level,
-                                            json_enabled,
-                                        );
-                                        continue;
-                                    }
-
-                                    let id = crate::worker::extract_id_from_pid(peer_pid);
-                                    if id.is_none() {
-                                        emit_log(
-                                            "WARN",
-                                            "uds_server",
-                                            None,
-                                            None,
-                                            None,
-                                            Some("trust_boundary"),
-                                            "REJECTED",
-                                            &format!("Failed to resolve container ID from peer PID {}. Connection dropped.", peer_pid),
-                                            config_log_level,
-                                            json_enabled,
-                                        );
-                                        continue;
-                                    }
-                                    id
-                                }
-                                Err(_) => continue,
-                            };
-
-                            #[cfg(not(target_os = "linux"))]
-                            let socket_container_id: Option<String> = None;
-
-                            if active_connections.load(Ordering::SeqCst) >= MAX_UDS_CONNECTIONS {
-                                continue;
-                            }
-
-                            active_connections.fetch_add(1, Ordering::SeqCst);
-                            let conn_tracker = Arc::clone(&active_connections);
-
-                            let reg_clone = Arc::clone(&registry);
-                            let rules_clone = Arc::clone(&regex_rules);
-                            let id_clone = id_extractor.clone();
-                            let wl_clone = Arc::clone(&whitelist);
-                            let tbl_clone = Arc::clone(&table);
-                            let ds_path_clone = docker_socket_path.clone();
-                            let cache_clone = Arc::clone(&active_containers);
-                            let dos_clone = Arc::clone(&anti_dos_state);
-                            let cid_socket_clone = socket_container_id.clone();
-                            let limiter_clone = Arc::clone(&global_limiter);
-
-                            thread::spawn(move || {
-                                let _guard = ConnectionGuard(conn_tracker);
-                                handle_uds_stream(
-                                    stream,
-                                    reg_clone,
-                                    rules_clone,
-                                    id_clone,
-                                    wl_clone,
-                                    tbl_clone,
-                                    json_enabled,
-                                    config_log_level,
-                                    ds_path_clone,
-                                    cache_clone,
-                                    dos_clone,
-                                    cid_socket_clone,
-                                    max_workers,
-                                    limiter_clone,
-                                );
-                            });
-                        }
-                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            break;
-                        }
-                        Err(_) => break,
-                    }
+            match event.token() {
+                SERVER => {
+                    // Flag that the OS has readable connections in the backlog
+                    // We DO NOT accept them here anymore
+                    backlog_pending = true;
                 }
-            }
-        }
-    }
-}
+                client_token => {
+                    let mut should_remove = false;
 
-fn handle_uds_stream(
-    stream: std::os::unix::net::UnixStream,
-    registry: Arc<RwLock<RegistryMap>>,
-    regex_rules: Arc<RwLock<Vec<(String, Regex, Vec<AtomicAction>, Vec<AtomicAction>)>>>,
-    id_extractor: Regex,
-    whitelist: Arc<Vec<ipnet::IpNet>>,
-    table: Arc<String>,
-    json_enabled: bool,
-    config_log_level: LogLevel,
-    docker_socket_path: String,
-    active_containers: Arc<RwLock<HashSet<String>>>,
-    anti_dos_state: Arc<Mutex<AntiDosState>>,
-    socket_container_id: Option<String>,
-    max_workers: usize,
-    global_limiter: Arc<GlobalRateLimiter>,
-) {
-    if let Err(e) = stream.set_read_timeout(Some(Duration::from_millis(100))) {
-        emit_log(
-            "ERROR",
-            "uds_server",
-            None,
-            None,
-            None,
-            Some("timeout_config"),
-            "CRASH",
-            &format!("Failed to enforce socket timeout: {}", e),
-            config_log_level,
-            json_enabled,
-        );
-        return;
-    }
+                    if let Some(conn) = connection_pool.get_mut(&client_token) {
+                        let mut read_buf = [0u8; 1024];
+                        loop {
+                            match conn.stream.read(&mut read_buf) {
+                                Ok(0) => {
+                                    should_remove = true;
+                                    break;
+                                }
+                                Ok(n) => {
+                                    conn.buffer.extend_from_slice(&read_buf[..n]);
+                                    if conn.buffer.len() > 65536 {
+                                        conn.buffer.clear();
+                                        should_remove = true;
+                                        break;
+                                    }
 
-    let mut reader = BufReader::new(stream);
-    let mut buf = Vec::new();
+                                    let mut start_pos = 0;
+                                    while let Some(newline_offset) = conn.buffer[start_pos..].iter().position(|&b| b == b'\n') {
+                                        let end_pos = start_pos + newline_offset;
+                                        let line_slice = String::from_utf8_lossy(&conn.buffer[start_pos..end_pos]);
+                                        let trimmed = line_slice.trim_end();
 
-    loop {
-        buf.clear();
-        let mut chunk = reader.by_ref().take(8192);
-
-        // Telemetry Hook: Gated under Trace scope to track live UDS socket evaluations
-        emit_log(
-            "TRACE",
-            "uds_server",
-            None,
-            socket_container_id.as_deref(),
-            None,
-            Some("stream_read"),
-            "PROCESSING",
-            "Reading next raw diagnostic frame buffer partition across non-allocating socket channels.",
-            config_log_level,
-            json_enabled,
-        );
-
-        match chunk.read_until(b'\n', &mut buf) {
-            Ok(0) => break,
-            Ok(_) => {
-                let has_newline = buf.ends_with(&[b'\n']);
-
-                if !has_newline && buf.len() >= 8192 {
-                    emit_log(
-                        "CRITICAL",
-                        "uds_server",
-                        None,
-                        None,
-                        None,
-                        Some("stream"),
-                        "TRUNCATED",
-                        "UDS Line limit reached without delimiter. Discarding remainder safely.",
-                        config_log_level,
-                        json_enabled,
-                    );
-
-                    let mut sink_buf = [0u8; 1024];
-                    loop {
-                        match reader.read(&mut sink_buf) {
-                            Ok(0) => break,
-                            Ok(n) => {
-                                if sink_buf[..n].contains(&b'\n') {
+                                        if !trimmed.is_empty() {
+                                            let rules_guard = regex_rules.read();
+                                            crate::ingestion::evaluate_line_signatures(
+                                                trimmed,
+                                                &rules_guard,
+                                                &id_extractor,
+                                                &registry,
+                                                &whitelist,
+                                                &table,
+                                                json_enabled,
+                                                config_log_level,
+                                                &docker_socket_path,
+                                                conn.container_id.clone(),
+                                                false,
+                                                &active_containers,
+                                                &anti_dos_state,
+                                                max_workers,
+                                                &global_limiter,
+                                            );
+                                        }
+                                        start_pos = end_pos + 1;
+                                    }
+                                    if start_pos > 0 {
+                                        conn.buffer.drain(0..start_pos);
+                                    }
+                                }
+                                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                    break;
+                                }
+                                Err(_) => {
+                                    should_remove = true;
                                     break;
                                 }
                             }
-                            Err(_) => break,
                         }
                     }
-                    continue;
+
+                    if should_remove {
+                        if let Some(mut conn) = connection_pool.remove(&client_token) {
+                            let _ = poll.registry().deregister(&mut conn.stream);
+
+                            // Flag that space opened up in the pool,
+                            // alerting the engine to check the OS backlog
+                            slot_freed = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        // BACKLOG DRAINING LOOP
+        // Only process the accept queue if there's potential capacity AND pending clients
+        // When MAX_UDS_CONNECTIONS is reached, we break instantly, leaving the
+        // unaccepted clients in the OS TCP/UDS backlog queue
+        if (backlog_pending || slot_freed) && connection_pool.len() < MAX_UDS_CONNECTIONS {
+            loop {
+                // Instantly sever the extraction loop if the pool hits capacity
+                if connection_pool.len() >= MAX_UDS_CONNECTIONS {
+                    backlog_pending = true;
+                    break;
                 }
 
-                let current_line = String::from_utf8_lossy(&buf);
-                let trimmed = current_line.trim_end();
+                match listener.accept() {
+                    Ok((mut client_stream, _)) => {
+                        #[cfg(target_os = "linux")]
+                        let socket_container_id = match get_peer_creds(std::os::unix::io::AsRawFd::as_raw_fd(&client_stream)) {
+                            Ok((peer_uid, peer_pid)) => {
+                                if peer_uid != 0 {
+                                    emit_log("WARN", "uds_server", None, None, None, Some("trust_boundary"), "REJECTED", &format!("Unauthorized UID {} attempted UDS connection. Payload dropped.", peer_uid), config_log_level, json_enabled);
+                                    continue;
+                                }
+                                // Incorporate race-free identity check
+                                extract_id_race_free(peer_pid, peer_uid)
+                            }
+                            Err(_) => continue,
+                        };
 
-                let rules_guard = regex_rules.read();
-                crate::ingestion::evaluate_line_signatures(
-                    trimmed,
-                    &rules_guard,
-                    &id_extractor,
-                    &registry,
-                    &whitelist,
-                    &table,
-                    json_enabled,
-                    config_log_level,
-                    &docker_socket_path,
-                    socket_container_id.clone(),
-                    false,
-                    &active_containers,
-                    &anti_dos_state,
-                    max_workers,
-                    &global_limiter,
-                );
-            }
-            Err(_) => break,
-        }
-    }
-}
+                        #[cfg(not(target_os = "linux"))]
+                        let socket_container_id: Option<String> = None;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+                        let client_token = Token(unique_token_counter);
+                        unique_token_counter += 1;
+                        if unique_token_counter > 1000000 {
+                            unique_token_counter = FIRST_CLIENT_TOKEN;
+                        }
 
-    #[test]
-    fn test_uds_connection_guard_raii_lifecycles() {
-        let counter = Arc::new(AtomicUsize::new(10));
-        {
-            let _guard = ConnectionGuard(Arc::clone(&counter));
-            assert_eq!(counter.load(Ordering::SeqCst), 10);
-        }
-        assert_eq!(counter.load(Ordering::SeqCst), 9);
-    }
-
-    #[test]
-    fn test_uds_connection_saturation_rejections() {
-        let counter = Arc::new(AtomicUsize::new(0));
-        const MAX_UDS_CONNECTIONS: usize = 50;
-        let mut allocated_guards = Vec::new();
-
-        for _ in 0..55 {
-            if counter.load(Ordering::SeqCst) < MAX_UDS_CONNECTIONS {
-                counter.fetch_add(1, Ordering::SeqCst);
-                allocated_guards.push(ConnectionGuard(Arc::clone(&counter)));
+                        if poll.registry().register(&mut client_stream, client_token, Interest::READABLE).is_ok() {
+                            connection_pool.insert(client_token, AsyncClientConnection {
+                                stream: client_stream,
+                                buffer: Vec::with_capacity(1024),
+                                container_id: socket_container_id,
+                            });
+                        }
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        // The OS queue is fully empty
+                        // Safe to turn off the pending flag
+                        backlog_pending = false;
+                        break;
+                    }
+                    Err(_) => {
+                        backlog_pending = false;
+                        break;
+                    }
+                }
             }
         }
-
-        assert_eq!(counter.load(Ordering::SeqCst), 50);
-        assert_eq!(allocated_guards.len(), 50);
     }
 }

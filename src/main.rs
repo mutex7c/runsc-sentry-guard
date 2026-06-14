@@ -8,7 +8,7 @@ mod limiters;
 mod socket;
 mod ingestion;
 
-use config::load_config;
+use config::{load_config, load_and_merge_manifests};
 use std::path::Path;
 use ingestion::start_monitor_loop;
 
@@ -51,70 +51,87 @@ fn main() {
             let log_level = valid_config.monitor.log_level;
             let flush_firewall = valid_config.monitor.flush_firewall_on_shutdown;
             let nft_table = valid_config.monitor.nftables_default_table.clone();
-            let mut sets_to_flush = Vec::new();
 
-            for rule in &valid_config.rules {
-                let combined_actions = rule.try_actions.iter().chain(rule.final_actions.iter());
-                for action in combined_actions {
-                    if let config::AtomicAction::NftBlacklist { set_name, .. } = action {
-                        sets_to_flush.push(set_name.clone());
-                    }
-                }
-            }
+            // Safe Manifest Merging and Verification Boundary
+            match load_and_merge_manifests(&valid_config.monitor.security_manifest_paths) {
+                Ok((global_playbooks, global_rules)) => {
+                    let mut sets_to_flush = Vec::new();
 
-            logger::emit_log(
-                "INFO",
-                "initialization",
-                None,
-                None,
-                None,
-                None,
-                "ARMED",
-                &format!(
-                    "Configuration profile verification successful via path: {}",
-                    active_path
-                ),
-                log_level,
-                json_enabled,
-            );
-
-            worker::cleanup_stale_firewall_elements(&valid_config);
-
-            start_monitor_loop(valid_config, Arc::clone(&shutdown), active_path.to_string());
-
-            logger::emit_log(
-                "INFO",
-                "shutdown",
-                None,
-                None,
-                None,
-                None,
-                "HALTED",
-                "Decommissioning sequence initialized. Processing cleanup contexts.",
-                log_level,
-                json_enabled,
-            );
-
-            if flush_firewall {
-                for set_name in sets_to_flush {
-                    let status = std::process::Command::new("/usr/sbin/nft")
-                        .arg("flush")
-                        .arg("set")
-                        .args(nft_table.split_whitespace())
-                        .arg(&set_name)
-                        .status();
-
-                    match status {
-                        Ok(s) if s.success() => {
-                            println!("[INFO] Graceful Shutdown: Cleared firewall containment set '{}'.", set_name);
-                        }
-                        _ => {
-                            eprintln!("[WARN] Graceful Shutdown: Failed to flush firewall set '{}'.", set_name);
+                    for playbook in global_playbooks.values() {
+                        let combined_actions = playbook.try_actions.iter().chain(playbook.final_actions.iter());
+                        for action in combined_actions {
+                            if let config::AtomicAction::NftBlacklist { set_name, .. } = action {
+                                sets_to_flush.push(set_name.clone());
+                            }
                         }
                     }
+
+                    logger::emit_log(
+                        "INFO",
+                        "initialization",
+                        None,
+                        None,
+                        None,
+                        None,
+                        "ARMED",
+                        &format!(
+                            "Configuration profile and security manifests verified successfully via path: {}",
+                            active_path
+                        ),
+                        log_level,
+                        json_enabled,
+                    );
+
+                    // Purge any residual firewall sets left behind by unexpected crashes
+                    worker::cleanup_stale_firewall_elements(&valid_config, &global_rules, &global_playbooks);
+
+                    // Hand down our parsed config and decoupled components to the main processing threads
+                    start_monitor_loop(
+                        valid_config,
+                        global_playbooks,
+                        global_rules,
+                        Arc::clone(&shutdown),
+                        active_path.to_string()
+                    );
+
+                    logger::emit_log(
+                        "INFO",
+                        "shutdown",
+                        None,
+                        None,
+                        None,
+                        None,
+                        "HALTED",
+                        "Decommissioning sequence initialized. Processing cleanup contexts.",
+                        log_level,
+                        json_enabled,
+                    );
+
+                    if flush_firewall {
+                        for set_name in sets_to_flush {
+                            let status = std::process::Command::new("/usr/sbin/nft")
+                                .arg("flush")
+                                .arg("set")
+                                .args(nft_table.split_whitespace())
+                                .arg(&set_name)
+                                .status();
+
+                            match status {
+                                Ok(s) if s.success() => {
+                                    println!("[INFO] Graceful Shutdown: Cleared firewall containment set '{}'.", set_name);
+                                }
+                                _ => {
+                                    eprintln!("[WARN] Graceful Shutdown: Failed to flush firewall set '{}'.", set_name);
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(err_msg) => {
+                    eprintln!("System Architectural Boot Panic: Manifest integrity verification failed: {}", err_msg);
+                    std::process::exit(1);
                 }
             }
-
         }
         Err(err_msg) => {
             eprintln!("System Architectural Boot Panic: {}", err_msg);

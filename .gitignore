@@ -16,8 +16,12 @@
 # Omit local runtime configs
 config.toml
 
+# Omit local rule files
+rules.json
+
 # Local mock_logs
 /mock_logs
 
 # Local dev / testing files
 /repo_dump.txt
+

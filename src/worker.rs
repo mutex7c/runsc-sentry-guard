@@ -2,6 +2,7 @@
 // Invokes localized host sandboxing isolation techniques
 // and direct socket interactions safely
 
+use std::collections::HashMap;
 use crate::config::{AtomicAction, LogLevel};
 use crate::logger::emit_log;
 use anyhow::{anyhow, bail, Result};
@@ -11,8 +12,6 @@ use std::sync::Arc;
 
 #[cfg(target_os = "linux")]
 use serde::Deserialize;
-#[cfg(target_os = "linux")]
-use std::collections::HashMap;
 #[cfg(target_os = "linux")]
 use std::io::BufRead;
 #[cfg(target_os = "linux")]
@@ -81,7 +80,6 @@ fn read_bounded_line<R: std::io::BufRead>(reader: &mut R, limit: u64) -> Result<
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
-// Zero-Fork Native HTTP Over Unix Domain Socket Engine (Linux Production Mode Only)
 #[cfg(target_os = "linux")]
 const MAX_UDS_PAYLOAD_SIZE: usize = 10 * 1024 * 1024; // 10 MB Heap Ceiling
 
@@ -111,10 +109,7 @@ fn execute_docker_uds_request(
     let request_payload = if let Some(b) = body {
         format!(
             "{} {} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-            method,
-            path,
-            b.len(),
-            b
+            method, path, b.len(), b
         )
     } else {
         format!(
@@ -135,11 +130,9 @@ fn execute_docker_uds_request(
 
     let header_end;
     let status_code;
-
     let mut is_chunked = false;
     let mut content_length: Option<usize> = None;
 
-    // Safely read and validate HTTP headers using httparse
     loop {
         if bytes_read >= header_buf.len() {
             bail!("UDS Error: HTTP Headers exceeded 8KB maximum boundary.");
@@ -176,7 +169,6 @@ fn execute_docker_uds_request(
         }
     }
 
-    // Process the remaining body bytes
     let leftover = header_buf[header_end..bytes_read].to_vec();
     let mut reader = BufReader::new(Cursor::new(leftover).chain(stream));
     let mut body_payload = String::new();
@@ -206,18 +198,10 @@ fn execute_docker_uds_request(
                 );
             }
 
-            // Forensics Telemetry Hook: Gated strictly under Trace scope to track live buffer decoding sequences
             emit_log(
-                "TRACE",
-                "worker_engine",
-                None,
-                None,
-                None,
-                Some("stream_chunk"),
-                "PROCESSING",
+                "TRACE", "worker_engine", None, None, None, Some("stream_chunk"), "PROCESSING",
                 &format!("Decoding dynamic chunked telemetry sequence of size {} bytes.", chunk_size),
-                config_log_level,
-                json_enabled,
+                config_log_level, json_enabled,
             );
 
             let mut chunk_buf = vec![0; chunk_size];
@@ -280,36 +264,16 @@ pub fn resolve_container_ips(
         }
         Ok((status, _)) => {
             emit_log(
-                "WARN",
-                "worker_engine",
-                None,
-                Some(container_id),
-                None,
-                Some("resolve_ip"),
-                "FAILURE",
-                &format!(
-                    "Container socket returned HTTP {} during IP resolution.",
-                    status
-                ),
-                config_log_level,
-                json_enabled,
+                "WARN", "worker_engine", None, Some(container_id), None, Some("resolve_ip"), "FAILURE",
+                &format!("Container socket returned HTTP {} during IP resolution.", status),
+                config_log_level, json_enabled,
             );
         }
         Err(e) => {
             emit_log(
-                "WARN",
-                "worker_engine",
-                None,
-                Some(container_id),
-                None,
-                Some("resolve_ip"),
-                "FAILURE",
-                &format!(
-                    "Failed to query Container socket for networking metadata via UDS channel: {:#}",
-                    e
-                ),
-                config_log_level,
-                json_enabled,
+                "WARN", "worker_engine", None, Some(container_id), None, Some("resolve_ip"), "FAILURE",
+                &format!("Failed to query Container socket for networking metadata via UDS channel: {:#}", e),
+                config_log_level, json_enabled,
             );
         }
     }
@@ -418,32 +382,16 @@ fn execute_atomic_command(
 
         AtomicAction::LogJson => {
             emit_log(
-                "INFO",
-                "worker_engine",
-                None,
-                Some(container_id),
-                None,
-                Some("log_json"),
-                "AUDIT",
-                "Standard signature verification telemetry logged.",
-                config_log_level,
-                json_enabled,
+                "INFO", "worker_engine", None, Some(container_id), None, Some("log_json"), "AUDIT",
+                "Standard signature verification telemetry logged.", config_log_level, json_enabled,
             );
             Ok(())
         }
 
         AtomicAction::LogCritical => {
             emit_log(
-                "CRITICAL",
-                "worker_engine",
-                None,
-                Some(container_id),
-                None,
-                Some("log_critical"),
-                "ALERT",
-                "Security policy remediation loop engaged.",
-                config_log_level,
-                json_enabled,
+                "CRITICAL", "worker_engine", None, Some(container_id), None, Some("log_critical"), "ALERT",
+                "Security policy remediation loop engaged.", config_log_level, json_enabled,
             );
             Ok(())
         }
@@ -462,26 +410,15 @@ fn execute_atomic_command(
                                 || json_payload.contains("\"Running\":true")
                             {
                                 emit_log(
-                                    "INFO",
-                                    "worker_engine",
-                                    None,
-                                    Some(container_id),
-                                    None,
-                                    Some("validate_state"),
-                                    "SUCCESS",
-                                    "Container state verified as active. Proceeding with containment pipeline.",
-                                    config_log_level,
-                                    json_enabled,
+                                    "INFO", "worker_engine", None, Some(container_id), None, Some("validate_state"), "SUCCESS",
+                                    "Container state verified as active. Proceeding with containment pipeline.", config_log_level, json_enabled,
                                 );
                                 Ok(())
                             } else {
                                 bail!("Container is no longer in a running state. Aborting containment to prevent TOCTOU misfires.");
                             }
                         } else {
-                            bail!(
-                                "State validation rejected (HTTP {}). Container likely terminated.",
-                                status
-                            );
+                            bail!("State validation rejected (HTTP {}). Container likely terminated.", status);
                         }
                     }
 
@@ -493,11 +430,7 @@ fn execute_atomic_command(
                         if (200..300).contains(&status) || status == 409 {
                             Ok(())
                         } else {
-                            bail!(
-                                "Pause mutation rejected (HTTP {}): {}",
-                                status,
-                                err_payload
-                            );
+                            bail!("Pause mutation rejected (HTTP {}): {}", status, err_payload);
                         }
                     }
 
@@ -509,11 +442,7 @@ fn execute_atomic_command(
                         if (200..300).contains(&status) || status == 409 {
                             Ok(())
                         } else {
-                            bail!(
-                                "Unpause mutation rejected (HTTP {}): {}",
-                                status,
-                                err_payload
-                            );
+                            bail!("Unpause mutation rejected (HTTP {}): {}", status, err_payload);
                         }
                     }
 
@@ -525,11 +454,7 @@ fn execute_atomic_command(
                         if (200..300).contains(&status) {
                             Ok(())
                         } else {
-                            bail!(
-                                "Restart mutation rejected (HTTP {}): {}",
-                                status,
-                                err_payload
-                            );
+                            bail!("Restart mutation rejected (HTTP {}): {}", status, err_payload);
                         }
                     }
 
@@ -550,28 +475,19 @@ fn execute_atomic_command(
                         if (200..300).contains(&status) {
                             Ok(())
                         } else {
-                            bail!(
-                                "CommitSnapshot rejected (HTTP {}): {}",
-                                status,
-                                err_payload
-                            );
+                            bail!("CommitSnapshot rejected (HTTP {}): {}", status, err_payload);
                         }
                     }
 
                     AtomicAction::ContainerSignal { signal } => {
-                        let query_path =
-                            format!("/containers/{}/kill?signal={}", container_id, signal);
+                        let query_path = format!("/containers/{}/kill?signal={}", container_id, signal);
                         let (status, err_payload) =
                             execute_docker_uds_request("POST", &query_path, None, socket_path, config_log_level, json_enabled)?;
 
                         if (200..300).contains(&status) || status == 409 {
                             Ok(())
                         } else {
-                            bail!(
-                                "ContainerSignal rejected (HTTP {}): {}",
-                                status,
-                                err_payload
-                            );
+                            bail!("ContainerSignal rejected (HTTP {}): {}", status, err_payload);
                         }
                     }
 
@@ -585,34 +501,15 @@ fn execute_atomic_command(
                         for ip in ips {
                             if is_ip_safe(&ip, whitelist) {
                                 emit_log(
-                                    "WARN",
-                                    "worker_engine",
-                                    None,
-                                    Some(container_id),
-                                    Some(&ip.to_string()),
-                                    Some("nft_blacklist"),
-                                    "INTERCEPTED",
-                                    "Target IP matches core infrastructure whitelist. Skipping isolation for this specific address.",
-                                    config_log_level,
-                                    json_enabled,
+                                    "WARN", "worker_engine", None, Some(container_id), Some(&ip.to_string()), Some("nft_blacklist"), "INTERCEPTED",
+                                    "Target IP matches core infrastructure whitelist. Skipping isolation for this specific address.", config_log_level, json_enabled,
                                 );
                                 continue;
                             }
                             execute_firewall_mutation(&ip.to_string(), set_name, timeout, table)?;
                             emit_log(
-                                "CRITICAL",
-                                "worker_engine",
-                                None,
-                                Some(container_id),
-                                Some(&ip.to_string()),
-                                Some("nft_blacklist"),
-                                "SUCCESS",
-                                &format!(
-                                    "Target network isolated via set {} for duration context {}",
-                                    set_name, timeout
-                                ),
-                                config_log_level,
-                                json_enabled,
+                                "CRITICAL", "worker_engine", None, Some(container_id), Some(&ip.to_string()), Some("nft_blacklist"), "SUCCESS",
+                                &format!("Target network isolated via set {} for duration context {}", set_name, timeout), config_log_level, json_enabled,
                             );
                         }
                         Ok(())
@@ -720,9 +617,7 @@ pub fn fetch_running_container_ids(socket_path: &str) -> std::collections::HashS
 
     match execute_docker_uds_request("GET", "/containers/json", None, socket_path, LogLevel::Info, true) {
         Ok((status, json_payload)) if status == 200 => {
-            if let Ok(parsed) =
-                serde_json::from_str::<Vec<DockerContainerListResponse>>(&json_payload)
-            {
+            if let Ok(parsed) = serde_json::from_str::<Vec<DockerContainerListResponse>>(&json_payload) {
                 return parsed.into_iter().map(|c| c.id).collect();
             }
         }
@@ -747,26 +642,12 @@ pub fn execute_containment_pipeline(
 
     for action in &try_actions {
         if let Err(e) = execute_atomic_command(
-            action,
-            &container_id,
-            &whitelist[..],
-            &table,
-            config_log_level,
-            json_enabled,
-            &socket_path,
-            &trigger_message,
+            action, &container_id, &whitelist[..], &table,
+            config_log_level, json_enabled, &socket_path, &trigger_message,
         ) {
             emit_log(
-                "WARN",
-                "worker_engine",
-                Some(&rule_name),
-                Some(&container_id),
-                None,
-                Some(&format!("{:?}", action)),
-                "FAILURE",
-                &format!("Primary playbook action failed structural context: {:#}", e),
-                config_log_level,
-                json_enabled,
+                "WARN", "worker_engine", Some(&rule_name), Some(&container_id), None, Some(&format!("{:?}", action)), "FAILURE",
+                &format!("Primary playbook action failed structural context: {:#}", e), config_log_level, json_enabled,
             );
             pipeline_failed = true;
             break;
@@ -778,59 +659,29 @@ pub fn execute_containment_pipeline(
 
         for fallback in &final_actions {
             match execute_atomic_command(
-                fallback,
-                &container_id,
-                &whitelist[..],
-                &table,
-                config_log_level,
-                json_enabled,
-                &socket_path,
-                &trigger_message,
+                fallback, &container_id, &whitelist[..], &table,
+                config_log_level, json_enabled, &socket_path, &trigger_message,
             ) {
                 Ok(_) => {
                     emit_log(
-                        "INFO",
-                        "worker_engine",
-                        Some(&rule_name),
-                        Some(&container_id),
-                        None,
-                        Some(&format!("{:?}", fallback)),
-                        "SUCCESS",
-                        "Emergency fallback action executed successfully.",
-                        config_log_level,
-                        json_enabled,
+                        "INFO", "worker_engine", Some(&rule_name), Some(&container_id), None, Some(&format!("{:?}", fallback)), "SUCCESS",
+                        "Emergency fallback action executed successfully.", config_log_level, json_enabled,
                     );
 
                     match fallback {
                         AtomicAction::ContainerSignal { signal } => {
                             if signal == "SIGKILL" || signal == "SIGSTOP" {
                                 emit_log(
-                                    "CRITICAL",
-                                    "runsc_sentry_guard",
-                                    Some(&rule_name),
-                                    Some(&container_id),
-                                    None,
-                                    None,
-                                    "HALTED",
-                                    "Terminal signal delivered. Short-circuiting remaining fallback chain.",
-                                    config_log_level,
-                                    json_enabled,
+                                    "CRITICAL", "runsc_sentry_guard", Some(&rule_name), Some(&container_id), None, None, "HALTED",
+                                    "Terminal signal delivered. Short-circuiting remaining fallback chain.", config_log_level, json_enabled,
                                 );
                                 break;
                             }
                         }
                         AtomicAction::Restart => {
                             emit_log(
-                                "CRITICAL",
-                                "runsc_sentry_guard",
-                                Some(&rule_name),
-                                Some(&container_id),
-                                None,
-                                None,
-                                "HALTED",
-                                "Container runtime restarted. Short-circuiting remaining fallback chain.",
-                                config_log_level,
-                                json_enabled,
+                                "CRITICAL", "runsc_sentry_guard", Some(&rule_name), Some(&container_id), None, None, "HALTED",
+                                "Container runtime restarted. Short-circuiting remaining fallback chain.", config_log_level, json_enabled,
                             );
                             break;
                         }
@@ -839,16 +690,8 @@ pub fn execute_containment_pipeline(
                 }
                 Err(fallback_error) => {
                     emit_log(
-                        "CRITICAL",
-                        "worker_engine",
-                        Some(&rule_name),
-                        Some(&container_id),
-                        None,
-                        Some(&format!("{:?}", fallback)),
-                        "CRASH",
-                        &format!("EMERGENCY CONTAINMENT FAILURE: {:#}", fallback_error),
-                        config_log_level,
-                        json_enabled,
+                        "CRITICAL", "worker_engine", Some(&rule_name), Some(&container_id), None, Some(&format!("{:?}", fallback)), "CRASH",
+                        &format!("EMERGENCY CONTAINMENT FAILURE: {:#}", fallback_error), config_log_level, json_enabled,
                     );
                 }
             }
@@ -858,16 +701,8 @@ pub fn execute_containment_pipeline(
 
 fn emit_json_escalation_marker(container_id: &str, rule: &str, config_log_level: LogLevel, json_enabled: bool) {
     emit_log(
-        "CRITICAL",
-        "worker_engine",
-        Some(rule),
-        Some(container_id),
-        None,
-        Some("escalation_routing"),
-        "ENGAGED",
-        "Primary playbook failed structural strategy. Deploying fallback containment actions.",
-        config_log_level,
-        json_enabled,
+        "CRITICAL", "worker_engine", Some(rule), Some(container_id), None, Some("escalation_routing"), "ENGAGED",
+        "Primary playbook failed structural strategy. Deploying fallback containment actions.", config_log_level, json_enabled,
     );
 }
 
@@ -933,14 +768,6 @@ mod tests {
             assert!(err.to_string().contains("Security Error"));
         }
     }
-
-    #[test]
-    fn test_execute_uds_request_length_boundary_violation() {
-        let test_payload_len = 11534336usize;
-        let maximum_heap_ceiling = MAX_UDS_PAYLOAD_SIZE;
-
-        assert!(test_payload_len > maximum_heap_ceiling, "Assertion matrix failed to register a structural boundary breach");
-    }
 }
 
 #[allow(dead_code)]
@@ -967,7 +794,12 @@ where
     fallback
 }
 
-pub fn cleanup_stale_firewall_elements(config: &crate::config::GuardConfig) {
+// Dynamic cleanups utilizing pre-verified maps sourced across the external manifests
+pub fn cleanup_stale_firewall_elements(
+    config: &crate::config::GuardConfig,
+    rules: &[crate::config::JsonRuleConfig],
+    playbooks: &HashMap<String, crate::config::PlaybookConfig>,
+) {
     let table = &config.monitor.nftables_default_table;
     let ip_regex = regex::Regex::new(r"\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b|([a-fA-F0-9:]+:+[a-fA-F0-9:]+)\b").unwrap();
     let json_enabled = config.monitor.json_logging_enabled;
@@ -981,47 +813,49 @@ pub fn cleanup_stale_firewall_elements(config: &crate::config::GuardConfig) {
     let family = table_parts[0];
     let table_name = table_parts[1];
 
-    for rule in &config.rules {
-        let combined_actions = rule.try_actions.iter().chain(rule.final_actions.iter());
-        for action in combined_actions {
-            if let AtomicAction::NftBlacklist { set_name, .. } = action {
-                let output = Command::new("/usr/sbin/nft")
-                    .arg("list")
-                    .arg("set")
-                    .arg(family)
-                    .arg(table_name)
-                    .arg(set_name)
-                    .output();
+    for rule in rules {
+        if let Some(playbook) = playbooks.get(&rule.playbook) {
+            let combined_actions = playbook.try_actions.iter().chain(playbook.final_actions.iter());
+            for action in combined_actions {
+                if let AtomicAction::NftBlacklist { set_name, .. } = action {
+                    let output = Command::new("/usr/sbin/nft")
+                        .arg("list")
+                        .arg("set")
+                        .arg(family)
+                        .arg(table_name)
+                        .arg(set_name)
+                        .output();
 
-                if let Ok(out) = output {
-                    let stdout_str = String::from_utf8_lossy(&out.stdout);
-                    let mut stale_ips = Vec::new();
+                    if let Ok(out) = output {
+                        let stdout_str = String::from_utf8_lossy(&out.stdout);
+                        let mut stale_ips = Vec::new();
 
-                    for line in stdout_str.lines() {
-                        if line.contains("comment \"runsc-sentry-guard\"") {
-                            if let Some(caps) = ip_regex.captures(line) {
-                                if let Some(matched_ip) = caps.get(0) {
-                                    stale_ips.push(matched_ip.as_str().to_string());
+                        for line in stdout_str.lines() {
+                            if line.contains("comment \"runsc-sentry-guard\"") {
+                                if let Some(caps) = ip_regex.captures(line) {
+                                    if let Some(matched_ip) = caps.get(0) {
+                                        stale_ips.push(matched_ip.as_str().to_string());
+                                    }
                                 }
                             }
                         }
-                    }
 
-                    if !stale_ips.is_empty() {
-                        let elements_payload = format!("{{ {} }}", stale_ips.join(", "));
+                        if !stale_ips.is_empty() {
+                            let elements_payload = format!("{{ {} }}", stale_ips.join(", "));
 
-                        match Command::new("/usr/sbin/nft")
-                            .arg("delete")
-                            .arg("element")
-                            .arg(family)
-                            .arg(table_name)
-                            .arg(set_name)
-                            .arg(&elements_payload)
-                            .status()
-                        {
-                            Ok(s) if s.success() => {},
-                            Ok(s) => emit_log("WARN", "bootstrap_cleanup", None, None, None, Some("nft"), "FAILURE", &format!("nft delete exited with code: {:?}", s.code()), config_log_level, json_enabled),
-                            Err(e) => emit_log("ERROR", "bootstrap_cleanup", None, None, None, Some("nft"), "CRASH", &format!("Failed to execute nft binary: {:#}", e), config_log_level, json_enabled),
+                            match Command::new("/usr/sbin/nft")
+                                .arg("delete")
+                                .arg("element")
+                                .arg(family)
+                                .arg(table_name)
+                                .arg(set_name)
+                                .arg(&elements_payload)
+                                .status()
+                            {
+                                Ok(s) if s.success() => {},
+                                Ok(s) => emit_log("WARN", "bootstrap_cleanup", None, None, None, Some("nft"), "FAILURE", &format!("nft delete exited with code: {:?}", s.code()), config_log_level, json_enabled),
+                                Err(e) => emit_log("ERROR", "bootstrap_cleanup", None, None, None, Some("nft"), "CRASH", &format!("Failed to execute nft binary: {:#}", e), config_log_level, json_enabled),
+                            }
                         }
                     }
                 }

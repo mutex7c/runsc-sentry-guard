@@ -1,16 +1,16 @@
 # Integration Testing & Threat Simulation Playbook
 
-This document outlines the standard operating procedures for verifying the `runsc-sentry-guard` containment engine[cite: 1]. Because this daemon operates at the host edge and mutates system state (firewalls, process execution), these tests must be executed in an isolated staging environment or a designated ephemeral virtual machine[cite: 1].
+This document outlines the standard operating procedures for verifying the `runsc-sentry-guard` containment engine. Because this daemon operates at the host edge and mutates system state (firewalls, process execution), these tests must be executed in an isolated staging environment or a designated ephemeral virtual machine.
 
 ## 1. Prerequisites & Environment Setup
 
 Ensure your staging host mimics a production configuration:
-* Root access (`sudo`) is required[cite: 1].
-* `docker` or `podman` must be installed and active[cite: 1].
-* `nftables` must be installed[cite: 1].
-* The guard daemon must be compiled in release mode and actively running via systemd[cite: 1].
+* Root access (`sudo`) is required.
+* `docker` or `podman` must be installed and active.
+* `nftables` must be installed.
+* The guard daemon must be compiled in release mode and actively running via systemd.
 
-To monitor the daemon's reaction in real-time during these tests, leave a terminal window open tailing the system journal[cite: 1]:
+To monitor the daemon's reaction in real-time during these tests, leave a terminal window open tailing the system journal:
 ```bash
 sudo journalctl -u runsc-sentry-guard -f
 ```
@@ -143,7 +143,7 @@ sudo systemctl stop runsc-sentry-guard
 
 ### Scenario H: Cross-Container Mitigation Spoofing Prevention
 
-**Objective:** Verify that the file log engine derives container IDs strictly from the immutable log filename stem rather than untrusted text payloads printed within the logs, ensuring a compromised container cannot frame an adjacent workload[cite: 1].
+**Objective:** Verify that the file log engine derives container IDs strictly from the immutable log filename stem rather than untrusted text payloads printed within the logs, ensuring a compromised container cannot frame an adjacent workload.
 
 **Execution:**
 1. Generate an active dummy log target profile using a valid, distinct hex name:

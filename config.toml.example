@@ -10,36 +10,8 @@ json_logging_enabled = true
 systemd_watchdog_interval_ms = 5000
 flush_firewall_on_shutdown = false
 max_workers = 100
-
-[[rules]]
-name = "unauthorized_interactive_shells"
-file_pattern = "*.boot"
-regex_match = ' execve\(.*(bash|sh|zsh|dash|nc|ncat|socat)'
-
-[[rules.try_actions]]
-type = "validate_state"
-
-[[rules.try_actions]]
-type = "pause"
-
-[[rules.try_actions]]
-type = "commit_snapshot"
-prefix = "forensic-snapshot"
-
-[[rules.try_actions]]
-type = "nft_blacklist"
-set_name = "container_blacklist"
-timeout = "24h"
-
-[[rules.try_actions]]
-type = "restart"
-
-[[rules.try_actions]]
-type = "unpause"
-
-[[rules.final_actions]]
-type = "log_critical"
-
-[[rules.final_actions]]
-type = "container_signal"
-signal = "SIGKILL"
+security_manifest_paths = [
+  "/etc/runsc-sentry-guard/playbooks.json",
+#  "/etc/runsc-sentry-guard/rules.d/common_iocs.json",
+#  "/etc/runsc-sentry-guard/rules.d/emergency_rules.json"
+]

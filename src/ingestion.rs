@@ -25,7 +25,7 @@ use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
 use std::os::unix::io::FromRawFd;
 
-use crate::config::{AtomicAction, GuardConfig, IngestionMode, LogLevel, RegistryMap, WorkerChannelMessage};
+use crate::config::{AtomicAction, GuardConfig, IngestionMode, LogLevel, RegistryMap, WorkerChannelMessage, JsonRuleConfig, PlaybookConfig};
 use crate::logger::emit_log;
 use crate::limiters::{AntiDosState, GlobalRateLimiter};
 use crate::worker::execute_containment_pipeline;
@@ -35,7 +35,13 @@ struct LogDescriptor {
     position: u64,
 }
 
-pub fn start_monitor_loop(config: GuardConfig, shutdown: Arc<AtomicBool>, config_path: String) {
+pub fn start_monitor_loop(
+    config: GuardConfig,
+    initial_playbooks: HashMap<String, PlaybookConfig>,
+    initial_rules: Vec<JsonRuleConfig>,
+    shutdown: Arc<AtomicBool>,
+    config_path: String
+) {
     let mode = &config.monitor.mode;
     let json_enabled = config.monitor.json_logging_enabled;
     let config_log_level = config.monitor.log_level;
@@ -71,7 +77,6 @@ pub fn start_monitor_loop(config: GuardConfig, shutdown: Arc<AtomicBool>, config
             let stream_endpoint = "/events?filters=%7B%22type%22%3A%5B%22container%22%5D%2C%22event%22%3A%5B%22start%22%2C%22die%22%5D%7D";
 
             while !stream_shutdown.load(Ordering::SeqCst) {
-                // Explicit matching on connection result to log runtime IPC failure
                 match std::os::unix::net::UnixStream::connect(&ds_path) {
                     Ok(mut stream) => {
                         let current_ids = crate::worker::fetch_running_container_ids(&ds_path);
@@ -179,7 +184,9 @@ pub fn start_monitor_loop(config: GuardConfig, shutdown: Arc<AtomicBool>, config
     }
 
     let worker_registry: Arc<RwLock<RegistryMap>> = Arc::new(RwLock::new(HashMap::new()));
-    let regex_compiled = Arc::new(RwLock::new(compile_rules(&config.rules)));
+
+    // Compile our decoupled rules matrix down onto flat fast-path matching sequences
+    let regex_compiled = Arc::new(RwLock::new(compile_manifest_rules(&initial_rules, &initial_playbooks)));
 
     let rules_watch_clone = Arc::clone(&regex_compiled);
     let path_watch_clone = config_path.clone();
@@ -192,7 +199,6 @@ pub fn start_monitor_loop(config: GuardConfig, shutdown: Arc<AtomicBool>, config
         let watcher_res = notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
             if let Ok(event) = res {
                 if event.kind.is_modify() || event.kind.is_create() {
-                    // Verify coordinate transmission succeeds and log broken channel failures
                     if let Err(e) = tx.send(()) {
                         eprintln!("[CRITICAL] Hot-reload notification pipeline broken: {:#}", e);
                     }
@@ -206,14 +212,18 @@ pub fn start_monitor_loop(config: GuardConfig, shutdown: Arc<AtomicBool>, config
                     thread::sleep(Duration::from_millis(100));
 
                     if let Ok(new_config) = crate::config::load_config(&path_watch_clone) {
-                        let new_compiled = compile_rules(&new_config.rules);
-                        {
-                            let mut guard = rules_watch_clone.write();
-                            *guard = new_compiled;
+                        if let Ok((new_playbooks, new_rules)) = crate::config::load_and_merge_manifests(&new_config.monitor.security_manifest_paths) {
+                            let new_compiled = compile_manifest_rules(&new_rules, &new_playbooks);
+                            {
+                                let mut guard = rules_watch_clone.write();
+                                *guard = new_compiled;
+                            }
+                            emit_log("INFO", "config_reload", None, None, None, None, "SUCCESS", "Active rulesets and decoupled manifests hot-reloaded.", config_log_level, json_enabled_clone);
+                        } else {
+                            emit_log("WARN", "config_reload", None, None, None, None, "FAILURE", "Hot-reload aborted: Manifest files contain schema errors or name collisions.", config_log_level, json_enabled_clone);
                         }
-                        emit_log("INFO", "config_reload", None, None, None, None, "SUCCESS", "Active rulesets hot-reloaded from manifest.", config_log_level, json_enabled_clone);
                     } else {
-                        emit_log("WARN", "config_reload", None, None, None, None, "FAILURE", "Hot-reload aborted: Updated manifest contains errors.", config_log_level, json_enabled_clone);
+                        emit_log("WARN", "config_reload", None, None, None, None, "FAILURE", "Hot-reload aborted: Updated config.toml contains errors.", config_log_level, json_enabled_clone);
                     }
                 }
             }
@@ -495,11 +505,6 @@ pub fn evaluate_line_signatures(
                             dos_write.negative_queue.push_back(container_id.clone());
                         }
                     } else {
-
-                        // ANTI-BLINDNESS SAFEGUARD
-                        // If tokens are exhausted, we don't drop the event blindly
-                        // We route the signature breach using a dedicated "UNKNOWN_OR_UNSYNCED"
-                        // fallback routing marker to ensure corporate SIEM visibility under flood
                         drop(dos_guard);
                         emit_log(
                             "CRITICAL", "orchestrator", Some(rule_name), Some(&container_id), None, Some("api_backpressure"), "RECOURSE_ROUTED",
@@ -555,11 +560,9 @@ fn dispatch_to_worker(
     {
         let reg_read = registry.read();
         if let Some(tx) = reg_read.get(&container_id) {
-            // Fast-Path Event Routing Check
             if let Err(e) = tx.try_send((try_actions, final_actions, rule_name, trigger_message)) {
                 match e {
                     TrySendError::Full((_, _, rule, _)) => {
-
                         emit_log(
                             "CRITICAL", "orchestrator", Some(&rule), Some(&container_id), None, Some("route"), "FAST_PATH_DROPPED",
                             "Queue saturated on fast-path lookup. Enforcing rigid backpressure: Event dropped to prevent host OOM.",
@@ -612,11 +615,9 @@ fn dispatch_to_worker(
         worker_tx
     });
 
-    // Slow-Path Event Routing Execution
     let _ = tx.try_send((try_actions, final_actions, rule_name.clone(), trigger_message)).map_err(|e| {
         match e {
             TrySendError::Full(_) => {
-
                 emit_log(
                     "CRITICAL", "orchestrator", Some(&rule_name), Some(&container_id), None, Some("route"), "SLOW_PATH_DROPPED",
                     "Worker execution queue full. Enforcing rigid backpressure: Event dropped to prevent host thread exhaustion.",
@@ -716,8 +717,28 @@ fn open_log_safe(dir_path: &Path, file_name: &OsStr) -> std::io::Result<fs::File
     }
 }
 
-fn compile_rules(rules: &[crate::config::RuleConfig]) -> Vec<(String, Regex, Vec<AtomicAction>, Vec<AtomicAction>)> {
-    rules.iter().filter_map(|r| {
-        Regex::new(&r.regex_match).ok().map(|compiled| { (r.name.clone(), compiled, r.try_actions.clone(), r.final_actions.clone()) })
-    }).collect()
+// Compiles and flattens multi-manifest `match_any`
+// structures down onto individual Regex lookup points
+pub fn compile_manifest_rules(
+    rules: &[JsonRuleConfig],
+    playbooks: &HashMap<String, PlaybookConfig>,
+) -> Vec<(String, Regex, Vec<AtomicAction>, Vec<AtomicAction>)> {
+    let mut compiled_list = Vec::new();
+
+    for rule in rules {
+        if let Some(playbook) = playbooks.get(&rule.playbook) {
+            for pattern in &rule.match_any {
+                if let Ok(rx) = Regex::new(pattern) {
+                    compiled_list.push((
+                        rule.name.clone(),
+                        rx,
+                        playbook.try_actions.clone(),
+                        playbook.final_actions.clone(),
+                    ));
+                }
+            }
+        }
+    }
+
+    compiled_list
 }

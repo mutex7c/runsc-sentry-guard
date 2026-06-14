@@ -1,0 +1,22 @@
+{
+  "playbooks": {
+    "nuclear_containment": {
+      "try_actions": [
+        { "type": "validate_state" },
+        { "type": "pause" }
+      ],
+      "final_actions": [
+        { "type": "container_signal", "signal": "SIGKILL" }
+      ]
+    }
+  },
+  "rules": [
+    {
+      "name": "unauthorized_interactive_shells",
+      "match_any": [
+        " execve\\(.*(bash|sh|zsh|dash)"
+      ],
+      "playbook": "nuclear_containment"
+    }
+  ]
+}

@@ -15,9 +15,9 @@ often struggle or introduce unnecessary performance
 overhead when trying to intercept deep sandbox system calls. 
 
 When a container running inside a runsc profile experiences an 
-exploit, it generates various indicators inside the 
-host-side debug streams. `runsc-sentry-guard` intercepts these 
-events out-of-band directly from the host edge. 
+exploit, it generates various indicators of compromise (IOC) 
+inside the host-side debug streams. `runsc-sentry-guard` intercepts 
+these events out-of-band directly from the host edge. 
 
 It completely bypasses the need for complex 
 kernel-hooking architectures (like eBPF) or intrusive container 
@@ -124,14 +124,15 @@ Choose the method that matches your environment setup:
 
 ### 5.3 Step 2: Establish Configuration Profile
 
-Provision your example configuration file blueprint:
+Provision your centralized environment configuration and your threat rules manifest blueprints:
 
 ```bash
 cp config.toml.example config.toml
+cp rules.json.example rules.json
 ```
 
-Open and modify `config.toml` to customize your threat signatures, 
-define core infrastructure whitelists, and align your mitigation playbooks.
+1. Open `config.toml` to declare your system environment baselines, network whitelists, and paths to your manifests.
+2. Modify `rules.json` to manage reusable, automated active containment playbooks and group threat intelligence patterns seamlessly.
 
 ### 5.4 Step 3: Run the System Installer
 

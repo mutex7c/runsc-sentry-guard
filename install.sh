@@ -2,14 +2,12 @@
 set -e
 
 # Establish FHS-compliant deployment destination paths
-
 BIN_DEST="/usr/sbin/runsc-sentry-guard"
 CONF_DIR="/etc/runsc-sentry-guard"
 CONF_DEST="$CONF_DIR/config.toml"
 SERVICE_DEST="/etc/systemd/system/runsc-sentry-guard.service"
 
 # Enforcement Boundary: Enforce administrative privileges check
-
 if [ "$(id -u)" -ne 0 ]; then
     echo "Installation Error: This deployment routine must be run with root permissions (sudo)." >&2
     exit 1
@@ -18,7 +16,6 @@ fi
 echo "Bootstrapping runsc-sentry-guard installation pipeline..."
 
 # Locate build artifact from both native or containerized cargo paths
-
 if [ -f "./target/release/runsc-sentry-guard" ]; then
     echo "Verified local release build target artifact. Deploying..."
     cp "./target/release/runsc-sentry-guard" "$BIN_DEST"
@@ -29,15 +26,25 @@ else
 fi
 
 # Restrict file execution permissions on binary
-
 chmod 700 "$BIN_DEST"
 chown root:root "$BIN_DEST"
 
 # Provision configuration file paths securely
-
 if [ ! -d "$CONF_DIR" ]; then
     mkdir -p "$CONF_DIR"
     chmod 750 "$CONF_DIR"
+fi
+
+# Create a dedicated, secure subdirectory for custom admin scripts
+if [ ! -d "$CONF_DIR/scripts" ]; then
+    mkdir -p "$CONF_DIR/scripts"
+    chmod 750 "$CONF_DIR/scripts"
+fi
+
+# Create a dedicated, authorized mutable path for script forensic outputs
+if [ ! -d "/var/log/runsc-sentry-guard" ]; then
+    mkdir -p "/var/log/runsc-sentry-guard"
+    chmod 750 "/var/log/runsc-sentry-guard"
 fi
 
 if [ ! -f "$CONF_DEST" ]; then
@@ -55,7 +62,6 @@ else
 fi
 
 # Provision host systemd service structures if native paths are present
-
 if [ -d "/run/systemd/system" ]; then
     echo "Systemd supervisor layers detected. Generating hardened daemon unit configuration..."
     cat << EOF > "$SERVICE_DEST"
@@ -73,17 +79,19 @@ Restart=always
 RestartSec=3
 WatchdogSec=10
 
-# Security Hardening & Sandboxing Matrix
+# Security Hardening & Sandboxing Matrix (PRESERVED)
 NoNewPrivileges=true
 CapabilityBoundingSet=CAP_NET_ADMIN
 AmbientCapabilities=CAP_NET_ADMIN
 ProtectSystem=strict
 ProtectHome=yes
-ReadWritePaths=/var/log/gvisor /var/run/
 ProtectControlGroups=yes
 ProtectKernelModules=yes
 ProtectKernelTunables=yes
 PrivateTmp=yes
+
+# SURGICAL AMENDMENT: Added authorized output directory for incident forensics
+ReadWritePaths=/var/log/gvisor /var/run/ /var/log/runsc-sentry-guard/
 
 [Install]
 WantedBy=multi-user.target
@@ -91,21 +99,17 @@ EOF
     chmod 644 "$SERVICE_DEST"
 
     # Force systemd subsystem index synchronization updates
-
     systemctl daemon-reload
 
     echo "Systemd service profile armed. To activate run: sudo systemctl enable --now runsc-sentry-guard"
 
 else
-
     echo "Warning: Systemd initialized configuration space not located. Please establish process supervisor profiles manually."
-
 fi
 
 # ==============================================================================
 # Mandatory Access Control (MAC) Provisioning: AppArmor
 # ==============================================================================
-
 if [ -f "/sys/module/apparmor/parameters/enabled" ] && [ "$(cat /sys/module/apparmor/parameters/enabled)" = "Y" ]; then
     echo "AppArmor MAC detected on host kernel. Provisioning security profile..."
     AA_PROFILE="/etc/apparmor.d/usr.sbin.runsc-sentry-guard"
@@ -123,15 +127,30 @@ if [ -f "/sys/module/apparmor/parameters/enabled" ] && [ "$(cat /sys/module/appa
   # Strict directory access rules
   /var/log/gvisor/ r,
   /var/log/gvisor/** r,
+  /var/log/runsc-sentry-guard/ rw,
+  /var/log/runsc-sentry-guard/** rw,
 
   # Allow the daemon to read foreign process states for UDS resolution
   /proc/[0-9]*/cmdline r,
   /proc/[0-9]*/cgroup r,
 
-  # Allow execution of Docker and Nftables control commands
+  # Bound core utility execution limits
   /usr/bin/docker rcx,
   /usr/sbin/nft rcx,
   /usr/bin/curl rcx,
+
+  # ─────────────────────────────────────────────────────────────────
+  # SURGICAL SCRIPT EXTENSION GATES
+  # ─────────────────────────────────────────────────────────────────
+  # Allow the daemon to execute standard shells under inheritance (ix)
+  /bin/sh ix,
+  /bin/bash ix,
+  /bin/dash ix,
+
+  # Force custom automation scripts to reside strictly inside our root-owned,
+  # locked-down configuration folder to prevent arbitrary execution vulnerabilities.
+  /etc/runsc-sentry-guard/scripts/ r,
+  /etc/runsc-sentry-guard/scripts/** rix,
 
   # Socket communication lines for Docker/Podman communication
   /var/run/docker.sock rw,

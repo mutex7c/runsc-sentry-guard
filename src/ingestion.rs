@@ -1,4 +1,4 @@
-use regex::Regex;
+use regex::{Regex, RegexSet, RegexSetBuilder};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufReader, Read, Seek, SeekFrom};
@@ -33,6 +33,45 @@ use crate::worker::execute_containment_pipeline;
 struct LogDescriptor {
     inode: u64,
     position: u64,
+}
+
+pub struct CompiledManifest {
+    pub regex_set: RegexSet,
+    pub rule_metadata: Vec<(String, Vec<AtomicAction>, Vec<AtomicAction>)>,
+}
+
+pub fn compile_manifest_rules(
+    rules: &[JsonRuleConfig],
+    playbooks: &HashMap<String, PlaybookConfig>,
+) -> CompiledManifest {
+    let mut patterns = Vec::new();
+    let mut metadata = Vec::new();
+
+    for rule in rules {
+        if let Some(playbook) = playbooks.get(&rule.playbook) {
+            for pattern in &rule.match_any {
+                patterns.push(pattern.clone());
+                metadata.push((
+                    rule.name.clone(),
+                    playbook.try_actions.clone(),
+                    playbook.final_actions.clone(),
+                ));
+            }
+        }
+    }
+
+    let regex_set = RegexSetBuilder::new(&patterns)
+        .size_limit(10 * 1024 * 1024)
+        .build()
+        .unwrap_or_else(|e| {
+            eprintln!("[CRITICAL] Failed to compile RegexSet automaton: {}", e);
+            std::process::exit(1);
+        });
+
+    CompiledManifest {
+        regex_set,
+        rule_metadata: metadata,
+    }
 }
 
 pub fn start_monitor_loop(
@@ -291,7 +330,7 @@ pub fn start_monitor_loop(
                                 None,
                                 None,
                                 "SUCCESS",
-                                "Active rulesets and decoupled manifests hot-reloaded.",
+                                "Active rulesets and decoupled manifests hot-reloaded into new Automaton.",
                                 config_log_level,
                                 json_enabled_clone,
                             );
@@ -648,7 +687,7 @@ fn is_container_active_sync(container_id: &str, socket_path: &str) -> bool {
 #[allow(unused_variables)]
 pub fn evaluate_line_signatures(
     line: &str,
-    rules: &[(String, Regex, Vec<AtomicAction>, Vec<AtomicAction>)],
+    rules: &CompiledManifest,
     id_extractor: &Regex,
     registry: &Arc<RwLock<RegistryMap>>,
     whitelist: &Arc<Vec<ipnet::IpNet>>,
@@ -681,7 +720,118 @@ pub fn evaluate_line_signatures(
         return;
     }
 
-    for (rule_name, rx, try_act, final_act) in rules.iter() {
+    let matches = rules.regex_set.matches(line);
+    if !matches.matched_any() {
+        return;
+    }
+
+    let container_id = if let Some(ref id) = file_container_id {
+        id.clone()
+    } else if !is_from_file {
+        emit_log(
+            "WARN",
+            "uds_server",
+            None,
+            None,
+            None,
+            Some("trust_boundary"),
+            "REJECTED",
+            "Socket stream failed kernel identity resolution. Dropping unauthenticated payload.",
+            config_log_level,
+            json_enabled,
+        );
+        return;
+    } else if let Some(caps) = id_extractor.captures(line) {
+        if let Some(matched_id) = caps.get(1) {
+            matched_id.as_str().to_string()
+        } else {
+            return;
+        }
+    } else {
+        return;
+    };
+
+    #[allow(unused_mut)]
+    let mut dispatch_id = container_id.clone();
+
+    #[cfg(target_os = "linux")]
+    let mut is_valid = {
+        let active_guard = active_containers.read();
+        active_guard.contains(&container_id)
+            || active_guard
+                .iter()
+                .any(|long_id| long_id.starts_with(&container_id))
+    };
+
+    #[cfg(target_os = "linux")]
+    {
+        if !is_valid {
+
+            let mut dos_guard = anti_dos_state.lock();
+            let now = std::time::Instant::now();
+            if now.duration_since(dos_guard.last_refill).as_secs() >= 1 {
+                dos_guard.tokens = crate::limiters::MAX_LOOKUP_TOKENS;
+                dos_guard.last_refill = now;
+            }
+
+            if dos_guard.negative_cache.contains(&container_id) {
+                return;
+            }
+
+            if dos_guard.tokens > 0 {
+                dos_guard.tokens -= 1;
+                drop(dos_guard);
+
+                let actually_exists = is_container_active_sync(&container_id, docker_socket_path);
+                if actually_exists {
+                    let mut active_write = active_containers.write();
+                    active_write.insert(container_id.clone());
+                    is_valid = true;
+                } else {
+                    let mut dos_write = anti_dos_state.lock();
+                    if dos_write.negative_cache.len() >= crate::limiters::MAX_NEGATIVE_CACHE {
+                        if let Some(oldest) = dos_write.negative_queue.pop_front() {
+                            dos_write.negative_cache.remove(&oldest);
+                        }
+                    }
+                    dos_write.negative_cache.insert(container_id.clone());
+                    dos_write.negative_queue.push_back(container_id.clone());
+                    return;
+                }
+            } else {
+                drop(dos_guard);
+                emit_log(
+                    "CRITICAL",
+                    "orchestrator",
+                    None,
+                    Some(&container_id),
+                    None,
+                    Some("api_backpressure"),
+                    "RECOURSE_ROUTED",
+                    "Lookup token pool exhausted. Container identity unverified but threat signature matches. Enforcing fallback routing.",
+                    config_log_level,
+                    json_enabled,
+                );
+
+                dispatch_id = format!(
+                    "UNSYNCED_ID_{}",
+                    &container_id[..std::cmp::min(12, container_id.len())]
+                );
+                is_valid = true;
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if !is_valid {
+            return;
+        }
+    }
+
+    for match_idx in matches.into_iter() {
+        let (rule_name, try_act, final_act) = &rules.rule_metadata[match_idx];
+
         emit_log(
             "DEBUG",
             "orchestrator",
@@ -691,150 +841,32 @@ pub fn evaluate_line_signatures(
             Some("signature_eval"),
             "EVALUATING",
             &format!(
-                "Scanning active stream sequences against signature layout: '{}'",
+                "Signature Automaton detected threat match for sequence layout: '{}'",
                 rule_name
             ),
             config_log_level,
             json_enabled,
         );
 
-        if rx.is_match(line) {
-            let container_id = if let Some(ref id) = file_container_id {
-                id.clone()
-            } else if !is_from_file {
-                emit_log(
-                    "WARN",
-                    "uds_server",
-                    Some(rule_name),
-                    None,
-                    None,
-                    Some("trust_boundary"),
-                    "REJECTED",
-                    "Socket stream failed kernel identity resolution. Dropping unauthenticated payload.",
-                    config_log_level,
-                    json_enabled,
-                );
-                continue;
-            } else if let Some(caps) = id_extractor.captures(line) {
-                if let Some(matched_id) = caps.get(1) {
-                    matched_id.as_str().to_string()
-                } else {
-                    continue;
-                }
-            } else {
-                continue;
-            };
-
-            #[cfg(target_os = "linux")]
-            {
-                let mut is_valid = {
-                    let active_guard = active_containers.read();
-                    active_guard.contains(&container_id)
-                        || active_guard
-                            .iter()
-                            .any(|long_id| long_id.starts_with(&container_id))
-                };
-
-                if !is_valid {
-                    let mut dos_guard = anti_dos_state.lock();
-                    let now = std::time::Instant::now();
-                    if now.duration_since(dos_guard.last_refill).as_secs() >= 1 {
-                        dos_guard.tokens = crate::limiters::MAX_LOOKUP_TOKENS;
-                        dos_guard.last_refill = now;
-                    }
-
-                    if dos_guard.negative_cache.contains(&container_id) {
-                        continue;
-                    }
-
-                    if dos_guard.tokens > 0 {
-                        dos_guard.tokens -= 1;
-                        drop(dos_guard);
-
-                        let actually_exists =
-                            is_container_active_sync(&container_id, docker_socket_path);
-                        if actually_exists {
-                            let mut active_write = active_containers.write();
-                            active_write.insert(container_id.clone());
-                            is_valid = true;
-                        } else {
-                            let mut dos_write = anti_dos_state.lock();
-                            if dos_write.negative_cache.len() >= crate::limiters::MAX_NEGATIVE_CACHE
-                            {
-                                if let Some(oldest) = dos_write.negative_queue.pop_front() {
-                                    dos_write.negative_cache.remove(&oldest);
-                                }
-                            }
-                            dos_write.negative_cache.insert(container_id.clone());
-                            dos_write.negative_queue.push_back(container_id.clone());
-                        }
-                    } else {
-                        drop(dos_guard);
-                        emit_log(
-                            "CRITICAL",
-                            "orchestrator",
-                            Some(rule_name),
-                            Some(&container_id),
-                            None,
-                            Some("api_backpressure"),
-                            "RECOURSE_ROUTED",
-                            "Lookup token pool exhausted. Container identity unverified but threat signature matches. Enforcing fallback routing.",
-                            config_log_level,
-                            json_enabled,
-                        );
-
-                        let fallback_id = format!(
-                            "UNSYNCED_ID_{}",
-                            &container_id[..std::cmp::min(12, container_id.len())]
-                        );
-                        let mut active_try = try_act.clone();
-                        if is_from_file && active_try.first() != Some(&AtomicAction::ValidateState)
-                        {
-                            active_try.insert(0, AtomicAction::ValidateState);
-                        }
-
-                        dispatch_to_worker(
-                            registry,
-                            fallback_id,
-                            active_try,
-                            final_act.clone(),
-                            rule_name.clone(),
-                            Arc::clone(whitelist),
-                            Arc::clone(table),
-                            json_enabled,
-                            config_log_level,
-                            docker_socket_path,
-                            line.to_string(),
-                            max_workers,
-                        );
-                        continue;
-                    }
-                }
-                if !is_valid {
-                    continue;
-                }
-            }
-
-            let mut active_try = try_act.clone();
-            if is_from_file && active_try.first() != Some(&AtomicAction::ValidateState) {
-                active_try.insert(0, AtomicAction::ValidateState);
-            }
-
-            dispatch_to_worker(
-                registry,
-                container_id,
-                active_try,
-                final_act.clone(),
-                rule_name.clone(),
-                Arc::clone(whitelist),
-                Arc::clone(table),
-                json_enabled,
-                config_log_level,
-                docker_socket_path,
-                line.to_string(),
-                max_workers,
-            );
+        let mut active_try = try_act.clone();
+        if is_from_file && active_try.first() != Some(&AtomicAction::ValidateState) {
+            active_try.insert(0, AtomicAction::ValidateState);
         }
+
+        dispatch_to_worker(
+            registry,
+            dispatch_id.clone(),
+            active_try,
+            final_act.clone(),
+            rule_name.clone(),
+            Arc::clone(whitelist),
+            Arc::clone(table),
+            json_enabled,
+            config_log_level,
+            docker_socket_path,
+            line.to_string(),
+            max_workers,
+        );
     }
 }
 
@@ -1094,28 +1126,4 @@ fn open_log_safe(dir_path: &Path, file_name: &OsStr) -> std::io::Result<fs::File
 
         Ok(fs::File::from_raw_fd(file_fd))
     }
-}
-
-pub fn compile_manifest_rules(
-    rules: &[JsonRuleConfig],
-    playbooks: &HashMap<String, PlaybookConfig>,
-) -> Vec<(String, Regex, Vec<AtomicAction>, Vec<AtomicAction>)> {
-    let mut compiled_list = Vec::new();
-
-    for rule in rules {
-        if let Some(playbook) = playbooks.get(&rule.playbook) {
-            for pattern in &rule.match_any {
-                if let Ok(rx) = Regex::new(pattern) {
-                    compiled_list.push((
-                        rule.name.clone(),
-                        rx,
-                        playbook.try_actions.clone(),
-                        playbook.final_actions.clone(),
-                    ));
-                }
-            }
-        }
-    }
-
-    compiled_list
 }

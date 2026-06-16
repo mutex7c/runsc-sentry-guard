@@ -11,7 +11,7 @@ use mio::net::{UnixListener as MioUnixListener, UnixStream as MioUnixStream};
 use mio::{Events, Interest, Poll, Token};
 use parking_lot::{Mutex, RwLock};
 
-use crate::config::{AtomicAction, LogLevel, RegistryMap};
+use crate::config::{LogLevel, RegistryMap};
 use crate::limiters::{AntiDosState, GlobalRateLimiter};
 use crate::logger::emit_log;
 
@@ -136,7 +136,7 @@ struct AsyncClientConnection {
 
 pub fn run_uds_server(
     registry: Arc<RwLock<RegistryMap>>,
-    regex_rules: Arc<RwLock<Vec<(String, Regex, Vec<AtomicAction>, Vec<AtomicAction>)>>>,
+    regex_rules: Arc<RwLock<crate::ingestion::CompiledManifest>>,
     id_extractor: Regex,
     whitelist: Arc<Vec<ipnet::IpNet>>,
     table: Arc<String>,

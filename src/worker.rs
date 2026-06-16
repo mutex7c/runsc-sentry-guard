@@ -340,32 +340,24 @@ fn execute_atomic_command(
             let payload_obj = serde_json::json!({
                 "text": format!("[SENTRY-GUARD] Active containment pipeline triggered for container context: {}", container_id)
             });
-            let payload = serde_json::to_string(&payload_obj)
-                .map_err(|e| anyhow!("Failed to serialize webhook alert payload: {}", e))?;
 
-            let s = Command::new("/usr/bin/curl")
-                .args(&[
-                    "-X",
-                    "POST",
-                    "-H",
-                    "Content-Type: application/json",
-                    "--max-time",
-                    "5",
-                    "--connect-timeout",
-                    "3",
-                    "--data",
-                    &payload,
-                    url,
-                ])
-                .status()
-                .map_err(|e| anyhow!("Failed to invoke system curl binary: {}", e))?;
+            let client = reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()
+                .map_err(|e| anyhow!("Failed to construct native reqwest client: {}", e))?;
 
-            if s.success() {
+            let response = client
+                .post(url)
+                .json(&payload_obj)
+                .send()
+                .map_err(|e| anyhow!("Failed to dispatch webhook alert natively: {}", e))?;
+
+            if response.status().is_success() {
                 Ok(())
             } else {
                 bail!(
-                    "Webhook dispatch failed. curl exited with non-zero status code: {:?}",
-                    s.code()
+                    "Webhook dispatch failed. Remote endpoint returned HTTP status code: {}",
+                    response.status()
                 );
             }
         }

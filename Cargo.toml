@@ -21,6 +21,7 @@ notify = "8.2.0"
 mio = { version = "1.2.1", features = ["os-ext", "net"] }
 parking_lot = "0.12.5"
 httparse = "1.10.1"
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls-tls", "json", "blocking"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 caps = "0.5.6"

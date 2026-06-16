@@ -72,9 +72,7 @@ Create `/etc/apparmor.d/usr.sbin.runsc-sentry-guard` using this blueprint:
   /proc/[0-9]*/cgroup r,
   
   # Bounded container utility control gates
-  /usr/bin/docker rcx,
   /usr/sbin/nft rcx,
-  /usr/bin/curl rcx,
   
   # ─────────────────────────────────────────────────────────────────
   # SCRIPT EXTENSION GATES
@@ -94,6 +92,7 @@ Create `/etc/apparmor.d/usr.sbin.runsc-sentry-guard` using this blueprint:
   /run/podman/podman.sock rw,
 
   # Deny all other administrative or home access vectors explicitly
+  deny /etc/** w,
   deny /home/** rw,
   deny /root/** rw,
 }

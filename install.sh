@@ -156,9 +156,7 @@ if [ -f "/sys/module/apparmor/parameters/enabled" ] && [ "$(cat /sys/module/appa
   /proc/[0-9]*/cgroup r,
 
   # Bound core utility execution limits
-  /usr/bin/docker rcx,
   /usr/sbin/nft rcx,
-  /usr/bin/curl rcx,
 
   # ─────────────────────────────────────────────────────────────────
   # SCRIPT EXTENSION GATES
@@ -179,6 +177,7 @@ if [ -f "/sys/module/apparmor/parameters/enabled" ] && [ "$(cat /sys/module/appa
   /run/podman/podman.sock rw,
 
   # Deny all other administrative or home access vectors explicitly
+  deny /etc/** w,
   deny /home/** rw,
   deny /root/** rw,
 }

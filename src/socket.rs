@@ -1,14 +1,10 @@
-// Ingestion Pipeline Socket Server
-// Establishes trusted Unix Domain Socket environments, enforces SO_PEERCRED
-// authentication boundaries, and parses real-time incoming container security streams.
-
 use regex::Regex;
 use std::collections::HashSet;
 use std::fs;
 use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use mio::net::{UnixListener as MioUnixListener, UnixStream as MioUnixStream};
@@ -48,9 +44,6 @@ fn get_peer_creds(fd: std::os::unix::io::RawFd) -> std::io::Result<(u32, i32)> {
     }
 }
 
-// RACE-FREE IDENTITY RESOLUTION (ANTI-PID RECYCLING)
-// Uses pidfd_open to pin the exact process instance, enforces strict DAC ownership
-// verification via fstat, and leverages openat semantics to close the TOCTOU window
 #[cfg(target_os = "linux")]
 fn extract_id_race_free(peer_pid: i32, peer_uid: u32) -> Option<String> {
     use std::ffi::CString;
@@ -59,30 +52,27 @@ fn extract_id_race_free(peer_pid: i32, peer_uid: u32) -> Option<String> {
     use std::sync::OnceLock;
 
     static ID_EXTRACTOR: OnceLock<Regex> = OnceLock::new();
-    let extractor = ID_EXTRACTOR.get_or_init(|| Regex::new(r"\b([a-fA-F0-9]{64}|[a-fA-F0-9]{12})\b").unwrap());
+    let extractor =
+        ID_EXTRACTOR.get_or_init(|| Regex::new(r"\b([a-fA-F0-9]{64}|[a-fA-F0-9]{12})\b").unwrap());
 
-    // RAII Guard to ensure raw file descriptors are reliably closed on all return paths
     struct FdGuard(std::os::unix::io::RawFd);
     impl Drop for FdGuard {
         fn drop(&mut self) {
             if self.0 >= 0 {
-                unsafe { libc::close(self.0); }
+                unsafe {
+                    libc::close(self.0);
+                }
             }
         }
     }
 
-    // Uniquely pin the process instance using pidfd_open
-    // This creates an immutable handle tied to this specific process lifecycle,
-    // ensuring the target PID cannot be recycled underneath us
-    let pidfd = unsafe {
-        libc::syscall(libc::SYS_pidfd_open, peer_pid, 0) as std::os::unix::io::RawFd
-    };
+    let pidfd =
+        unsafe { libc::syscall(libc::SYS_pidfd_open, peer_pid, 0) as std::os::unix::io::RawFd };
     if pidfd < 0 {
         return None;
     }
     let _pidfd_guard = FdGuard(pidfd);
 
-    // Open the process directory under /proc
     let proc_path = format!("/proc/{}", peer_pid);
     let proc_dir_c = CString::new(proc_path).ok()?;
 
@@ -97,9 +87,6 @@ fn extract_id_race_free(peer_pid: i32, peer_uid: u32) -> Option<String> {
     }
     let _proc_dir_guard = FdGuard(proc_dir_fd);
 
-    // Cross-examine directory ownership against trusted SO_PEERCRED metadata
-    // Since the owner UID of a /proc/<PID> directory matches the process's effective UID,
-    // fstat detects if the PID was recycled by a different user before our open() call
     unsafe {
         let mut statbuf = std::mem::zeroed::<libc::stat>();
         if libc::fstat(proc_dir_fd, &mut statbuf) < 0 || statbuf.st_uid != peer_uid {
@@ -107,7 +94,6 @@ fn extract_id_race_free(peer_pid: i32, peer_uid: u32) -> Option<String> {
         }
     }
 
-    // Securely isolate path resolution via openat
     let cgroup_c = CString::new("cgroup").unwrap();
     let cgroup_fd = unsafe {
         libc::openat(
@@ -121,25 +107,19 @@ fn extract_id_race_free(peer_pid: i32, peer_uid: u32) -> Option<String> {
     }
     let cgroup_guard = FdGuard(cgroup_fd);
 
-    // Final Validation: Dispatch signal 0 via the pinned pidfd
-    // If the process was recycled by the *same* user between step 1 and step 2,
-    // the original process pinned by our pidfd will be dead/zombie, causing
-    // pidfd_send_signal to return an error (or reveal status drift), failing the gate
     let is_same_process = unsafe {
         libc::syscall(
             libc::SYS_pidfd_send_signal,
             pidfd,
             0,
             std::ptr::null::<libc::siginfo_t>(),
-            0
+            0,
         ) == 0
     };
     if !is_same_process {
         return None;
     }
 
-    // Hand over the validated descriptor to the Rust standard library file wrapper
-    // We disarm the guard so the standard library's File type safely owns and closes it
     std::mem::forget(cgroup_guard);
     let file = unsafe { fs::File::from_raw_fd(cgroup_fd) };
     let reader = std::io::BufReader::new(file);
@@ -175,41 +155,86 @@ pub fn run_uds_server(
     let mut listener = match MioUnixListener::bind(socket_path) {
         Ok(l) => l,
         Err(e) => {
-            emit_log("ERROR", "uds_server", None, None, None, None, "CRASH", &format!("UDS bind failed: {}", e), config_log_level, json_enabled);
+            emit_log(
+                "ERROR",
+                "uds_server",
+                None,
+                None,
+                None,
+                None,
+                "CRASH",
+                &format!("UDS bind failed: {}", e),
+                config_log_level,
+                json_enabled,
+            );
             return;
         }
     };
 
     if let Err(e) = fs::set_permissions(socket_path, fs::Permissions::from_mode(0o660)) {
-        emit_log("ERROR", "uds_server", None, None, None, Some("permissions"), "CRASH", &format!(
-            "Failed to enforce secure access permissions on UDS socket: {}",
-            e
-        ), config_log_level, json_enabled);
+        emit_log(
+            "ERROR",
+            "uds_server",
+            None,
+            None,
+            None,
+            Some("permissions"),
+            "CRASH",
+            &format!(
+                "Failed to enforce secure access permissions on UDS socket: {}",
+                e
+            ),
+            config_log_level,
+            json_enabled,
+        );
         return;
     }
 
     let mut poll = match Poll::new() {
         Ok(p) => p,
         Err(e) => {
-            emit_log("ERROR", "uds_server", None, None, None, None, "CRASH", &format!("Failed to initialize mio Poll instance: {}", e), config_log_level, json_enabled);
+            emit_log(
+                "ERROR",
+                "uds_server",
+                None,
+                None,
+                None,
+                None,
+                "CRASH",
+                &format!("Failed to initialize mio Poll instance: {}", e),
+                config_log_level,
+                json_enabled,
+            );
             return;
         }
     };
 
-    if let Err(e) = poll.registry().register(&mut listener, SERVER, Interest::READABLE) {
-        emit_log("ERROR", "uds_server", None, None, None, None, "CRASH", &format!("Failed to register UDS listener with mio registry: {}", e), config_log_level, json_enabled);
+    if let Err(e) = poll
+        .registry()
+        .register(&mut listener, SERVER, Interest::READABLE)
+    {
+        emit_log(
+            "ERROR",
+            "uds_server",
+            None,
+            None,
+            None,
+            None,
+            "CRASH",
+            &format!("Failed to register UDS listener with mio registry: {}", e),
+            config_log_level,
+            json_enabled,
+        );
         return;
     }
 
     crate::ingestion::notify_systemd_ready();
 
-    let mut connection_pool: std::collections::HashMap<Token, AsyncClientConnection> = std::collections::HashMap::new();
+    let mut connection_pool: std::collections::HashMap<Token, AsyncClientConnection> =
+        std::collections::HashMap::new();
     let mut unique_token_counter = FIRST_CLIENT_TOKEN;
     let mut events = Events::with_capacity(128);
 
-    // KERNEL BACKLOG STATE TRACKER
-    // Tracks if the OS kernel listener queue contains pending connections
-    // that were deferred due to the user-space pool reaching its ceiling
     let mut backlog_pending = false;
     const MAX_UDS_CONNECTIONS: usize = 50;
 
@@ -226,8 +251,6 @@ pub fn run_uds_server(
         for event in events.iter() {
             match event.token() {
                 SERVER => {
-                    // Flag that the OS has readable connections in the backlog
-                    // We DO NOT accept them here anymore
                     backlog_pending = true;
                 }
                 client_token => {
@@ -250,9 +273,13 @@ pub fn run_uds_server(
                                     }
 
                                     let mut start_pos = 0;
-                                    while let Some(newline_offset) = conn.buffer[start_pos..].iter().position(|&b| b == b'\n') {
+                                    while let Some(newline_offset) =
+                                        conn.buffer[start_pos..].iter().position(|&b| b == b'\n')
+                                    {
                                         let end_pos = start_pos + newline_offset;
-                                        let line_slice = String::from_utf8_lossy(&conn.buffer[start_pos..end_pos]);
+                                        let line_slice = String::from_utf8_lossy(
+                                            &conn.buffer[start_pos..end_pos],
+                                        );
                                         let trimmed = line_slice.trim_end();
 
                                         if !trimmed.is_empty() {
@@ -296,8 +323,6 @@ pub fn run_uds_server(
                         if let Some(mut conn) = connection_pool.remove(&client_token) {
                             let _ = poll.registry().deregister(&mut conn.stream);
 
-                            // Flag that space opened up in the pool,
-                            // alerting the engine to check the OS backlog
                             slot_freed = true;
                         }
                     }
@@ -305,13 +330,8 @@ pub fn run_uds_server(
             }
         }
 
-        // BACKLOG DRAINING LOOP
-        // Only process the accept queue if there's potential capacity AND pending clients
-        // When MAX_UDS_CONNECTIONS is reached, we break instantly, leaving the
-        // unaccepted clients in the OS TCP/UDS backlog queue
         if (backlog_pending || slot_freed) && connection_pool.len() < MAX_UDS_CONNECTIONS {
             loop {
-                // Instantly sever the extraction loop if the pool hits capacity
                 if connection_pool.len() >= MAX_UDS_CONNECTIONS {
                     backlog_pending = true;
                     break;
@@ -320,13 +340,29 @@ pub fn run_uds_server(
                 match listener.accept() {
                     Ok((mut client_stream, _)) => {
                         #[cfg(target_os = "linux")]
-                        let socket_container_id = match get_peer_creds(std::os::unix::io::AsRawFd::as_raw_fd(&client_stream)) {
+                        let socket_container_id = match get_peer_creds(
+                            std::os::unix::io::AsRawFd::as_raw_fd(&client_stream),
+                        ) {
                             Ok((peer_uid, peer_pid)) => {
                                 if peer_uid != 0 {
-                                    emit_log("WARN", "uds_server", None, None, None, Some("trust_boundary"), "REJECTED", &format!("Unauthorized UID {} attempted UDS connection. Payload dropped.", peer_uid), config_log_level, json_enabled);
+                                    emit_log(
+                                        "WARN",
+                                        "uds_server",
+                                        None,
+                                        None,
+                                        None,
+                                        Some("trust_boundary"),
+                                        "REJECTED",
+                                        &format!(
+                                            "Unauthorized UID {} attempted UDS connection. Payload dropped.",
+                                            peer_uid
+                                        ),
+                                        config_log_level,
+                                        json_enabled,
+                                    );
                                     continue;
                                 }
-                                // Incorporate race-free identity check
+
                                 extract_id_race_free(peer_pid, peer_uid)
                             }
                             Err(_) => continue,
@@ -341,17 +377,22 @@ pub fn run_uds_server(
                             unique_token_counter = FIRST_CLIENT_TOKEN;
                         }
 
-                        if poll.registry().register(&mut client_stream, client_token, Interest::READABLE).is_ok() {
-                            connection_pool.insert(client_token, AsyncClientConnection {
-                                stream: client_stream,
-                                buffer: Vec::with_capacity(1024),
-                                container_id: socket_container_id,
-                            });
+                        if poll
+                            .registry()
+                            .register(&mut client_stream, client_token, Interest::READABLE)
+                            .is_ok()
+                        {
+                            connection_pool.insert(
+                                client_token,
+                                AsyncClientConnection {
+                                    stream: client_stream,
+                                    buffer: Vec::with_capacity(1024),
+                                    container_id: socket_container_id,
+                                },
+                            );
                         }
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        // The OS queue is fully empty
-                        // Safe to turn off the pending flag
                         backlog_pending = false;
                         break;
                     }

@@ -1,22 +1,18 @@
-// Application Entry point
-// Orchestrates process initialization and routes execution to the multithreaded monitoring handlers
-
 mod config;
-mod logger;
-mod worker;
-mod limiters;
-mod socket;
 mod ingestion;
+mod limiters;
+mod logger;
+mod socket;
+mod worker;
 
-use config::{load_config, load_and_merge_manifests};
-use std::path::Path;
+use config::{load_and_merge_manifests, load_config};
 use ingestion::start_monitor_loop;
+use std::path::Path;
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 fn main() {
-    // Enforcement Boundary: Validate active Linux root execution privileges explicitly
     #[cfg(target_os = "linux")]
     {
         if unsafe { libc::getuid() } != 0 {
@@ -52,13 +48,15 @@ fn main() {
             let flush_firewall = valid_config.monitor.flush_firewall_on_shutdown;
             let nft_table = valid_config.monitor.nftables_default_table.clone();
 
-            // Safe Manifest Merging and Verification Boundary
             match load_and_merge_manifests(&valid_config.monitor.security_manifest_paths) {
                 Ok((global_playbooks, global_rules)) => {
                     let mut sets_to_flush = Vec::new();
 
                     for playbook in global_playbooks.values() {
-                        let combined_actions = playbook.try_actions.iter().chain(playbook.final_actions.iter());
+                        let combined_actions = playbook
+                            .try_actions
+                            .iter()
+                            .chain(playbook.final_actions.iter());
                         for action in combined_actions {
                             if let config::AtomicAction::NftBlacklist { set_name, .. } = action {
                                 sets_to_flush.push(set_name.clone());
@@ -82,16 +80,18 @@ fn main() {
                         json_enabled,
                     );
 
-                    // Purge any residual firewall sets left behind by unexpected crashes
-                    worker::cleanup_stale_firewall_elements(&valid_config, &global_rules, &global_playbooks);
+                    worker::cleanup_stale_firewall_elements(
+                        &valid_config,
+                        &global_rules,
+                        &global_playbooks,
+                    );
 
-                    // Hand down our parsed config and decoupled components to the main processing threads
                     start_monitor_loop(
                         valid_config,
                         global_playbooks,
                         global_rules,
                         Arc::clone(&shutdown),
-                        active_path.to_string()
+                        active_path.to_string(),
                     );
 
                     logger::emit_log(
@@ -118,17 +118,26 @@ fn main() {
 
                             match status {
                                 Ok(s) if s.success() => {
-                                    println!("[INFO] Graceful Shutdown: Cleared firewall containment set '{}'.", set_name);
+                                    println!(
+                                        "[INFO] Graceful Shutdown: Cleared firewall containment set '{}'.",
+                                        set_name
+                                    );
                                 }
                                 _ => {
-                                    eprintln!("[WARN] Graceful Shutdown: Failed to flush firewall set '{}'.", set_name);
+                                    eprintln!(
+                                        "[WARN] Graceful Shutdown: Failed to flush firewall set '{}'.",
+                                        set_name
+                                    );
                                 }
                             }
                         }
                     }
                 }
                 Err(err_msg) => {
-                    eprintln!("System Architectural Boot Panic: Manifest integrity verification failed: {}", err_msg);
+                    eprintln!(
+                        "System Architectural Boot Panic: Manifest integrity verification failed: {}",
+                        err_msg
+                    );
                     std::process::exit(1);
                 }
             }

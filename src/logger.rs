@@ -1,12 +1,7 @@
-// Structured SIEM Audit Logging Module
-// Handles the emission of synchronized plain-text
-// and structured JSON logging payloads with granular severity filtering
-
+use crate::config::LogLevel;
 use serde::Serialize;
 use std::time::{SystemTime, UNIX_EPOCH};
-use crate::config::LogLevel;
 
-// Standardized structured JSON tracking signature optimized for enterprise SIEM ingestion
 #[derive(Serialize)]
 struct JsonLogPayload<'a> {
     timestamp: u64,
@@ -20,9 +15,6 @@ struct JsonLogPayload<'a> {
     details: &'a str,
 }
 
-// Synchronized Log Outflow Router
-// Distributes operational telemetry across standard plain text streams or structured SIEM models
-// after checking the payload severity against the active runtime threshold filter.
 pub fn emit_log(
     level: &str,
     component: &str,
@@ -35,7 +27,6 @@ pub fn emit_log(
     config_log_level: LogLevel,
     json_enabled: bool,
 ) {
-    // Map the string-based log severity parameter to our type-safe hierarchy matrix
     let msg_level = match level.to_lowercase().as_str() {
         "trace" => LogLevel::Trace,
         "debug" => LogLevel::Debug,
@@ -45,7 +36,6 @@ pub fn emit_log(
         _ => LogLevel::Info, // Safely fallback to Info for untracked metrics
     };
 
-    // Early-Exit Guard: Short-circuit instantly if the log event doesn't meet the threshold restraints
     if msg_level < config_log_level {
         return;
     }

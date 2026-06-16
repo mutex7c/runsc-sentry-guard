@@ -1,17 +1,11 @@
-// Configuration Engine Module
-// Handles the secure ingestion, parsing,
-// and type-safe validation of the declarative `config.toml` structure
-// and independent JSON threat signature manifests.
-
-use regex::Regex;
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use ipnet::IpNet;
+use regex::Regex;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-// Type-safe Log Level Severity Hierarchy Matrix
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LogLevel {
@@ -22,10 +16,9 @@ pub enum LogLevel {
     Error,
 }
 
-// Strictly typed operational matrix definitions mapping onto specific automated containment actions
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
-#[serde(deny_unknown_fields)] // Enforces strict structural errors for deprecated/unknown dictionary keys
+#[serde(deny_unknown_fields)]
 pub enum AtomicAction {
     ValidateState,
     LogJson,
@@ -68,7 +61,6 @@ fn default_log_level() -> LogLevel {
     LogLevel::Info
 }
 
-// Global Daemon Engine Metric Parameters
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MonitorConfig {
@@ -88,14 +80,12 @@ pub struct MonitorConfig {
     pub security_manifest_paths: Vec<PathBuf>,
 }
 
-// Root Node Structure for Configuration Manifest Mapping
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GuardConfig {
     pub monitor: MonitorConfig,
 }
 
-// Decoupled Structural Elements for External Manifest Files
 #[derive(Debug, Deserialize)]
 pub struct SecurityManifest {
     #[serde(default)]
@@ -127,43 +117,51 @@ pub fn load_config<P: AsRef<Path>>(path: P) -> Result<GuardConfig> {
         )
     })?;
 
-    let config: GuardConfig = toml::from_str(&content)
-        .context("Configuration structural verification failed")?;
+    let config: GuardConfig =
+        toml::from_str(&content).context("Configuration structural verification failed")?;
 
     Ok(config)
 }
 
-// Ingests, merges, and validates multiple JSON security manifests
-// Aborts instantly if a duplicate playbook name or rule name is encountered
-pub fn load_and_merge_manifests(paths: &[PathBuf]) -> Result<(HashMap<String, PlaybookConfig>, Vec<JsonRuleConfig>)> {
+pub fn load_and_merge_manifests(
+    paths: &[PathBuf],
+) -> Result<(HashMap<String, PlaybookConfig>, Vec<JsonRuleConfig>)> {
     let mut global_playbooks: HashMap<String, PlaybookConfig> = HashMap::new();
     let mut global_rules: Vec<JsonRuleConfig> = Vec::new();
     let mut seen_rule_names: HashSet<String> = HashSet::new();
 
     for path in paths {
-        let content = fs::read_to_string(path)
-            .with_context(|| format!("Failed to read security manifest file: '{}'", path.display()))?;
+        let content = fs::read_to_string(path).with_context(|| {
+            format!(
+                "Failed to read security manifest file: '{}'",
+                path.display()
+            )
+        })?;
 
-        let manifest: SecurityManifest = serde_json::from_str(&content)
-            .with_context(|| format!("JSON schema structural verification failed for file: '{}'", path.display()))?;
+        let manifest: SecurityManifest = serde_json::from_str(&content).with_context(|| {
+            format!(
+                "JSON schema structural verification failed for file: '{}'",
+                path.display()
+            )
+        })?;
 
-        // Merge and validate Playbooks with unique name tracking
         for (name, playbook) in manifest.playbooks {
             if global_playbooks.contains_key(&name) {
                 return Err(anyhow!(
                     "Configuration Collision Error: Playbook name '{}' found in '{}' conflicts with an existing playbook declaration.",
-                    name, path.display()
+                    name,
+                    path.display()
                 ));
             }
             global_playbooks.insert(name, playbook);
         }
 
-        // Merge and validate Rules with unique name tracking
         for rule in manifest.rules {
             if seen_rule_names.contains(&rule.name) {
                 return Err(anyhow!(
                     "Configuration Collision Error: Rule name '{}' defined in '{}' conflicts with an existing rule declaration.",
-                    rule.name, path.display()
+                    rule.name,
+                    path.display()
                 ));
             }
             seen_rule_names.insert(rule.name.clone());
@@ -172,12 +170,14 @@ pub fn load_and_merge_manifests(paths: &[PathBuf]) -> Result<(HashMap<String, Pl
     }
 
     if global_rules.is_empty() {
-        return Err(anyhow!("Security Constraint Violation: At least one active detection rule must be defined across the manifest files."));
+        return Err(anyhow!(
+            "Security Constraint Violation: At least one active detection rule must be defined across the manifest files."
+        ));
     }
 
-    // Structural Constraint & Firewall Duration Verification Matrix
-    let timeout_regex = Regex::new(r"^\d+[smhd]$")
-        .context("Internal Architecture Error: Failed to compile firewall timeout validation regex")?;
+    let timeout_regex = Regex::new(r"^\d+[smhd]$").context(
+        "Internal Architecture Error: Failed to compile firewall timeout validation regex",
+    )?;
 
     for (name, playbook) in &global_playbooks {
         if playbook.try_actions.is_empty() && playbook.final_actions.is_empty() {
@@ -187,25 +187,29 @@ pub fn load_and_merge_manifests(paths: &[PathBuf]) -> Result<(HashMap<String, Pl
             ));
         }
 
-        let combined_actions = playbook.try_actions.iter().chain(playbook.final_actions.iter());
+        let combined_actions = playbook
+            .try_actions
+            .iter()
+            .chain(playbook.final_actions.iter());
         for action in combined_actions {
             if let AtomicAction::NftBlacklist { timeout, .. } = action {
                 if !timeout_regex.is_match(timeout) {
                     return Err(anyhow!(
                         "Security Constraint Violation: Playbook '{}' contains an invalid firewall timeout format: '{}'",
-                        name, timeout
+                        name,
+                        timeout
                     ));
                 }
             }
         }
     }
 
-    // Integrity Check: Ensure every registered rule points to a valid playbook identity
     for rule in &global_rules {
         if !global_playbooks.contains_key(&rule.playbook) {
             return Err(anyhow!(
                 "Integrity Constraint Violation: Rule '{}' references an undefined playbook lookup identity: '{}'.",
-                rule.name, rule.playbook
+                rule.name,
+                rule.playbook
             ));
         }
     }
@@ -260,17 +264,31 @@ mod tests {
         let mut temp_path1 = env::temp_dir();
         temp_path1.push("manifest1.json");
         let mut file1 = File::create(&temp_path1).unwrap();
-        file1.write_all(r#"{"playbooks":{"p1":{"try_actions":[],"final_actions":[]}},"rules":[]}"#.as_bytes()).unwrap();
+        file1
+            .write_all(
+                r#"{"playbooks":{"p1":{"try_actions":[],"final_actions":[]}},"rules":[]}"#
+                    .as_bytes(),
+            )
+            .unwrap();
 
         let mut temp_path2 = env::temp_dir();
         temp_path2.push("manifest2.json");
         let mut file2 = File::create(&temp_path2).unwrap();
-        file2.write_all(r#"{"playbooks":{"p1":{"try_actions":[],"final_actions":[]}},"rules":[]}"#.as_bytes()).unwrap();
+        file2
+            .write_all(
+                r#"{"playbooks":{"p1":{"try_actions":[],"final_actions":[]}},"rules":[]}"#
+                    .as_bytes(),
+            )
+            .unwrap();
 
         let paths = vec![temp_path1.clone(), temp_path2.clone()];
         let res = load_and_merge_manifests(&paths);
         assert!(res.is_err());
-        assert!(res.unwrap_err().to_string().contains("Playbook name 'p1' found in"));
+        assert!(
+            res.unwrap_err()
+                .to_string()
+                .contains("Playbook name 'p1' found in")
+        );
 
         let _ = fs::remove_file(temp_path1);
         let _ = fs::remove_file(temp_path2);

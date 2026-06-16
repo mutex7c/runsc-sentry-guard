@@ -1,18 +1,12 @@
-// Defensive Back-Pressure & Rate Limiting Controls
-// Protects host resources from token exhaustion and high-frequency regex validation flood attacks
-
-use std::collections::{HashSet, VecDeque};
 use parking_lot::Mutex;
+use std::collections::{HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
-// Silences dead-code warnings on cross-platform dev environments (macOS/Windows)
-// where the Linux-only anti-spoofing engine block is compiled out
 #[allow(dead_code)]
 pub const MAX_NEGATIVE_CACHE: usize = 1000;
 #[allow(dead_code)]
-pub const MAX_LOOKUP_TOKENS: u32 = 10; // Max Docker API queries per second for unknown IDs
+pub const MAX_LOOKUP_TOKENS: u32 = 10;
 
-// Anti-DoS State Engine controlling the TOCTOU synchronous container lookup fallback cache
 #[allow(dead_code)]
 pub struct AntiDosState {
     pub negative_cache: HashSet<String>,
@@ -32,7 +26,6 @@ impl AntiDosState {
     }
 }
 
-// Global Sliding-Window Rate Limiting Tracker to protect host CPU against denial-of-service attempts
 pub struct GlobalRateLimiter {
     state: Mutex<(Instant, usize)>,
     last_warning: Mutex<Instant>,
@@ -49,11 +42,9 @@ impl GlobalRateLimiter {
     }
 
     pub fn acquire(&self) -> bool {
-        // parking_lot locks directly return the guard without Results or unwraps
         let mut guard = self.state.lock();
         let now = Instant::now();
 
-        // Reset the window count bucket if a full second has passed
         if now.duration_since(guard.0) >= Duration::from_secs(1) {
             guard.0 = now;
             guard.1 = 0;
@@ -67,7 +58,6 @@ impl GlobalRateLimiter {
         }
     }
 
-    // Extends a 5-second cooldown delay threshold to prevent warning log exhaustion.
     pub fn should_warn(&self) -> bool {
         let mut guard = self.last_warning.lock();
         let now = Instant::now();

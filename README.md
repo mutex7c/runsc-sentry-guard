@@ -122,10 +122,10 @@ the visibility and latency flaws inherent in legacy detection tools.
 
 ## 4. Core Documentation & Context Links
 
-* [Source Compilation & System Installation Guide](./BUILD_INSTALL.md)
-* [Product Requirements & Compliance Specs (CRA & NIS2)](./REQUIREMENTS_AND_COMPLIANCE.md)
-* [Technical Implementation Specification](./TECHNICAL_SPECIFICATION.md)
-* [Configuration & Script Specs](./CONFIG.md)
-* [Host Hardening Profiles (AppArmor, Systemd)](./SECURITY_HARDENING.md)
-* [Integration Testing & Threat Simulation Playbook](./TESTING_AND_SIMULATION.md)
+* [Source Compilation & System Installation Guide](docs/BUILD_INSTALL.md)
+* [Product Requirements & Compliance Specs (CRA & NIS2)](docs/REQUIREMENTS_AND_COMPLIANCE.md)
+* [Technical Implementation Specification](docs/TECHNICAL_SPECIFICATION.md)
+* [Configuration & Script Specs](docs/CONFIG.md)
+* [Host Hardening Profiles (AppArmor, Systemd)](docs/SECURITY_HARDENING.md)
+* [Integration Testing & Threat Simulation Playbook](docs/operations/TESTING_AND_SIMULATION.md)
 

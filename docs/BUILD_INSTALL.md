@@ -40,7 +40,7 @@ Create a file named `Dockerfile` in your root folder:
 # Stage 1: Build Environment
 FROM rust:1.96-alpine AS builder
 WORKDIR /usr/src/runsc-sentry-guard
-COPY . .
+COPY .. .
 RUN cargo build --release
 
 # Stage 2: Minimal Production Image

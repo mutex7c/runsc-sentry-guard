@@ -9,29 +9,17 @@ JSON manifests.
 | Parameter Name                 | Data Type Expected      | Description / Purpose                                                                                                                |
 |--------------------------------|-------------------------|--------------------------------------------------------------------------------------------------------------------------------------|
 | `mode`                         | String                  | `"file"` tails disk logs (recommended for testing only), `"socket"` listens out-of-band via UDS, and `"dual"` aggregates both loops. |
-|
 | `log_level`                    | String                  | `"error"`, `"warn"`, `"info"`, `"debug"`, or `"trace"`. Defaults to `"info"` if omitted.                                             |
-|
 | `log_dir`                      | String (File Path)      | Absolute host folder path to gVisor sandbox (`.boot`) streams.                                                                       |
-|
 | `docker_socket_path`           | String (File Path)      | Absolute path to the container engine IPC socket (e.g., `/var/run/docker.sock` or `/run/podman/podman.sock`).                        |
-|
 | `check_interval_ms`            | Unsigned 64-bit Integer | Thread polling interval for inspecting file modifications.                                                                           |
-|
 | `ip_whitelist`                 | Array of CIDR Strings   | IP networks whitelisted against accidental firewall containment locks.                                                               |
-|
 | `nftables_default_table`       | String                  | Specific nftables table space namespace where containment sets are deployed.                                                         |
-|
 | `json_logging_enabled`         | Boolean Flag            | Toggles output logs between plain-text and structured SIEM JSON payloads.                                                            |
-|
 | `systemd_watchdog_interval_ms` | Unsigned 64-bit Integer | Runtime heartbeat loop frequency for systemd deadlock health checks.                                                                 |
-|
 | `flush_firewall_on_shutdown`   | Boolean Flag            | Toggles automatic post-termination purging of active containment set elements upon graceful daemon stop.                             |
-|
 | `max_workers`                  | Unsigned Integer        | Caps the maximum active concurrent execution threads allowed in the worker pool to mitigate host exhaustion.                         |
-|
 | `security_manifest_paths`      | Array of Paths          | Collection of file paths referencing the JSON rule and playbook manifests.                                                           |
-|
 
 > **SECURITY WARNING: Ingestion Modes**
 > While `mode = "file"` is supported for testing environments,

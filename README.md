@@ -8,7 +8,7 @@ for `runsc` (gVisor) sandboxes written in Rust.
 > You are very welcome to test and contribute, but
 > DO NOT USE in production environments yet!
 
-## TL;DR
+## EXECUTIVE SUMMARY / TL;DR
 
 If your application is running inside a sandboxed gVisor container, it will likely 
 prevent an adversary from easily taking over your entire server.
@@ -37,10 +37,7 @@ outside host edge), the workload has zero visibility into the guard daemon.
 Our goal is to provide enterprise-grade, real-time cyber response capabilities 
 with **zero** performance impact on the running applications.
 
-### Turnkey Quick Start (Run in 60 Seconds)
-
-For rapid evaluations on staging instances, you can fetch the pre-compiled 
-release artifacts directly.
+### QUICK START
 
 > **Platform Compatibility Warning:** These turnkey commands and real-time 
 > containment loops require a native Linux operating system. Running 
@@ -66,12 +63,10 @@ chmod +x runsc-sentry-guard
 sudo ./runsc-sentry-guard config.toml
 ```
 
-## Documentation & Context Links
+## Documentation
 
-* [Source Compilation & System Installation Guide](docs/BUILD_INSTALL.md)
-* [Product Requirements & Compliance Specs (CRA & NIS2)](docs/REQUIREMENTS_AND_COMPLIANCE.md)
-* [Technical Implementation Specification](docs/TECHNICAL_SPECIFICATION.md)
-* [Configuration & Script Specs](docs/CONFIG.md)
-* [Host Hardening Profiles (AppArmor, Systemd)](docs/SECURITY_HARDENING.md)
-* [Integration Testing & Threat Simulation Playbook](docs/operations/TESTING_AND_SIMULATION.md)
+* [Configuration](docs/CONFIG.md)
+* [Compilation & Installation Guide](docs/BUILD_INSTALL.md)
+* [Technical Specifications](docs/TECHNICAL_SPECIFICATION.md)
+* [Testing & Threat Simulation](docs/operations/TESTING_AND_SIMULATION.md)
 

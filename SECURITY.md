@@ -2,7 +2,9 @@
 
 ## Supported Versions
 
-We actively monitor and maintain security updates for the following versions of `runsc-sentry-guard`. Vulnerabilities discovered in unsupported or modified forks will not be triaged under this policy.
+We actively monitor and maintain security updates for the following 
+versions of `runsc-sentry-guard`. Vulnerabilities discovered in unsupported 
+or modified forks will not be triaged under this policy.
 
 | Version | Supported         |
 |---------|-------------------|

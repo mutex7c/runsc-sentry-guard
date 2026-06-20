@@ -1,44 +1,40 @@
-# Configuration Schema Blueprint
-
-The `runsc-sentry-guard` daemon enforces a decoupled, secure defense-in-depth configuration strategy. Global host infrastructure and ingestion engine parameters are defined in a lean `config.toml` file, while threat detection signatures and multi-step containment playbooks are organized inside independent, reusable JSON manifests.
-
-The internal engine enforces strict schema validation at initialization; any unexpected properties, malformed parameters, or duplicate identifiers across files will immediately trigger a safe startup boot panic.
-
----
+# CONFIGURATION
 
 ## 1. Global Daemon Parameters (`[monitor]`)
 
-The primary `config.toml` file maps strictly to host hardware channels, security boundaries, and paths to your detached manifests. It manages the operational footprint of the master daemon loop.
+Global parameters are defined in `config.toml`, while threat detection
+signatures and multi-step containment playbooks are organized in independent
+JSON manifests.
 
-| Parameter Name                 | Data Type Expected      | Description / Purpose                                                                                                                    |
-|--------------------------------|-------------------------|------------------------------------------------------------------------------------------------------------------------------------------|
-| `mode`                         | String                  | Dictates the ingestion strategy: `"file"` tails disk logs, `"socket"` listens out-of-band via UDS, and `"dual"` aggregates both loops.   |
+| Parameter Name                 | Data Type Expected      | Description / Purpose                                                                                                                |
+|--------------------------------|-------------------------|--------------------------------------------------------------------------------------------------------------------------------------|
+| `mode`                         | String                  | `"file"` tails disk logs (recommended for testing only), `"socket"` listens out-of-band via UDS, and `"dual"` aggregates both loops. |
 |
-| `log_level`                    | String                  | Enforces a type-safe severity threshold filter: `"error"`, `"warn"`, `"info"`, `"debug"`, or `"trace"`. Defaults to `"info"` if omitted. |
+| `log_level`                    | String                  | `"error"`, `"warn"`, `"info"`, `"debug"`, or `"trace"`. Defaults to `"info"` if omitted.                                             |
 |
-| `log_dir`                      | String (File Path)      | The absolute host folder path where gVisor emits its active sandbox `.boot` streams.                                                     |
+| `log_dir`                      | String (File Path)      | Absolute host folder path to gVisor sandbox (`.boot`) streams.                                                                       |
 |
-| `docker_socket_path`           | String (File Path)      | The absolute path to the container engine IPC socket (e.g., `/var/run/docker.sock` or `/run/podman/podman.sock`).                        |
+| `docker_socket_path`           | String (File Path)      | Absolute path to the container engine IPC socket (e.g., `/var/run/docker.sock` or `/run/podman/podman.sock`).                        |
 |
-| `check_interval_ms`            | Unsigned 64-bit Integer | The thread polling interval cadence for inspecting file modifications.                                                                   |
+| `check_interval_ms`            | Unsigned 64-bit Integer | Thread polling interval for inspecting file modifications.                                                                           |
 |
-| `ip_whitelist`                 | Array of CIDR Strings   | Core infrastructure IP networks strictly protected against accidental firewall containment locks.                                        |
+| `ip_whitelist`                 | Array of CIDR Strings   | IP networks whitelisted against accidental firewall containment locks.                                                               |
 |
-| `nftables_default_table`       | String                  | The specific nftables table space namespace where containment sets are deployed.                                                         |
+| `nftables_default_table`       | String                  | Specific nftables table space namespace where containment sets are deployed.                                                         |
 |
-| `json_logging_enabled`         | Boolean Flag            | Toggles terminal output logs between clean plain-text and structured SIEM JSON payloads.                                                 |
+| `json_logging_enabled`         | Boolean Flag            | Toggles output logs between plain-text and structured SIEM JSON payloads.                                                            |
 |
-| `systemd_watchdog_interval_ms` | Unsigned 64-bit Integer | The periodic runtime heartbeat loop frequency for systemd deadlock health checks.                                                        |
+| `systemd_watchdog_interval_ms` | Unsigned 64-bit Integer | Runtime heartbeat loop frequency for systemd deadlock health checks.                                                                 |
 |
-| `flush_firewall_on_shutdown`   | Boolean Flag            | Toggles automatic post-termination purging of active containment set elements upon graceful daemon stop.                                 |
+| `flush_firewall_on_shutdown`   | Boolean Flag            | Toggles automatic post-termination purging of active containment set elements upon graceful daemon stop.                             |
 |
-| `max_workers`                  | Unsigned Integer        | Caps the maximum active concurrent execution threads allowed in the worker pool to mitigate host exhaustion.                             |
+| `max_workers`                  | Unsigned Integer        | Caps the maximum active concurrent execution threads allowed in the worker pool to mitigate host exhaustion.                         |
 |
-| `security_manifest_paths`      | Array of Paths          | Ordered collection of file paths referencing the decoupled JSON threat intelligence rule and playbook manifests.                         |
+| `security_manifest_paths`      | Array of Paths          | Collection of file paths referencing the JSON rule and playbook manifests.                                                           |
 |
 
-> ⚠️ **SECURITY WARNING: Ingestion Modes**
-> While `mode = "file"` is supported for legacy setups or lightweight testing environments,
+> **SECURITY WARNING: Ingestion Modes**
+> While `mode = "file"` is supported for testing environments,
 > it inherently relies on host disk polling. This introduces a slight latency window
 > (Time-of-Check to Time-of-Use) and a theoretical log spoofing risk if an attacker manages
 > to compromise the `/var/log/gvisor/` directory permissions.
@@ -92,9 +88,12 @@ security_manifest_paths = [
 
 ## 2. Container Runtime Engine Configuration (`daemon.json`)
 
-For `runsc-sentry-guard` to receive high-fidelity system call telemetry out-of-band, you must configure Docker/Podman to instruct the runsc / gVisor supervisor to emit strace logs down to the host file system.
+For `runsc-sentry-guard` to receive high-fidelity system call telemetry out-of-band, 
+you must configure Docker/Podman to instruct the runsc / gVisor supervisor to emit 
+strace logs to the host file system.
 
-Append or merge the following configuration block into your global `/etc/docker/daemon.json` file:
+Append or merge the following configuration block into your 
+global `/etc/docker/daemon.json` file:
 
 ```json
 {
@@ -122,9 +121,13 @@ the runtime parameters (`sudo systemctl restart docker`).
 
 ## 3. Threat & Playbook Manifests (JSON Schema)
 
-Threat detection patterns and mitigation playbooks are organized via an $N:1$ architecture inside detached JSON manifest files. Multiple distinct signatures can reference a single reusable remediation process, preventing duplication bloat.
+Threat detection patterns and mitigation playbooks are organized 
+via an $N:1$ architecture inside detached JSON manifest files. 
 
-### 3.1 Strict Security Rules File Layout
+Multiple distinct signatures can reference a single reusable remediation 
+process, preventing duplication bloat.
+
+### 3.1 Rules File Layout
 
 ```json
 {
@@ -155,17 +158,22 @@ Threat detection patterns and mitigation playbooks are organized via an $N:1$ ar
 
 #### Playbook Configurations (`playbooks`)
 
-Every declared playbook identifier maps to a sequential `try_actions` list and a defensive `final_actions` fallback block. If an error occurs during primary execution, the engine drops the remaining sequence and triggers the fallback containment chain immediately to enforce containment.
+Every playbook identifier maps to a 
+sequential `try_actions` list and a 
+defensive `final_actions` fallback block. If an error 
+occurs during primary execution, the engine drops the remaining sequence 
+and triggers the fallback containment chain immediately to enforce containment.
 
 #### Rule Matrix (`rules`)
 
-* **`name`**: A unique alphanumeric identifier for the rule context. **Duplicate rule names across any loaded manifest files will trigger an immediate boot panic**.
-* **`match_any`**: An array of regular expressions evaluated sequentially against log streams as an implicit **logical OR** condition. If any individual pattern strikes a match, the assigned playbook execution pool is engaged.
-* **`playbook`**: The string token matching a playbook identifier defined within the available manifest pool.
+* **`name`**: A unique alphanumeric identifier for the rule context. **Duplicate rule names across any loaded manifest files will trigger a boot panic**.
+* **`match_any`**: An array of regular expressions evaluated against log streams as an implicit **logical OR** condition. If any individual pattern matches, the assigned playbook is executed.
+* **`playbook`**: The string token matching a playbook identifier.
 
 ## 4. Rule Actions & Parameter Reference
 
-Every operational action declared inside a playbook's `try_actions` or `final_actions` maps straight onto strongly typed engine components.
+Every operational action declared inside a playbook's 
+`try_actions` or `final_actions` maps to specific engine commands.
 
 ### `validate_state`
 
@@ -230,18 +238,33 @@ docker logs "${TARGET_CONTAINER_ID}" > "/var/log/forensics/incident-${TARGET_CON
 
 ## 6. Host-Side nftables Policy Layouts
 
-> ⚠️ **ARCHITECTURAL BOUNDARY WARNING**
-> The `runsc-sentry-guard` daemon operates strictly as an **out-of-band set populator**. When an incident response pipeline triggers, the engine appends the container's internal bridge IP address directly into a named kernel set.
+> **ARCHITECTURAL BOUNDARY WARNING**
+> 
+> The `runsc-sentry-guard` daemon operates as an **out-of-band set populator**. 
+> When an incident response pipeline triggers, the engine appends the container's 
+> internal bridge IP address directly into a specified kernel set.
 >
 >
-> The daemon **does not** create base tables, routing chains, or packet-filtering hooks on the host. Firewall policy enforcement is entirely delegated to the system supervisor. Implementing overly broad filtering postures risks inflicting an accidental self-inflicted Denial of Service (DoS) on legitimate, concurrent user sessions running within the same compromised namespace.
+> The daemon **does not** create base tables, routing chains, 
+> or packet-filtering hooks on the host. Firewall policy enforcement 
+> is entirely delegated to the system administrator. 
+> 
+> Implementing overly 
+> broad filtering can lead to accidental self-inflicted 
+> Denial of Service (DoS) on legitimate, concurrent user sessions running 
+> within the same compromised namespace.
 >
 
-To prevent collateral damage, administrators must deploy surgical packet-filtering layouts on the host network edge. The following three blueprints use the daemon's default `inet security_ops` table and `container_blacklist` set references to achieve varying security profiles.
+To prevent collateral damage, administrators should deploy appropriate 
+packet-filtering layouts on the host network edge. 
+
+The following three 
+blueprints use the daemon's default `inet security_ops` table 
+and `container_blacklist` set references to achieve varying security profiles.
 
 ### Blueprint A: Total Isolation (Air-Gap Containment)
 
-* **Use Case:** Maximum containment severity. Completely severs all inbound, outbound, and inter-container network connectivity for the compromised container instantly.
+* **Use Case:** Maximum containment. Completely severs all inbound, outbound, and inter-container network connectivity for the compromised container instantly.
 * **Impact:** High blast radius. Best suited for highly critical data-leak environments where active forensic preservation is preferred over application availability.
 
 ```text
@@ -285,7 +308,7 @@ table inet security_ops {
 ### Blueprint C: Connection-Tracking State Filtration (Zero-Collateral)
 
 * **Use Case:** Highly recommended for dense, high-traffic production application nodes. Bypasses the "crossfire" dilemma entirely.
-* **Impact:** Zero blast radius for valid users. Uses the Linux kernel connection tracking (`conntrack`) subsystem to permit already-established, legitimate user sessions (`established,related`) to complete their lifecycles seamlessly. Concurrently, it blocks the container from initializing **any** fresh outbound socket requests, trapping reverse shell dial-backs or malicious command-and-control (C2) setups instantly.
+* **Impact:** Zero blast radius for valid users. Uses the Linux kernel connection tracking (`conntrack`) subsystem to permit already-established, legitimate user sessions (`established,related`) to complete their lifecycles seamlessly. Concurrently, it blocks the container from initializing **any** fresh outbound socket requests, trapping reverse shell dial-backs or malicious command-and-control (C2) setups.
 
 ```text
 table inet security_ops {
@@ -305,3 +328,166 @@ table inet security_ops {
     }
 }
 ```
+
+
+
+---
+
+# HOST SECURITY HARDENING & SANDBOXING
+
+Because `runsc-sentry-guard` executes with elevated privileges, 
+this document provides some blueprints required 
+to restrict the daemon's host-level access to only the necessary directories 
+and kernel interfaces while preserving the execution viability of custom 
+administrative incident response playbooks.
+
+Adjust to your individual environment as you see fit.
+
+## 1. Systemd Sandboxing (Built-in Hardening)
+
+The systemd service unit utilizes advanced Linux namespace isolation flags. 
+
+This ensures that even if a vulnerability is discovered within our dependency tree, 
+the binary cannot access unauthorized host directories, spawn arbitrary network 
+listeners, or modify critical system configurations.
+
+To ensure custom incident response playbooks have a safe space to write forensic 
+artifacts without introducing a broad file-system attack surface, the profile 
+defines a dedicated writable sandbox path under `/var/log/runsc-sentry-guard/`.
+
+Ensure your system service file `/etc/systemd/system/runsc-sentry-guard.service` 
+reflects these parameters:
+
+```ini
+[Unit]
+Description=Runsc Sentry Guard Active Containment Daemon
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=notify
+User=root
+WorkingDirectory=/var/log/gvisor
+ExecStart=/usr/sbin/runsc-sentry-guard /etc/runsc-sentry-guard/config.toml
+Restart=always
+RestartSec=3
+WatchdogSec=10
+
+# Security Hardening & Sandboxing Matrix
+NoNewPrivileges=true
+CapabilityBoundingSet=CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_ADMIN
+ProtectSystem=strict
+ProtectHome=yes
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+PrivateTmp=yes
+
+# Hardened Data Path Channels
+ReadWritePaths=/var/log/gvisor /var/run/ /var/log/runsc-sentry-guard/
+```
+
+## 2. AppArmor Security Profile
+
+For systems running AppArmor (Ubuntu, Debian, openSUSE), 
+deploy this profile to enforce Mandatory Access Controls (MAC). 
+
+It restricts the daemon's file operations to the gVisor log directory 
+and standard container IPC endpoints while creating strict execution 
+gates for custom administrative playbooks.
+
+> **CRITICAL SECURITY BOUNDARY:** To prevent arbitrary execution 
+> vulnerabilities, all custom automation bash scripts must be stored 
+> within the root-owned, locked-down folder path `/etc/runsc-sentry-guard/scripts/`. 
+> The AppArmor profile permits system shell execution (`/bin/bash`) **exclusively** 
+> when processing scripts inside this designated directory container.
+>
+
+Create `/etc/apparmor.d/usr.sbin.runsc-sentry-guard` using this blueprint:
+
+```text
+#include <tunables/global>
+
+/usr/sbin/runsc-sentry-guard {
+  #include <abstractions/base>
+  #include <abstractions/nameservice>
+
+  # Allow standard logging outputs
+  /usr/sbin/runsc-sentry-guard mr,
+  
+  # Strict directory access rules
+  /var/log/gvisor/ r,
+  /var/log/gvisor/** r,
+  /var/log/runsc-sentry-guard/ rw,
+  /var/log/runsc-sentry-guard/** rw,
+  
+  # Allow the daemon to read foreign process states for UDS resolution
+  /proc/[0-9]*/cmdline r,
+  /proc/[0-9]*/cgroup r,
+  
+  # Bounded container utility control gates
+  /usr/sbin/nft rcx,
+  
+  # ─────────────────────────────────────────────────────────────────
+  # SCRIPT EXTENSION GATES
+  # ─────────────────────────────────────────────────────────────────
+  # Allow the daemon to execute standard shells under environment inheritance (ix)
+  /bin/sh ix,
+  /bin/bash ix,
+  /bin/dash ix,
+
+  # Bound custom automation script execution strictly to our secure config tree
+  /etc/runsc-sentry-guard/scripts/ r,
+  /etc/runsc-sentry-guard/scripts/** rix,
+  
+  # Socket communication lines for container engines
+  /var/run/docker.sock rw,
+  /run/docker.sock rw,
+  /run/podman/podman.sock rw,
+
+  # Deny all other administrative or home access vectors explicitly
+  deny /etc/** w,
+  deny /home/** rw,
+  deny /root/** rw,
+}
+```
+
+Load and parse the updated ruleset into the active kernel:
+
+```bash
+sudo apparmor_parser -r /etc/apparmor.d/usr.sbin.runsc-sentry-guard
+```
+
+## 3. Seccomp Architecture Note
+
+Earlier alpha versions of this daemon utilized an 
+internal `libseccomp` BPF filter natively. This was intentionally removed 
+to support external mitigation playbooks (like spawning custom shell automations), 
+which require broad, unpredictable system call matrices (DNS resolution, SSL loading, 
+Netlink sockets, signal reaping).
+
+Syscall sandboxing for the master process can be optionally extended 
+via systemd `SystemCallFilter` fields. However, filters must be applied 
+with caution if administrators design custom playbooks that require specialized 
+debugging or system instrumentation tools.
+
+## 4. Architectural Note: Execution Identity & DAC
+
+Earlier alpha versions of this daemon attempted to perform an internal 
+identity shift upon boot—dropping from `root` to an unprivileged 
+user (`nobody`) while attempting to retain `CAP_NET_ADMIN` internally.
+
+However, Linux Discretionary Access Control (DAC) requires 
+standard `root` group ownership to interact with the container 
+engine Unix Domain Socket (`/var/run/docker.sock`) and to reliably 
+read privileged sandbox streams (`/var/log/gvisor/`). 
+
+Attempting to strip DAC overrides fundamentally broke the daemon's 
+core ingestion and state-validation mechanisms.
+
+Consequently, internal identity manipulation has been explicitly removed. 
+The daemon **must** execute as standard `root` (UID 0). All process bounding 
+(restricting capabilities strictly to `CAP_NET_ADMIN`) and file-system 
+jailing must be handled by the `systemd` supervisor or AppArmor profiles 
+as defined above.

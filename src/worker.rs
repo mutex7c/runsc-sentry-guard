@@ -6,17 +6,29 @@ use std::collections::HashMap;
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::OnceLock;
-
 #[cfg(target_os = "linux")]
 use serde::Deserialize;
 #[cfg(target_os = "linux")]
 use std::io::BufRead;
 #[cfg(target_os = "linux")]
 use std::net::IpAddr;
-
-
 #[cfg(target_os = "linux")]
 use std::os::unix::process::CommandExt;
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+#[cfg(target_os = "linux")]
+struct DockerStateField {
+    running: bool, // 🟢 Idiomatic snake_case, automatically maps to "Running"
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+#[cfg(target_os = "linux")]
+struct DockerStatusInspect {
+    state: DockerStateField, // 🟢 Idiomatic snake_case, automatically maps to "State"
+}
+
 
 #[derive(Deserialize)]
 #[allow(non_snake_case)]
@@ -508,25 +520,28 @@ fn execute_atomic_command(
                             config_log_level,
                             json_enabled,
                         )?;
+
                         if status == 200 {
-                            if json_payload.contains("\"Running\": true")
-                                || json_payload.contains("\"Running\":true")
-                            {
-                                emit_log(
-                                    "INFO",
-                                    "worker_engine",
-                                    None,
-                                    Some(container_id),
-                                    None,
-                                    Some("validate_state"),
-                                    "SUCCESS",
-                                    "Container state verified as active. Executing containment pipeline.",
-                                    config_log_level,
-                                    json_enabled,
-                                );
-                                Ok(())
+                            if let Ok(parsed) = serde_json::from_str::<DockerStatusInspect>(&json_payload) {
+                                if parsed.state.running { 
+                                    emit_log(
+                                        "INFO",
+                                        "worker_engine",
+                                        None,
+                                        Some(container_id),
+                                        None,
+                                        Some("validate_state"),
+                                        "SUCCESS",
+                                        "Container state verified as active. Executing containment pipeline.",
+                                        config_log_level,
+                                        json_enabled,
+                                    );
+                                    Ok(())
+                                } else {
+                                    bail!("Container status inactive. Aborting containment pipeline.");
+                                }
                             } else {
-                                bail!("Container status inactive. Aborting containment pipeline.");
+                                bail!("Failed to parse container state validation JSON response payload.");
                             }
                         } else {
                             bail!("State validation rejected (HTTP {}). Container likely terminated.", status);

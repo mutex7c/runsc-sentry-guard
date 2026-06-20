@@ -5,6 +5,7 @@ use ipnet::IpNet;
 use std::collections::HashMap;
 use std::process::Command;
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 #[cfg(target_os = "linux")]
 use serde::Deserialize;
@@ -12,8 +13,7 @@ use serde::Deserialize;
 use std::io::BufRead;
 #[cfg(target_os = "linux")]
 use std::net::IpAddr;
-#[cfg(target_os = "linux")]
-use std::sync::OnceLock;
+
 
 #[cfg(target_os = "linux")]
 use std::os::unix::process::CommandExt;
@@ -323,19 +323,28 @@ fn execute_atomic_command(
     let _ = socket_path;
 
     match action {
+
         AtomicAction::WebhookAlert { url } => {
             let payload_obj = serde_json::json!({
                 "text": format!("[SENTRY-GUARD] Active containment pipeline triggered for container context: {}", container_id)
             });
-            let client = reqwest::blocking::Client::builder()
-                .timeout(std::time::Duration::from_secs(5))
-                .build()
-                .map_err(|e| anyhow!("Failed to construct native reqwest client: {}", e))?;
+
+            static WEBHOOK_CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
+            let client = WEBHOOK_CLIENT.get_or_init(|| {
+                reqwest::blocking::Client::builder()
+                    .timeout(std::time::Duration::from_secs(5))
+                    .build()
+                    .unwrap_or_else(|e| {
+                        panic!("Fatal: Failed to initialize global HTTP webhook client context: {}", e);
+                    })
+            });
+
             let response = client
                 .post(url)
                 .json(&payload_obj)
                 .send()
                 .map_err(|e| anyhow!("Failed to dispatch webhook alert natively: {}", e))?;
+
             if response.status().is_success() {
                 Ok(())
             } else {

@@ -1,9 +1,3 @@
-My bad on that—I completely dropped the ball by cutting out those critical operational baselines and warnings. In an active containment engine, dropping the parameter references and edge case warnings defeats the entire purpose of the documentation.
-
-Here is your complete, unified `CONFIG.md` layout. It preserves every security warning, matrix reference, custom script template, and advanced `nftables` state configuration exactly as originally written, while seamlessly weaving in your new decoupled multi-manifest paths and JSON schema definitions.
-
----
-
 # Configuration Schema Blueprint
 
 The `runsc-sentry-guard` daemon enforces a decoupled, secure defense-in-depth configuration strategy. Global host infrastructure and ingestion engine parameters are defined in a lean `config.toml` file, while threat detection signatures and multi-step containment playbooks are organized inside independent, reusable JSON manifests.

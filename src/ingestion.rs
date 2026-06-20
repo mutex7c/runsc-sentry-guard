@@ -67,7 +67,6 @@ pub fn compile_manifest_rules(
             eprintln!("[CRITICAL] Failed to compile RegexSet automaton: {}", e);
             std::process::exit(1);
         });
-
     CompiledManifest {
         regex_set,
         rule_metadata: metadata,
@@ -87,7 +86,6 @@ pub fn start_monitor_loop(
     let docker_socket_path = config.monitor.docker_socket_path.clone();
     let watchdog_interval = config.monitor.systemd_watchdog_interval_ms;
     let max_workers = config.monitor.max_workers;
-
     let whitelist = Arc::new(config.monitor.ip_whitelist);
     let table = Arc::new(config.monitor.nftables_default_table);
 
@@ -148,7 +146,6 @@ pub fn start_monitor_loop(
 
                                 let mut headers = [httparse::EMPTY_HEADER; 64];
                                 let mut res = httparse::Response::new(&mut headers);
-
                                 match res.parse(&header_buf[..bytes_read]) {
                                     Ok(httparse::Status::Complete(body_start_offset)) => {
                                         header_end = body_start_offset;
@@ -180,7 +177,6 @@ pub fn start_monitor_loop(
                                     BufReader::new(Cursor::new(leftover).chain(stream));
                                 let mut chunk_size_buf = String::new();
                                 let mut line_buffer = Vec::new();
-
                                 while !stream_shutdown.load(Ordering::SeqCst) {
                                     chunk_size_buf.clear();
                                     if reader.read_line(&mut chunk_size_buf).is_err() {
@@ -275,16 +271,13 @@ pub fn start_monitor_loop(
     }
 
     let worker_registry: Arc<RwLock<RegistryMap>> = Arc::new(RwLock::new(HashMap::new()));
-
     let regex_compiled = Arc::new(RwLock::new(compile_manifest_rules(
         &initial_rules,
         &initial_playbooks,
     )));
-
     let rules_watch_clone = Arc::clone(&regex_compiled);
     let path_watch_clone = config_path.clone();
     let json_enabled_clone = json_enabled;
-
     thread::spawn(move || {
         use notify::{RecursiveMode, Watcher};
         let (tx, rx) = std::sync::mpsc::channel();
@@ -330,7 +323,7 @@ pub fn start_monitor_loop(
                                 None,
                                 None,
                                 "SUCCESS",
-                                "Active rulesets and decoupled manifests hot-reloaded into new Automaton.",
+                                "Active rulesets and decoupled manifests hot-reloaded successfully.",
                                 config_log_level,
                                 json_enabled_clone,
                             );
@@ -343,7 +336,7 @@ pub fn start_monitor_loop(
                                 None,
                                 None,
                                 "FAILURE",
-                                "Hot-reload aborted: Manifest files contain schema errors or name collisions.",
+                                "Hot-reload aborted: Manifest files contain schema errors or format collisions.",
                                 config_log_level,
                                 json_enabled_clone,
                             );
@@ -357,7 +350,7 @@ pub fn start_monitor_loop(
                             None,
                             None,
                             "FAILURE",
-                            "Hot-reload aborted: Updated config.toml contains errors.",
+                            "Hot-reload aborted: Updated configuration profile contains errors.",
                             config_log_level,
                             json_enabled_clone,
                         );
@@ -366,13 +359,11 @@ pub fn start_monitor_loop(
             }
         }
     });
-
     let id_extractor = Regex::new(r"--id=\b([a-fA-F0-9]{12}|[a-fA-F0-9]{64})\b").unwrap();
     let filename_id_extractor = Regex::new(r"\b([a-fA-F0-9]{12}|[a-fA-F0-9]{64})\b").unwrap();
 
     let mut file_state_tracker: HashMap<String, LogDescriptor> = HashMap::new();
     let mut first_run = true;
-
     if mode == &IngestionMode::Socket || mode == &IngestionMode::Dual {
         let uds_registry = Arc::clone(&worker_registry);
         let uds_regex = Arc::clone(&regex_compiled);
@@ -384,7 +375,6 @@ pub fn start_monitor_loop(
         let uds_anti_dos = Arc::clone(&anti_dos_state);
         let uds_shutdown = Arc::clone(&shutdown);
         let limiter_clone = Arc::clone(&global_limiter);
-
         thread::spawn(move || {
             crate::socket::run_uds_server(
                 uds_registry,
@@ -413,7 +403,7 @@ pub fn start_monitor_loop(
             None,
             None,
             "STARTED",
-            "Out-of-band UDS receiver active. Filesystem parsing idle.",
+            "Out-of-band UDS receiver active. Production monitoring path fully armed.",
             config_log_level,
             json_enabled,
         );
@@ -424,14 +414,14 @@ pub fn start_monitor_loop(
     }
 
     emit_log(
-        "INFO",
+        "WARN",
         "orchestrator",
         None,
         None,
         None,
-        None,
-        "STARTED",
-        "Master directory tailer and UDS receiver paths armed.",
+        Some("ingestion_mode"),
+        "NON_PRODUCTION",
+        "RUNNING IN FILE INGESTION TESTING HARNESS. DIRECTORY POLL LATENCY IS NOT OPTIMIZED FOR PRODUCTION CORES.",
         config_log_level,
         json_enabled,
     );
@@ -442,7 +432,6 @@ pub fn start_monitor_loop(
 
     while !shutdown.load(Ordering::SeqCst) {
         let log_dir_path = Path::new(&config.monitor.log_dir);
-
         if !log_dir_path.exists() {
             #[cfg(not(target_os = "linux"))]
             {
@@ -458,7 +447,7 @@ pub fn start_monitor_loop(
                     None,
                     None,
                     "MISSING",
-                    "Target directory unreachable.",
+                    "Target log path directory unreachable.",
                     config_log_level,
                     json_enabled,
                 );
@@ -480,7 +469,7 @@ pub fn start_monitor_loop(
                         None,
                         Some("directory_audit"),
                         "HALTED",
-                        "Log directory unsecured. Suspended to prevent spoofing.",
+                        "Log directory unsecured. Suspended directory crawler to prevent traversal mutations.",
                         config_log_level,
                         json_enabled,
                     );
@@ -491,11 +480,9 @@ pub fn start_monitor_loop(
         }
 
         let mut actively_seen_paths = HashSet::new();
-
         if let Ok(entries) = fs::read_dir(log_dir_path) {
             for entry in entries.flatten() {
                 let path = entry.path();
-
                 if path.extension().map_or(false, |ext| ext == "boot") {
                     let path_str = path.to_string_lossy().into_owned();
                     actively_seen_paths.insert(path_str.clone());
@@ -515,7 +502,6 @@ pub fn start_monitor_loop(
                     };
                     #[cfg(not(target_os = "linux"))]
                     let current_inode = 0;
-
                     if first_run {
                         if let Ok(metadata) = path.metadata() {
                             file_state_tracker.insert(
@@ -540,7 +526,6 @@ pub fn start_monitor_loop(
                     let file_result = open_log_safe(log_dir_path, path.file_name().unwrap());
                     #[cfg(not(unix))]
                     let file_result = fs::File::open(&path);
-
                     if let Ok(file) = file_result {
                         #[cfg(unix)]
                         {
@@ -560,14 +545,12 @@ pub fn start_monitor_loop(
                         const MAX_LINE_SIZE: usize = 65536;
                         let mut stream_buffer = vec![0u8; MAX_LINE_SIZE * 2];
                         let mut buffer_len = 0;
-
                         loop {
                             let bytes_read = match reader.read(&mut stream_buffer[buffer_len..]) {
                                 Ok(0) => break,
                                 Ok(n) => n,
                                 Err(_) => break,
                             };
-
                             buffer_len += bytes_read;
                             let mut start_pos = 0;
 
@@ -614,7 +597,7 @@ pub fn start_monitor_loop(
                                         None,
                                         Some("stream"),
                                         "OVERFLOW_FLUSHED",
-                                        "Line token bounds overflowed 64KB boundary.",
+                                        "Ingestion stream buffer boundaries overflowed 64KB ceiling layer.",
                                         config_log_level,
                                         json_enabled,
                                     );
@@ -670,7 +653,6 @@ fn is_container_active_sync(container_id: &str, socket_path: &str) -> bool {
 
                 let mut headers = [httparse::EMPTY_HEADER; 16];
                 let mut res = httparse::Response::new(&mut headers);
-
                 match res.parse(&header_buf[..bytes_read]) {
                     Ok(httparse::Status::Complete(_)) => {
                         return res.code == Some(200);
@@ -750,7 +732,6 @@ pub fn evaluate_line_signatures(
     } else {
         return;
     };
-
     #[allow(unused_mut)]
     let mut dispatch_id = container_id.clone();
 
@@ -758,15 +739,31 @@ pub fn evaluate_line_signatures(
     let mut is_valid = {
         let active_guard = active_containers.read();
         active_guard.contains(&container_id)
-            || active_guard
-                .iter()
-                .any(|long_id| long_id.starts_with(&container_id))
+            || active_guard.iter().any(|long_id| long_id.starts_with(&container_id))
     };
 
     #[cfg(target_os = "linux")]
     {
-        if !is_valid {
+        if !is_valid && !is_from_file {
+            let mut active_write = active_containers.write();
+            active_write.insert(container_id.clone());
+            is_valid = true;
 
+            emit_log(
+                "DEBUG",
+                "orchestrator",
+                None,
+                Some(&container_id),
+                None,
+                Some("kernel_promotion"),
+                "SUCCESS",
+                "Startup transaction detected. Container context cache seeded via verified peer credentials.",
+                config_log_level,
+                json_enabled,
+            );
+        }
+
+        if !is_valid {
             let mut dos_guard = anti_dos_state.lock();
             let now = std::time::Instant::now();
             if now.duration_since(dos_guard.last_refill).as_secs() >= 1 {
@@ -808,11 +805,10 @@ pub fn evaluate_line_signatures(
                     None,
                     Some("api_backpressure"),
                     "RECOURSE_ROUTED",
-                    "Lookup token pool exhausted. Container identity unverified but threat signature matches. Enforcing fallback routing.",
+                    "Lookup token pool exhausted. Enforcing fallback routing configuration context.",
                     config_log_level,
                     json_enabled,
                 );
-
                 dispatch_id = format!(
                     "UNSYNCED_ID_{}",
                     &container_id[..std::cmp::min(12, container_id.len())]
@@ -831,7 +827,6 @@ pub fn evaluate_line_signatures(
 
     for match_idx in matches.into_iter() {
         let (rule_name, try_act, final_act) = &rules.rule_metadata[match_idx];
-
         emit_log(
             "DEBUG",
             "orchestrator",
@@ -840,14 +835,10 @@ pub fn evaluate_line_signatures(
             None,
             Some("signature_eval"),
             "EVALUATING",
-            &format!(
-                "Signature Automaton detected threat match for sequence layout: '{}'",
-                rule_name
-            ),
+            &format!("Signature automaton detected match layout template: '{}'", rule_name),
             config_log_level,
             json_enabled,
         );
-
         let mut active_try = try_act.clone();
         if is_from_file && active_try.first() != Some(&AtomicAction::ValidateState) {
             active_try.insert(0, AtomicAction::ValidateState);
@@ -898,7 +889,7 @@ fn dispatch_to_worker(
                             None,
                             Some("route"),
                             "FAST_PATH_DROPPED",
-                            "Queue saturated on fast-path lookup. Enforcing rigid backpressure: Event dropped to prevent host OOM.",
+                            "Worker channel capacity reached. Dropping event to preserve host memory constraints.",
                             config_log_level,
                             json_enabled,
                         );
@@ -912,7 +903,7 @@ fn dispatch_to_worker(
                             None,
                             Some("route"),
                             "FAST_PATH_BROKEN_PIPE",
-                            "Catastrophic Failure: Fast-path ingestion channel disconnected. Worker thread has terminated unexpectedly!",
+                            "Ingestion pipeline channel disconnected. Worker thread terminated unexpectedly.",
                             config_log_level,
                             json_enabled,
                         );
@@ -924,7 +915,6 @@ fn dispatch_to_worker(
     }
 
     let mut reg_write = registry.write();
-
     if !reg_write.contains_key(&container_id) && reg_write.len() >= max_workers {
         emit_log(
             "CRITICAL",
@@ -934,7 +924,7 @@ fn dispatch_to_worker(
             None,
             Some("route"),
             "OOM_PREVENTION",
-            "Maximum worker thread ceiling reached. Flood detected.",
+            "Maximum worker thread ceiling reached. Dropping payload to prevent resource exhaustion.",
             config_log_level,
             json_enabled,
         );
@@ -953,7 +943,6 @@ fn dispatch_to_worker(
         config_log_level,
         json_enabled,
     );
-
     let tx = reg_write.entry(container_id.clone()).or_insert_with(|| {
         let (worker_tx, worker_rx) = sync_channel::<WorkerChannelMessage>(64);
         let cid_clone = container_id.clone();
@@ -977,20 +966,19 @@ fn dispatch_to_worker(
 
         worker_tx
     });
-
     let _ = tx.try_send((try_actions, final_actions, rule_name.clone(), trigger_message)).map_err(|e| {
         match e {
             TrySendError::Full(_) => {
                 emit_log(
                     "CRITICAL", "orchestrator", Some(&rule_name), Some(&container_id), None, Some("route"), "SLOW_PATH_DROPPED",
-                    "Worker execution queue full. Enforcing rigid backpressure: Event dropped to prevent host thread exhaustion.",
+                    "Worker execution channel full. Dropping event to prevent thread exhaustion.",
                     config_log_level, json_enabled
                 );
             }
             TrySendError::Disconnected(_) => {
                 emit_log(
                     "CRITICAL", "orchestrator", Some(&rule_name), Some(&container_id), None, Some("route"), "SLOW_PATH_BROKEN_PIPE",
-                    "CRITICAL ERROR: Slow-path ingestion channel disconnected. Worker has ceased execution!",
+                    "Slow-path ingestion channel disconnected. Worker has ceased execution loops.",
                     config_log_level, json_enabled
                 );
             }
@@ -1009,7 +997,6 @@ fn run_worker_lifecycle(
     docker_socket_path: String,
 ) {
     let timeout_dur = Duration::from_secs(30);
-
     loop {
         match rx_chan.recv_timeout(timeout_dur) {
             Ok((try_cmds, final_cmds, rule, trigger_msg)) => {
@@ -1054,7 +1041,7 @@ fn run_worker_lifecycle(
                             None,
                             Some("lifecycle_decay"),
                             "DECOMMISSIONED",
-                            "Worker context inactive past 30s ceiling. Safely flushing channels and clearing footprints.",
+                            "Worker context inactive past 30s threshold. Clearing thread resources.",
                             config_log_level,
                             json_enabled,
                         );
@@ -1104,7 +1091,6 @@ fn open_log_safe(dir_path: &Path, file_name: &OsStr) -> std::io::Result<fs::File
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     let file_c = CString::new(file_name.as_bytes())
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-
     unsafe {
         let dir_fd = libc::open(
             dir_c.as_ptr(),

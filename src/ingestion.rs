@@ -4,9 +4,8 @@ use std::fs;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
-use std::sync::mpsc::{Receiver, TrySendError, sync_channel};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{sync_channel, Receiver, TrySendError};
 use std::thread;
 use std::time::Duration;
 
@@ -33,11 +32,36 @@ use crate::worker::execute_containment_pipeline;
 struct LogDescriptor {
     inode: u64,
     position: u64,
+    container_id: Option<String>,
 }
 
 pub struct CompiledManifest {
     pub regex_set: RegexSet,
-    pub rule_metadata: Vec<(String, Vec<AtomicAction>, Vec<AtomicAction>)>,
+    pub rule_metadata: Vec<(String, String, Vec<AtomicAction>, Vec<AtomicAction>)>,
+}
+
+pub struct RuleMatch<'a> {
+    pub rule_name: &'a str,
+    pub matched_pattern: &'a str,
+    pub try_actions: &'a Vec<AtomicAction>,
+    pub final_actions: &'a Vec<AtomicAction>,
+}
+
+fn scrape_container_id(line: &str) -> Option<String> {
+    use std::sync::OnceLock;
+    static HOSTNAME_RE: OnceLock<Regex> = OnceLock::new();
+    static BOOT_ARGS_RE: OnceLock<Regex> = OnceLock::new();
+
+    let host_re = HOSTNAME_RE.get_or_init(|| {
+        Regex::new(r"\bHOSTNAME=([a-fA-F0-9]{12,64})\b").unwrap()
+    });
+    let boot_re = BOOT_ARGS_RE.get_or_init(|| {
+        Regex::new(r"\b([a-fA-F0-9]{64})]").unwrap()
+    });
+
+    host_re.captures(line)
+        .or_else(|| boot_re.captures(line))
+        .and_then(|caps| caps.get(1).map(|m| m.as_str().to_string()))
 }
 
 pub fn compile_manifest_rules(
@@ -53,6 +77,7 @@ pub fn compile_manifest_rules(
                 patterns.push(pattern.clone());
                 metadata.push((
                     rule.name.clone(),
+                    pattern.clone(),
                     playbook.try_actions.clone(),
                     playbook.final_actions.clone(),
                 ));
@@ -67,10 +92,115 @@ pub fn compile_manifest_rules(
             eprintln!("[CRITICAL] Failed to compile RegexSet automaton: {}", e);
             std::process::exit(1);
         });
+
     CompiledManifest {
         regex_set,
         rule_metadata: metadata,
     }
+}
+
+pub fn get_line_matches<'a>(line: &str, rules: &'a CompiledManifest) -> Vec<RuleMatch<'a>> {
+    let matches = rules.regex_set.matches(line);
+    matches
+        .into_iter()
+        .map(|idx| {
+            let (name, pattern, try_act, final_act) = &rules.rule_metadata[idx];
+            RuleMatch {
+                rule_name: name,
+                matched_pattern: pattern,
+                try_actions: try_act,
+                final_actions: final_act,
+            }
+        })
+        .collect()
+}
+
+pub fn run_offline_reprocessing(
+    config: &GuardConfig,
+    rules: &CompiledManifest,
+    json_enabled: bool,
+) {
+    let log_dir_path = Path::new(&config.monitor.log_dir);
+    if !log_dir_path.exists() {
+        eprintln!("[ERROR] Log directory does not exist: {:?}", log_dir_path);
+        return;
+    }
+
+    println!(
+        "[*] Initiating offline forensic scan of directory: {:?}",
+        log_dir_path
+    );
+
+    if let Ok(entries) = fs::read_dir(log_dir_path) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let file_name_str = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+
+            if file_name_str.ends_with(".boot") || file_name_str.ends_with(".boot.txt") {
+                println!("[*] Opening target log file: {}", file_name_str);
+
+                if let Ok(file) = fs::File::open(&path) {
+                    let reader = BufReader::new(file);
+                    use std::io::BufRead;
+                    use std::io::Write;
+
+                    let mut active_container_id: Option<String> = None;
+                    let mut line_count = 0u64;
+
+                    for line_res in reader.lines() {
+                        if let Ok(line) = line_res {
+                            line_count += 1;
+
+                            if line_count % 10_000 == 0 {
+                                print!("\r  └─ Quietly scanning... evaluated {} lines", line_count);
+                                let _ = std::io::stdout().flush();
+                            }
+
+                            if active_container_id.is_none() {
+                                active_container_id = scrape_container_id(&line);
+                            }
+
+                            let hits = get_line_matches(&line, rules);
+                            if !hits.is_empty() {
+
+                                print!("\r\x1B[K");
+
+                                let display_id = active_container_id.as_deref().unwrap_or("UNKNOWN_ID");
+
+                                for hit in hits {
+                                    if json_enabled {
+                                        emit_log(
+                                            "INFO",
+                                            "forensics",
+                                            Some(hit.rule_name),
+                                            Some(display_id),
+                                            None,
+                                            Some("offline_scan"),
+                                            "MATCH_FOUND",
+                                            &format!(
+                                                "Pattern triggered: '{}' | Raw log: '{}'",
+                                                hit.matched_pattern, line
+                                            ),
+                                            config.monitor.log_level,
+                                            true,
+                                        );
+                                    } else {
+                                        println!(
+                                            "[FORENSIC] Container: {} | Rule: '{}' | Pattern: '{}'\n  └─ Log: '{}'",
+                                            display_id, hit.rule_name, hit.matched_pattern, line
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    println!("\n  └─ File processing complete. Total lines parsed: {}", line_count);
+                }
+            }
+        }
+    }
+    println!("[*] Offline reprocessing scan complete.");
 }
 
 pub fn start_monitor_loop(
@@ -360,8 +490,6 @@ pub fn start_monitor_loop(
         }
     });
     let id_extractor = Regex::new(r"--id=\b([a-fA-F0-9]{12}|[a-fA-F0-9]{64})\b").unwrap();
-    let filename_id_extractor = Regex::new(r"\b([a-fA-F0-9]{12}|[a-fA-F0-9]{64})\b").unwrap();
-
     let mut file_state_tracker: HashMap<String, LogDescriptor> = HashMap::new();
     let mut first_run = true;
     if mode == &IngestionMode::Socket || mode == &IngestionMode::Dual {
@@ -483,17 +611,11 @@ pub fn start_monitor_loop(
         if let Ok(entries) = fs::read_dir(log_dir_path) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.extension().map_or(false, |ext| ext == "boot") {
+                let file_name_str = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+
+                if file_name_str.ends_with(".boot") || file_name_str.ends_with(".boot.txt") {
                     let path_str = path.to_string_lossy().into_owned();
                     actively_seen_paths.insert(path_str.clone());
-
-                    let file_name_str = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                    let file_container_id = filename_id_extractor
-                        .captures(file_name_str)
-                        .and_then(|caps| caps.get(1).map(|m| m.as_str().to_string()));
-                    if file_container_id.is_none() {
-                        continue;
-                    }
 
                     #[cfg(target_os = "linux")]
                     let current_inode = {
@@ -502,6 +624,7 @@ pub fn start_monitor_loop(
                     };
                     #[cfg(not(target_os = "linux"))]
                     let current_inode = 0;
+
                     if first_run {
                         if let Ok(metadata) = path.metadata() {
                             file_state_tracker.insert(
@@ -509,6 +632,7 @@ pub fn start_monitor_loop(
                                 LogDescriptor {
                                     inode: current_inode,
                                     position: metadata.len(),
+                                    container_id: None,
                                 },
                             );
                         }
@@ -516,9 +640,11 @@ pub fn start_monitor_loop(
                     }
 
                     let mut last_pos = 0;
+                    let mut cached_id = None;
                     if let Some(desc) = file_state_tracker.get(&path_str) {
                         if desc.inode == current_inode {
                             last_pos = desc.position;
+                            cached_id = desc.container_id.clone();
                         }
                     }
 
@@ -564,6 +690,11 @@ pub fn start_monitor_loop(
                                 let trimmed = line_slice.trim_end();
 
                                 if !trimmed.is_empty() {
+
+                                    if cached_id.is_none() {
+                                        cached_id = scrape_container_id(trimmed);
+                                    }
+
                                     let rules_guard = regex_compiled.read();
                                     evaluate_line_signatures(
                                         trimmed,
@@ -575,7 +706,7 @@ pub fn start_monitor_loop(
                                         json_enabled,
                                         config_log_level,
                                         &docker_socket_path,
-                                        file_container_id.clone(),
+                                        cached_id.clone(),
                                         true,
                                         &active_containers,
                                         &anti_dos_state,
@@ -617,6 +748,7 @@ pub fn start_monitor_loop(
                                 LogDescriptor {
                                     inode: current_inode,
                                     position: pos,
+                                    container_id: cached_id,
                                 },
                             );
                         }
@@ -684,6 +816,11 @@ pub fn evaluate_line_signatures(
     max_workers: usize,
     global_limiter: &GlobalRateLimiter,
 ) {
+    let hits = get_line_matches(line, rules);
+    if hits.is_empty() {
+        return;
+    }
+
     if !global_limiter.acquire() {
         if global_limiter.should_warn() {
             emit_log(
@@ -699,11 +836,6 @@ pub fn evaluate_line_signatures(
                 json_enabled,
             );
         }
-        return;
-    }
-
-    let matches = rules.regex_set.matches(line);
-    if !matches.matched_any() {
         return;
     }
 
@@ -732,6 +864,7 @@ pub fn evaluate_line_signatures(
     } else {
         return;
     };
+
     #[allow(unused_mut)]
     let mut dispatch_id = container_id.clone();
 
@@ -739,7 +872,9 @@ pub fn evaluate_line_signatures(
     let mut is_valid = {
         let active_guard = active_containers.read();
         active_guard.contains(&container_id)
-            || active_guard.iter().any(|long_id| long_id.starts_with(&container_id))
+            || active_guard
+            .iter()
+            .any(|long_id| long_id.starts_with(&container_id))
     };
 
     #[cfg(target_os = "linux")]
@@ -825,8 +960,7 @@ pub fn evaluate_line_signatures(
         }
     }
 
-    for match_idx in matches.into_iter() {
-        let (rule_name, try_act, final_act) = &rules.rule_metadata[match_idx];
+    for hit in hits {
         emit_log(
             "DEBUG",
             "orchestrator",
@@ -835,27 +969,34 @@ pub fn evaluate_line_signatures(
             None,
             Some("signature_eval"),
             "EVALUATING",
-            &format!("Signature automaton detected match layout template: '{}'", rule_name),
+            &format!(
+                "Automaton detected rule '{}' via specific pattern: '{}'",
+                hit.rule_name, hit.matched_pattern
+            ),
             config_log_level,
             json_enabled,
         );
-        let mut active_try = try_act.clone();
+
+        let mut active_try = hit.try_actions.clone();
         if is_from_file && active_try.first() != Some(&AtomicAction::ValidateState) {
             active_try.insert(0, AtomicAction::ValidateState);
         }
+
+        let enhanced_trigger_message =
+            format!("[Matched Pattern: {}] Raw: {}", hit.matched_pattern, line);
 
         dispatch_to_worker(
             registry,
             dispatch_id.clone(),
             active_try,
-            final_act.clone(),
-            rule_name.clone(),
+            hit.final_actions.clone(),
+            hit.rule_name.to_string(),
             Arc::clone(whitelist),
             Arc::clone(table),
             json_enabled,
             config_log_level,
             docker_socket_path,
-            line.to_string(),
+            enhanced_trigger_message,
             max_workers,
         );
     }
@@ -966,24 +1107,43 @@ fn dispatch_to_worker(
 
         worker_tx
     });
-    let _ = tx.try_send((try_actions, final_actions, rule_name.clone(), trigger_message)).map_err(|e| {
-        match e {
+    let _ = tx
+        .try_send((
+            try_actions,
+            final_actions,
+            rule_name.clone(),
+            trigger_message,
+        ))
+        .map_err(|e| match e {
             TrySendError::Full(_) => {
                 emit_log(
-                    "CRITICAL", "orchestrator", Some(&rule_name), Some(&container_id), None, Some("route"), "SLOW_PATH_DROPPED",
+                    "CRITICAL",
+                    "orchestrator",
+                    Some(&rule_name),
+                    Some(&container_id),
+                    None,
+                    Some("route"),
+                    "SLOW_PATH_DROPPED",
                     "Worker execution channel full. Dropping event to prevent thread exhaustion.",
-                    config_log_level, json_enabled
+                    config_log_level,
+                    json_enabled,
                 );
             }
             TrySendError::Disconnected(_) => {
                 emit_log(
-                    "CRITICAL", "orchestrator", Some(&rule_name), Some(&container_id), None, Some("route"), "SLOW_PATH_BROKEN_PIPE",
+                    "CRITICAL",
+                    "orchestrator",
+                    Some(&rule_name),
+                    Some(&container_id),
+                    None,
+                    Some("route"),
+                    "SLOW_PATH_BROKEN_PIPE",
                     "Slow-path ingestion channel disconnected. Worker has ceased execution loops.",
-                    config_log_level, json_enabled
+                    config_log_level,
+                    json_enabled,
                 );
             }
-        }
-    });
+        });
 }
 
 fn run_worker_lifecycle(

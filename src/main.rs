@@ -6,27 +6,34 @@ mod socket;
 mod worker;
 
 use config::{load_and_merge_manifests, load_config};
-use ingestion::start_monitor_loop;
+use ingestion::{compile_manifest_rules, run_offline_reprocessing, start_monitor_loop};
 use std::path::Path;
-
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 fn main() {
+
+    let args: Vec<String> = std::env::args().collect();
+    let is_offline_mode = args.contains(&"--reprocess-logs".to_string());
+    let force_json_output = args.contains(&"--output-json".to_string());
+
     #[cfg(target_os = "linux")]
     {
         if unsafe { libc::getuid() } != 0 {
-            eprintln!(
-                "Fatal System Error: runsc-sentry-guard must execute as root to manage network filters and access host streams."
-            );
+            eprintln!("Fatal System Error: runsc-sentry-guard must execute as root.");
             std::process::exit(1);
         }
     }
 
-    println!("[INFO] Initializing runsc-sentry-guard active containment runtime architecture...");
+    if is_offline_mode {
+        println!("[INFO] Starting runsc-sentry-guard in OFFLINE FORENSIC MODE...");
+    } else {
+        println!(
+            "[INFO] Initializing runsc-sentry-guard active containment runtime architecture..."
+        );
+    }
 
     let shutdown = Arc::new(AtomicBool::new(false));
-
     signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&shutdown))
         .expect("Fatal System Initialization Error: Failed to register SIGINT lifecycle hook.");
     signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&shutdown))
@@ -34,7 +41,6 @@ fn main() {
 
     let production_path = "/etc/runsc-sentry-guard/config.toml";
     let developer_path = "config.toml";
-
     let active_path = if Path::new(production_path).exists() {
         production_path
     } else {
@@ -42,7 +48,18 @@ fn main() {
     };
 
     match load_config(active_path) {
-        Ok(valid_config) => {
+
+        Ok(mut valid_config) => {
+
+            if is_offline_mode {
+
+                valid_config.monitor.json_logging_enabled = force_json_output;
+
+            } else if force_json_output {
+
+                valid_config.monitor.json_logging_enabled = true;
+            }
+
             let json_enabled = valid_config.monitor.json_logging_enabled;
             let log_level = valid_config.monitor.log_level;
             let flush_firewall = valid_config.monitor.flush_firewall_on_shutdown;
@@ -50,8 +67,15 @@ fn main() {
 
             match load_and_merge_manifests(&valid_config.monitor.security_manifest_paths) {
                 Ok((global_playbooks, global_rules)) => {
-                    let mut sets_to_flush = Vec::new();
 
+                    if is_offline_mode {
+                        let compiled_rules =
+                            compile_manifest_rules(&global_rules, &global_playbooks);
+                        run_offline_reprocessing(&valid_config, &compiled_rules, json_enabled);
+                        std::process::exit(0);
+                    }
+
+                    let mut sets_to_flush = Vec::new();
                     for playbook in global_playbooks.values() {
                         let combined_actions = playbook
                             .try_actions

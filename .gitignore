@@ -12,6 +12,7 @@
 # Local environmental files
 .env
 *.local
+.DS_Store
 
 # Omit local runtime configs
 config.toml

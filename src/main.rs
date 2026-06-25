@@ -12,10 +12,15 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 fn main() {
-
     let args: Vec<String> = std::env::args().collect();
     let is_offline_mode = args.contains(&"--reprocess-logs".to_string());
     let force_json_output = args.contains(&"--output-json".to_string());
+    let hide_bypasses = args.contains(&"--hide-bypasses".to_string());
+
+    let offline_map_path = args
+        .iter()
+        .position(|a| a == "--offline-mapping")
+        .and_then(|idx| args.get(idx + 1).cloned());
 
     #[cfg(target_os = "linux")]
     {
@@ -48,15 +53,10 @@ fn main() {
     };
 
     match load_config(active_path) {
-
         Ok(mut valid_config) => {
-
             if is_offline_mode {
-
                 valid_config.monitor.json_logging_enabled = force_json_output;
-
             } else if force_json_output {
-
                 valid_config.monitor.json_logging_enabled = true;
             }
 
@@ -66,12 +66,22 @@ fn main() {
             let nft_table = valid_config.monitor.nftables_default_table.clone();
 
             match load_and_merge_manifests(&valid_config.monitor.security_manifest_paths) {
-                Ok((global_playbooks, global_rules)) => {
-
+                Ok((global_playbooks, global_rules, global_whitelists, global_mappings)) => {
                     if is_offline_mode {
-                        let compiled_rules =
-                            compile_manifest_rules(&global_rules, &global_playbooks);
-                        run_offline_reprocessing(&valid_config, &compiled_rules, json_enabled);
+                        let compiled_rules = compile_manifest_rules(
+                            &global_rules,
+                            &global_whitelists,
+                            &global_playbooks,
+                            global_mappings,
+                        );
+
+                        run_offline_reprocessing(
+                            &valid_config,
+                            &compiled_rules,
+                            json_enabled,
+                            offline_map_path,
+                            hide_bypasses,
+                        );
                         std::process::exit(0);
                     }
 
@@ -81,6 +91,7 @@ fn main() {
                             .try_actions
                             .iter()
                             .chain(playbook.final_actions.iter());
+
                         for action in combined_actions {
                             if let config::AtomicAction::NftBlacklist { set_name, .. } = action {
                                 sets_to_flush.push(set_name.clone());
@@ -114,6 +125,8 @@ fn main() {
                         valid_config,
                         global_playbooks,
                         global_rules,
+                        global_whitelists,
+                        global_mappings,
                         Arc::clone(&shutdown),
                         active_path.to_string(),
                     );

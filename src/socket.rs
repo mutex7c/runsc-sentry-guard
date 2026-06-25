@@ -1,5 +1,5 @@
 use regex::Regex;
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
@@ -36,7 +36,6 @@ fn get_peer_creds(fd: std::os::unix::io::RawFd) -> std::io::Result<(u32, i32)> {
             &mut len,
         )
     };
-
     if res == 0 {
         Ok((ucred.uid, ucred.pid))
     } else {
@@ -75,7 +74,6 @@ fn extract_id_race_free(peer_pid: i32, peer_uid: u32) -> Option<String> {
 
     let proc_path = format!("/proc/{}", peer_pid);
     let proc_dir_c = CString::new(proc_path).ok()?;
-
     let proc_dir_fd = unsafe {
         libc::open(
             proc_dir_c.as_ptr(),
@@ -143,7 +141,7 @@ pub fn run_uds_server(
     json_enabled: bool,
     config_log_level: LogLevel,
     docker_socket_path: String,
-    active_containers: Arc<RwLock<HashSet<String>>>,
+    active_containers: Arc<RwLock<HashMap<String, String>>>,
     anti_dos_state: Arc<Mutex<AntiDosState>>,
     shutdown: Arc<AtomicBool>,
     max_workers: usize,
@@ -230,8 +228,7 @@ pub fn run_uds_server(
 
     crate::ingestion::notify_systemd_ready();
 
-    let mut connection_pool: std::collections::HashMap<Token, AsyncClientConnection> =
-        std::collections::HashMap::new();
+    let mut connection_pool: HashMap<Token, AsyncClientConnection> = HashMap::new();
     let mut unique_token_counter = FIRST_CLIENT_TOKEN;
     let mut events = Events::with_capacity(128);
 
@@ -255,7 +252,6 @@ pub fn run_uds_server(
                 }
                 client_token => {
                     let mut should_remove = false;
-
                     if let Some(conn) = connection_pool.get_mut(&client_token) {
                         let mut read_buf = [0u8; 1024];
                         loop {
@@ -284,6 +280,7 @@ pub fn run_uds_server(
 
                                         if !trimmed.is_empty() {
                                             let rules_guard = regex_rules.read();
+
                                             crate::ingestion::evaluate_line_signatures(
                                                 trimmed,
                                                 &rules_guard,
@@ -322,7 +319,6 @@ pub fn run_uds_server(
                     if should_remove {
                         if let Some(mut conn) = connection_pool.remove(&client_token) {
                             let _ = poll.registry().deregister(&mut conn.stream);
-
                             slot_freed = true;
                         }
                     }
@@ -362,12 +358,10 @@ pub fn run_uds_server(
                                     );
                                     continue;
                                 }
-
                                 extract_id_race_free(peer_pid, peer_uid)
                             }
                             Err(_) => continue,
                         };
-
                         #[cfg(not(target_os = "linux"))]
                         let socket_container_id: Option<String> = None;
 

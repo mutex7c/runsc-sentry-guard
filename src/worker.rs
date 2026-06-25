@@ -2,33 +2,33 @@ use crate::config::{AtomicAction, LogLevel};
 use crate::logger::emit_log;
 use anyhow::{Result, anyhow, bail};
 use ipnet::IpNet;
-use std::collections::HashMap;
-use std::process::Command;
-use std::sync::Arc;
-use std::sync::OnceLock;
 #[cfg(target_os = "linux")]
 use serde::Deserialize;
+use std::collections::HashMap;
 #[cfg(target_os = "linux")]
 use std::io::BufRead;
 #[cfg(target_os = "linux")]
 use std::net::IpAddr;
 #[cfg(target_os = "linux")]
 use std::os::unix::process::CommandExt;
+use std::process::Command;
+use std::sync::Arc;
+use std::sync::OnceLock;
 
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "PascalCase")]
 #[cfg(target_os = "linux")]
 struct DockerStateField {
-    running: bool, // 🟢 Idiomatic snake_case, automatically maps to "Running"
+    running: bool,
 }
 
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "PascalCase")]
 #[cfg(target_os = "linux")]
 struct DockerStatusInspect {
-    state: DockerStateField, // 🟢 Idiomatic snake_case, automatically maps to "State"
+    state: DockerStateField,
+    pub name: Option<String>,
 }
-
 
 #[derive(Deserialize)]
 #[allow(non_snake_case)]
@@ -68,6 +68,17 @@ pub struct DockerEventPayload {
 pub struct DockerEventActor {
     #[serde(rename = "ID")]
     pub id: String,
+    #[serde(rename = "Attributes")]
+    pub attributes: Option<HashMap<String, String>>,
+}
+
+#[derive(Deserialize)]
+#[cfg(target_os = "linux")]
+struct DockerContainerListResponse {
+    #[serde(rename = "Id")]
+    id: String,
+    #[serde(rename = "Names")]
+    names: Option<Vec<String>>,
 }
 
 #[cfg(target_os = "linux")]
@@ -82,7 +93,6 @@ fn read_bounded_line<R: std::io::BufRead>(reader: &mut R, limit: u64) -> Result<
     if buf.len() as u64 == limit && !buf.ends_with(&[b'\n']) {
         bail!("Buffer-bloat protection: HTTP line exceeded maximum bounded length");
     }
-
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
@@ -95,8 +105,8 @@ fn execute_docker_uds_request(
     path: &str,
     body: Option<&str>,
     socket_path: &str,
-    config_log_level: LogLevel,
-    json_enabled: bool,
+    _config_log_level: LogLevel,
+    _json_enabled: bool,
 ) -> Result<(u16, String)> {
     use std::io::{BufReader, Cursor, Read, Write};
     use std::os::unix::net::UnixStream;
@@ -128,14 +138,13 @@ fn execute_docker_uds_request(
 
     stream
         .write_all(request_payload.as_bytes())
-        .map_err(|e| anyhow!("Failed to write to UDS stream: {}", e))?;
+        .map_err(|e| anyhow!("Failed to write to UDS: {}", e))?;
     stream
         .flush()
-        .map_err(|e| anyhow!("Failed to flush UDS stream: {}", e))?;
+        .map_err(|e| anyhow!("Failed to flush UDS: {}", e))?;
 
     let mut header_buf = [0u8; 8192];
     let mut bytes_read = 0;
-
     let header_end;
     let status_code;
     let mut is_chunked = false;
@@ -145,10 +154,9 @@ fn execute_docker_uds_request(
         if bytes_read >= header_buf.len() {
             bail!("UDS Error: HTTP headers exceeded 8KB maximum boundary.");
         }
-
         let n = stream
             .read(&mut header_buf[bytes_read..])
-            .map_err(|e| anyhow!("Failed to read UDS stream headers: {}", e))?;
+            .map_err(|e| anyhow!("Failed to read UDS headers: {}", e))?;
         if n == 0 {
             bail!("UDS Error: Stream closed prematurely during header read.");
         }
@@ -194,7 +202,6 @@ fn execute_docker_uds_request(
             if trimmed_size.is_empty() {
                 continue;
             }
-
             let chunk_size = usize::from_str_radix(trimmed_size, 16)
                 .map_err(|e| anyhow!("Failed to parse chunk size: {}", e))?;
             if chunk_size == 0 {
@@ -210,35 +217,17 @@ fn execute_docker_uds_request(
                 );
             }
 
-            emit_log(
-                "TRACE",
-                "worker_engine",
-                None,
-                None,
-                None,
-                Some("stream_chunk"),
-                "PROCESSING",
-                &format!("Decoding payload chunk of size {} bytes.", chunk_size),
-                config_log_level,
-                json_enabled,
-            );
-
             let mut chunk_buf = vec![0; chunk_size];
             reader
                 .read_exact(&mut chunk_buf)
                 .map_err(|e| anyhow!("Failed to read chunk payload: {}", e))?;
             body_payload.push_str(&String::from_utf8_lossy(&chunk_buf));
-
             let mut crlf = vec![0; 2];
             let _ = reader.read_exact(&mut crlf);
         }
     } else if let Some(len) = content_length {
         if len > MAX_UDS_PAYLOAD_SIZE {
-            bail!(
-                "Content-Length {} exceeds maximum allowed UDS capacity of {} bytes.",
-                len,
-                MAX_UDS_PAYLOAD_SIZE
-            );
+            bail!("Content-Length {} exceeds maximum allowed capacity.", len);
         }
         let mut buf = vec![0; len];
         reader
@@ -251,8 +240,58 @@ fn execute_docker_uds_request(
             .read_to_string(&mut body_payload)
             .map_err(|e| anyhow!("Failed to read payload to string: {}", e))?;
     }
-
     Ok((status_code, body_payload))
+}
+
+#[cfg(target_os = "linux")]
+pub fn fetch_running_container_ids(socket_path: &str) -> std::collections::HashMap<String, String> {
+    use std::collections::HashMap;
+    let mut mapping = HashMap::new();
+
+    match execute_docker_uds_request(
+        "GET",
+        "/containers/json",
+        None,
+        socket_path,
+        LogLevel::Info,
+        true,
+    ) {
+        Ok((status, json_payload)) if status == 200 => {
+            if let Ok(parsed) =
+                serde_json::from_str::<Vec<DockerContainerListResponse>>(&json_payload)
+            {
+                for c in parsed {
+                    let name = c
+                        .names
+                        .and_then(|mut names| names.pop())
+                        .map(|n| n.strip_prefix('/').unwrap_or(&n).to_string())
+                        .unwrap_or(c.id.clone());
+                    mapping.insert(c.id, name);
+                }
+            }
+        }
+        _ => {}
+    }
+    mapping
+}
+
+#[cfg(target_os = "linux")]
+pub fn fetch_container_name_sync(container_id: &str, socket_path: &str) -> Option<String> {
+    let endpoint = format!("/containers/{}/json", container_id);
+
+    match execute_docker_uds_request("GET", &endpoint, None, socket_path, LogLevel::Warn, true) {
+        Ok((status, json_payload)) if status == 200 => {
+            if let Ok(parsed) = serde_json::from_str::<DockerStatusInspect>(&json_payload) {
+                let name = parsed
+                    .name
+                    .map(|n| n.strip_prefix('/').unwrap_or(&n).to_string())
+                    .unwrap_or_else(|| container_id.to_string());
+                return Some(name);
+            }
+        }
+        _ => {}
+    }
+    None
 }
 
 #[cfg(target_os = "linux")]
@@ -298,7 +337,10 @@ pub fn resolve_container_ips(
                 None,
                 Some("resolve_ip"),
                 "FAILURE",
-                &format!("Container socket returned HTTP {} during IP resolution.", status),
+                &format!(
+                    "Container socket returned HTTP {} during IP resolution.",
+                    status
+                ),
                 config_log_level,
                 json_enabled,
             );
@@ -312,7 +354,10 @@ pub fn resolve_container_ips(
                 None,
                 Some("resolve_ip"),
                 "FAILURE",
-                &format!("Failed to query container socket for networking metadata: {:#}", e),
+                &format!(
+                    "Failed to query container socket for networking metadata: {:#}",
+                    e
+                ),
                 config_log_level,
                 json_enabled,
             );
@@ -331,37 +376,38 @@ fn execute_atomic_command(
     socket_path: &str,
     trigger_message: &str,
 ) -> Result<()> {
-    let _ = whitelist;
-    let _ = socket_path;
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = whitelist;
+        let _ = socket_path;
+        let _ = config_log_level;
+        let _ = json_enabled;
+        let _ = table;
+        let _ = trigger_message;
+    }
 
     match action {
-
         AtomicAction::WebhookAlert { url } => {
             let payload_obj = serde_json::json!({
                 "text": format!("[SENTRY-GUARD] Active containment pipeline triggered for container context: {}", container_id)
             });
-
             static WEBHOOK_CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
             let client = WEBHOOK_CLIENT.get_or_init(|| {
                 reqwest::blocking::Client::builder()
                     .timeout(std::time::Duration::from_secs(5))
                     .build()
-                    .unwrap_or_else(|e| {
-                        panic!("Fatal: Failed to initialize global HTTP webhook client context: {}", e);
-                    })
+                    .unwrap()
             });
-
             let response = client
                 .post(url)
                 .json(&payload_obj)
                 .send()
-                .map_err(|e| anyhow!("Failed to dispatch webhook alert natively: {}", e))?;
-
+                .map_err(|e| anyhow!("Failed to dispatch webhook natively: {}", e))?;
             if response.status().is_success() {
                 Ok(())
             } else {
                 bail!(
-                    "Webhook dispatch failed. Remote endpoint returned HTTP status code: {}",
+                    "Webhook dispatch failed. Return code: {}",
                     response.status()
                 );
             }
@@ -387,6 +433,7 @@ fn execute_atomic_command(
             };
             #[cfg(not(target_os = "linux"))]
             let resolved_ip = "127.0.0.1".to_string();
+
             let mut cmd = Command::new(path);
             cmd.arg(container_id).arg(&resolved_ip).arg(trigger_message);
 
@@ -418,7 +465,7 @@ fn execute_atomic_command(
                         if status.success() {
                             return Ok(());
                         } else {
-                            bail!("Custom extension script exited with failure footprint: {}", status);
+                            bail!("Custom script exited with failure footprint: {}", status);
                         }
                     }
                     Ok(None) => {
@@ -432,7 +479,7 @@ fn execute_atomic_command(
                                     None,
                                     Some("script_kill"),
                                     "LEAK",
-                                    &format!("Failed to kill runaway script process: {:#}", e),
+                                    &format!("Failed to kill runaway script: {:#}", e),
                                     config_log_level,
                                     json_enabled,
                                 );
@@ -463,13 +510,13 @@ fn execute_atomic_command(
                                     json_enabled,
                                 ),
                             }
-                            bail!("Custom extension script exceeded 15-second execution boundary. Forcefully reaped.");
+                            bail!(
+                                "Custom script exceeded 15-second execution boundary. Forcefully reaped."
+                            );
                         }
                         std::thread::sleep(std::time::Duration::from_millis(100));
                     }
-                    Err(e) => {
-                        bail!("Failed to parse child execution status: {}", e);
-                    }
+                    Err(e) => bail!("Failed to parse child execution status: {}", e),
                 }
             }
         }
@@ -520,10 +567,11 @@ fn execute_atomic_command(
                             config_log_level,
                             json_enabled,
                         )?;
-
                         if status == 200 {
-                            if let Ok(parsed) = serde_json::from_str::<DockerStatusInspect>(&json_payload) {
-                                if parsed.state.running { 
+                            if let Ok(parsed) =
+                                serde_json::from_str::<DockerStatusInspect>(&json_payload)
+                            {
+                                if parsed.state.running {
                                     emit_log(
                                         "INFO",
                                         "worker_engine",
@@ -532,22 +580,28 @@ fn execute_atomic_command(
                                         None,
                                         Some("validate_state"),
                                         "SUCCESS",
-                                        "Container state verified as active. Executing containment pipeline.",
+                                        "Container state verified as active.",
                                         config_log_level,
                                         json_enabled,
                                     );
                                     Ok(())
                                 } else {
-                                    bail!("Container status inactive. Aborting containment pipeline.");
+                                    bail!(
+                                        "Container status inactive. Aborting containment pipeline."
+                                    );
                                 }
                             } else {
-                                bail!("Failed to parse container state validation JSON response payload.");
+                                bail!(
+                                    "Failed to parse container state validation JSON response payload."
+                                );
                             }
                         } else {
-                            bail!("State validation rejected (HTTP {}). Container likely terminated.", status);
+                            bail!(
+                                "State validation rejected (HTTP {}). Container likely terminated.",
+                                status
+                            );
                         }
                     }
-
                     AtomicAction::Pause => {
                         let endpoint = format!("/containers/{}/pause", container_id);
                         let (status, err_payload) = execute_docker_uds_request(
@@ -564,7 +618,6 @@ fn execute_atomic_command(
                             bail!("Pause mutation rejected (HTTP {}): {}", status, err_payload);
                         }
                     }
-
                     AtomicAction::Unpause => {
                         let endpoint = format!("/containers/{}/unpause", container_id);
                         let (status, err_payload) = execute_docker_uds_request(
@@ -578,10 +631,13 @@ fn execute_atomic_command(
                         if (200..300).contains(&status) || status == 409 {
                             Ok(())
                         } else {
-                            bail!("Unpause mutation rejected (HTTP {}): {}", status, err_payload);
+                            bail!(
+                                "Unpause mutation rejected (HTTP {}): {}",
+                                status,
+                                err_payload
+                            );
                         }
                     }
-
                     AtomicAction::Restart => {
                         let endpoint = format!("/containers/{}/restart", container_id);
                         let (status, err_payload) = execute_docker_uds_request(
@@ -595,10 +651,13 @@ fn execute_atomic_command(
                         if (200..300).contains(&status) {
                             Ok(())
                         } else {
-                            bail!("Restart mutation rejected (HTTP {}): {}", status, err_payload);
+                            bail!(
+                                "Restart mutation rejected (HTTP {}): {}",
+                                status,
+                                err_payload
+                            );
                         }
                     }
-
                     AtomicAction::CommitSnapshot { prefix } => {
                         let timestamp = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
@@ -622,9 +681,9 @@ fn execute_atomic_command(
                             bail!("CommitSnapshot rejected (HTTP {}): {}", status, err_payload);
                         }
                     }
-
                     AtomicAction::ContainerSignal { signal } => {
-                        let query_path = format!("/containers/{}/kill?signal={}", container_id, signal);
+                        let query_path =
+                            format!("/containers/{}/kill?signal={}", container_id, signal);
                         let (status, err_payload) = execute_docker_uds_request(
                             "POST",
                             &query_path,
@@ -636,10 +695,13 @@ fn execute_atomic_command(
                         if (200..300).contains(&status) || status == 409 {
                             Ok(())
                         } else {
-                            bail!("ContainerSignal rejected (HTTP {}): {}", status, err_payload);
+                            bail!(
+                                "ContainerSignal rejected (HTTP {}): {}",
+                                status,
+                                err_payload
+                            );
                         }
                     }
-
                     AtomicAction::NftBlacklist { set_name, timeout } => {
                         let ips = resolve_container_ips(
                             container_id,
@@ -648,9 +710,10 @@ fn execute_atomic_command(
                             socket_path,
                         );
                         if ips.is_empty() {
-                            bail!("IP resolution yielded zero addresses; cannot apply nftables blacklist.");
+                            bail!(
+                                "IP resolution yielded zero addresses; cannot apply nftables blacklist."
+                            );
                         }
-
                         for ip in ips {
                             if is_ip_safe(&ip, whitelist) {
                                 emit_log(
@@ -676,7 +739,10 @@ fn execute_atomic_command(
                                 Some(&ip.to_string()),
                                 Some("nft_blacklist"),
                                 "SUCCESS",
-                                &format!("Target network isolated via set {} for duration {}", set_name, timeout),
+                                &format!(
+                                    "Target network isolated via set {} for duration {}",
+                                    set_name, timeout
+                                ),
                                 config_log_level,
                                 json_enabled,
                             );
@@ -691,31 +757,52 @@ fn execute_atomic_command(
             {
                 match infrastructure_action {
                     AtomicAction::ValidateState => {
-                        println!("[DEV-MOCK] Verifying operational status for context ID: {}", container_id);
+                        println!(
+                            "[DEV-MOCK] Verifying operational status for context ID: {}",
+                            container_id
+                        );
                         Ok(())
                     }
                     AtomicAction::Pause => {
-                        println!("[DEV-MOCK] Executing container namespace freeze mutation on ID: {}", container_id);
+                        println!(
+                            "[DEV-MOCK] Executing container namespace freeze mutation on ID: {}",
+                            container_id
+                        );
                         Ok(())
                     }
                     AtomicAction::Unpause => {
-                        println!("[DEV-MOCK] Releasing container namespace freeze mutation on ID: {}", container_id);
+                        println!(
+                            "[DEV-MOCK] Releasing container namespace freeze mutation on ID: {}",
+                            container_id
+                        );
                         Ok(())
                     }
                     AtomicAction::Restart => {
-                        println!("[DEV-MOCK] Executing container runtime reboot sequence on ID: {}", container_id);
+                        println!(
+                            "[DEV-MOCK] Executing container runtime reboot sequence on ID: {}",
+                            container_id
+                        );
                         Ok(())
                     }
                     AtomicAction::CommitSnapshot { prefix } => {
-                        println!("[DEV-MOCK] Committing snapshot layer via registry tag: {}-{}", prefix, container_id);
+                        println!(
+                            "[DEV-MOCK] Committing snapshot layer via registry tag: {}-{}",
+                            prefix, container_id
+                        );
                         Ok(())
                     }
                     AtomicAction::ContainerSignal { signal } => {
-                        println!("[DEV-MOCK] Emitting task termination signal [{}] to ID: {}", signal, container_id);
+                        println!(
+                            "[DEV-MOCK] Emitting task termination signal [{}] to ID: {}",
+                            signal, container_id
+                        );
                         Ok(())
                     }
                     AtomicAction::NftBlacklist { set_name, timeout } => {
-                        println!("[DEV-MOCK] Appending packet filter element drop logic -> Table: {}, Set: {}, Timeout: {}", table, set_name, timeout);
+                        println!(
+                            "[DEV-MOCK] Appending packet filter element drop logic -> Table: {}, Set: {}, Timeout: {}",
+                            table, set_name, timeout
+                        );
                         Ok(())
                     }
                     _ => unreachable!(),
@@ -737,7 +824,6 @@ fn execute_firewall_mutation(ip: &str, set_name: &str, timeout: &str, table: &st
     if !t_rule.is_match(timeout) {
         bail!("Security Constraint Violation: Intercepted malformed firewall duration payload.");
     }
-
     let table_parts: Vec<&str> = table.split_whitespace().collect();
     if table_parts.len() != 2 {
         bail!("Security Error: Malformed nftables table format.");
@@ -747,7 +833,9 @@ fn execute_firewall_mutation(ip: &str, set_name: &str, timeout: &str, table: &st
     let table_name = table_parts[1];
 
     if !id_rule.is_match(family) || !id_rule.is_match(table_name) || !id_rule.is_match(set_name) {
-        bail!("Security Error: Malformed firewall identifier details. Arguments must match secure boundaries.");
+        bail!(
+            "Security Error: Malformed firewall identifier details. Arguments must match secure boundaries."
+        );
     }
 
     let element_payload = format!(
@@ -763,39 +851,12 @@ fn execute_firewall_mutation(ip: &str, set_name: &str, timeout: &str, table: &st
         .arg(&element_payload)
         .status()
         .map_err(|e| anyhow!("Subprocess execution failed: {}", e))?;
+
     if s.success() {
         Ok(())
     } else {
         bail!("Kernel nftables transaction rejected execution parameters.");
     }
-}
-
-#[derive(Deserialize)]
-#[cfg(target_os = "linux")]
-struct DockerContainerListResponse {
-    #[serde(rename = "Id")]
-    id: String,
-}
-
-#[cfg(target_os = "linux")]
-pub fn fetch_running_container_ids(socket_path: &str) -> std::collections::HashSet<String> {
-    use std::collections::HashSet;
-    match execute_docker_uds_request(
-        "GET",
-        "/containers/json",
-        None,
-        socket_path,
-        LogLevel::Info,
-        true,
-    ) {
-        Ok((status, json_payload)) if status == 200 => {
-            if let Ok(parsed) = serde_json::from_str::<Vec<DockerContainerListResponse>>(&json_payload) {
-                return parsed.into_iter().map(|c| c.id).collect();
-            }
-        }
-        _ => {}
-    }
-    HashSet::new()
 }
 
 pub fn execute_containment_pipeline(
@@ -910,7 +971,10 @@ pub fn execute_containment_pipeline(
                         None,
                         Some(&format!("{:?}", fallback)),
                         "CRASH",
-                        &format!("Fallback mitigation action failed to execute successfully: {:#}", fallback_error),
+                        &format!(
+                            "Fallback mitigation action failed to execute successfully: {:#}",
+                            fallback_error
+                        ),
                         config_log_level,
                         json_enabled,
                     );
@@ -938,78 +1002,6 @@ fn emit_json_escalation_marker(
         config_log_level,
         json_enabled,
     );
-}
-
-#[cfg(all(test, target_os = "linux"))]
-mod tests {
-    use super::*;
-    use ipnet::IpNet;
-    use std::io::Cursor;
-    use std::net::IpAddr;
-
-    fn run_mock_line_reader(stream_payload: Vec<u8>, capacity_limit: u64) -> Result<String> {
-        let mut mock_cursor = Cursor::new(stream_payload);
-        read_bounded_line(&mut mock_cursor, capacity_limit)
-    }
-
-    #[test]
-    fn test_is_ip_safe_evaluations() {
-        let whitelist = vec![
-            "10.0.0.0/8".parse::<IpNet>().unwrap(),
-            "192.168.1.0/24".parse::<IpNet>().unwrap(),
-        ];
-        let safe_ip: IpAddr = "10.5.5.5".parse().unwrap();
-        let unsafe_ip: IpAddr = "172.16.0.5".parse().unwrap();
-        assert!(
-            is_ip_safe(&safe_ip, &whitelist),
-            "Failed: 10.5.5.5 should be whitelisted"
-        );
-        assert!(
-            !is_ip_safe(&unsafe_ip, &whitelist),
-            "Failed: 172.16.0.5 should be blacklisted"
-        );
-    }
-
-    #[test]
-    fn test_read_bounded_line_success() {
-        let result = run_mock_line_reader(b"HTTP/1.1 200 OK\r\n".to_vec(), 1024).unwrap();
-        assert_eq!(result, "HTTP/1.1 200 OK\r\n");
-    }
-
-    #[test]
-    fn test_read_bounded_line_bloat_protection() {
-        let result = run_mock_line_reader(vec![b'A'; 100], 50);
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("Buffer-bloat protection: HTTP line exceeded maximum bounded length")
-        );
-    }
-
-    #[test]
-    fn test_read_bounded_line_exact_limit_anomaly() {
-        let result = run_mock_line_reader(vec![b'B'; 64], 64);
-        assert!(
-            result.is_err(),
-            "Engine should fail if buffer hits limit exactly without finding a newline"
-        );
-    }
-
-    #[test]
-    fn test_firewall_timeout_injection_defense() {
-        let target_ip = "10.0.0.2";
-        let target_set = "blacklist_set";
-        let target_table = "inet filter";
-        let malicious_timeout = "24h; nft delete table inet filter;";
-        let validation_result =
-            execute_firewall_mutation(target_ip, target_set, malicious_timeout, target_table);
-        assert!(validation_result.is_err());
-        if let Err(err) = validation_result {
-            assert!(err.to_string().contains("Security Error"));
-        }
-    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1157,6 +1149,80 @@ pub fn cleanup_stale_firewall_elements(
                     }
                 }
             }
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use ipnet::IpNet;
+    use std::io::Cursor;
+    use std::net::IpAddr;
+
+    fn run_mock_line_reader(stream_payload: Vec<u8>, capacity_limit: u64) -> Result<String> {
+        let mut mock_cursor = Cursor::new(stream_payload);
+        read_bounded_line(&mut mock_cursor, capacity_limit)
+    }
+
+    #[test]
+    fn test_is_ip_safe_evaluations() {
+        let whitelist = vec![
+            "10.0.0.0/8".parse::<IpNet>().unwrap(),
+            "192.168.1.0/24".parse::<IpNet>().unwrap(),
+        ];
+        let safe_ip: IpAddr = "10.5.5.5".parse().unwrap();
+        let unsafe_ip: IpAddr = "172.16.0.5".parse().unwrap();
+
+        assert!(
+            is_ip_safe(&safe_ip, &whitelist),
+            "Failed: 10.5.5.5 should be whitelisted"
+        );
+        assert!(
+            !is_ip_safe(&unsafe_ip, &whitelist),
+            "Failed: 172.16.0.5 should be blacklisted"
+        );
+    }
+
+    #[test]
+    fn test_read_bounded_line_success() {
+        let result = run_mock_line_reader(b"HTTP/1.1 200 OK\r\n".to_vec(), 1024).unwrap();
+        assert_eq!(result, "HTTP/1.1 200 OK\r\n");
+    }
+
+    #[test]
+    fn test_read_bounded_line_bloat_protection() {
+        let result = run_mock_line_reader(vec![b'A'; 100], 50);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Buffer-bloat protection: HTTP line exceeded maximum bounded length")
+        );
+    }
+
+    #[test]
+    fn test_read_bounded_line_exact_limit_anomaly() {
+        let result = run_mock_line_reader(vec![b'B'; 64], 64);
+        assert!(
+            result.is_err(),
+            "Engine should fail if buffer hits limit exactly without finding a newline"
+        );
+    }
+
+    #[test]
+    fn test_firewall_timeout_injection_defense() {
+        let target_ip = "10.0.0.2";
+        let target_set = "blacklist_set";
+        let target_table = "inet filter";
+        let malicious_timeout = "24h; nft delete table inet filter;";
+
+        let validation_result =
+            execute_firewall_mutation(target_ip, target_set, malicious_timeout, target_table);
+        assert!(validation_result.is_err());
+        if let Err(err) = validation_result {
+            assert!(err.to_string().contains("Security Error"));
         }
     }
 }

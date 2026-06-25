@@ -1,0 +1,10 @@
+{
+  "mappings": {
+    "*": {
+      "active_rules": ["suspicious_downloader_activity"]
+    },
+    "frontend-nginx": {
+      "active_whitelists": ["local_healthcheck_bypass"]
+    }
+  }
+}

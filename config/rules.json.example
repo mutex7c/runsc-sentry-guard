@@ -1,0 +1,11 @@
+{
+  "rules": [
+    {
+      "name": "suspicious_downloader_activity",
+      "match_any": [
+        " execve\\(.*\\b(curl|wget)\\b.*\"https?://"
+      ],
+      "playbook": "network_quarantine"
+    }
+  ]
+}

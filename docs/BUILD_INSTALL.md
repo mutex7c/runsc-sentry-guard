@@ -81,7 +81,7 @@ Provision your centralized environment configuration and your threat rules manif
 
 ```bash
 cp config.toml.example config.toml
-cp rules.json.example rules.json
+cp rules.json.example.example rules.json.example
 ```
 
 1. Open `config.toml` to declare your system environment baselines, network whitelists, and paths to your manifests.

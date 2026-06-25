@@ -1,0 +1,14 @@
+{
+  "playbooks": {
+    "network_quarantine": {
+      "try_actions": [
+        { "type": "validate_state" },
+        { "type": "nft_blacklist", "set_name": "container_blacklist", "timeout": "12h" },
+        { "type": "log_critical" }
+      ],
+      "final_actions": [
+        { "type": "container_signal", "signal": "SIGKILL" }
+      ]
+    }
+  }
+}

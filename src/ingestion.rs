@@ -1,3 +1,4 @@
+use parking_lot::{Mutex, RwLock};
 use regex::{Regex, RegexSet, RegexSetBuilder};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -5,11 +6,9 @@ use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, TrySendError};
+use std::sync::mpsc::{Receiver, TrySendError, sync_channel};
 use std::thread;
 use std::time::Duration;
-
-use parking_lot::{Mutex, RwLock};
 
 #[cfg(target_os = "linux")]
 use std::io::BufRead;
@@ -22,8 +21,8 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::FromRawFd;
 
 use crate::config::{
-    AtomicAction, GuardConfig, IngestionMode, JsonRuleConfig, LogLevel, PlaybookConfig,
-    RegistryMap, WorkerChannelMessage,
+    AtomicAction, GuardConfig, IngestionMode, JsonRuleConfig, LogLevel, MappingConfig,
+    PlaybookConfig, RegistryMap, WhitelistConfig, WorkerChannelMessage,
 };
 use crate::limiters::{AntiDosState, GlobalRateLimiter};
 use crate::logger::emit_log;
@@ -35,16 +34,25 @@ struct LogDescriptor {
     container_id: Option<String>,
 }
 
-pub struct CompiledManifest {
-    pub regex_set: RegexSet,
-    pub rule_metadata: Vec<(String, String, Vec<AtomicAction>, Vec<AtomicAction>)>,
+#[derive(Clone)]
+pub enum SignatureMeta {
+    Rule {
+        name: String,
+        playbook: String,
+        pattern: String,
+        try_actions: Vec<AtomicAction>,
+        final_actions: Vec<AtomicAction>,
+    },
+    Whitelist {
+        name: String,
+        pattern: String,
+    },
 }
 
-pub struct RuleMatch<'a> {
-    pub rule_name: &'a str,
-    pub matched_pattern: &'a str,
-    pub try_actions: &'a Vec<AtomicAction>,
-    pub final_actions: &'a Vec<AtomicAction>,
+pub struct CompiledManifest {
+    pub regex_set: RegexSet,
+    pub metadata: Vec<SignatureMeta>,
+    pub mappings: HashMap<String, MappingConfig>,
 }
 
 fn scrape_container_id(line: &str) -> Option<String> {
@@ -52,35 +60,46 @@ fn scrape_container_id(line: &str) -> Option<String> {
     static HOSTNAME_RE: OnceLock<Regex> = OnceLock::new();
     static BOOT_ARGS_RE: OnceLock<Regex> = OnceLock::new();
 
-    let host_re = HOSTNAME_RE.get_or_init(|| {
-        Regex::new(r"\bHOSTNAME=([a-fA-F0-9]{12,64})\b").unwrap()
-    });
-    let boot_re = BOOT_ARGS_RE.get_or_init(|| {
-        Regex::new(r"\b([a-fA-F0-9]{64})]").unwrap()
-    });
+    let host_re =
+        HOSTNAME_RE.get_or_init(|| Regex::new(r"\bHOSTNAME=([a-fA-F0-9]{12,64})\b").unwrap());
+    let boot_re = BOOT_ARGS_RE.get_or_init(|| Regex::new(r"\b([a-fA-F0-9]{64})]").unwrap());
 
-    host_re.captures(line)
+    host_re
+        .captures(line)
         .or_else(|| boot_re.captures(line))
         .and_then(|caps| caps.get(1).map(|m| m.as_str().to_string()))
 }
 
 pub fn compile_manifest_rules(
     rules: &[JsonRuleConfig],
+    whitelists: &[WhitelistConfig],
     playbooks: &HashMap<String, PlaybookConfig>,
+    mappings: HashMap<String, MappingConfig>,
 ) -> CompiledManifest {
     let mut patterns = Vec::new();
     let mut metadata = Vec::new();
+
+    for wl in whitelists {
+        for pattern in &wl.match_any {
+            patterns.push(pattern.clone());
+            metadata.push(SignatureMeta::Whitelist {
+                name: wl.name.clone(),
+                pattern: pattern.clone(),
+            });
+        }
+    }
 
     for rule in rules {
         if let Some(playbook) = playbooks.get(&rule.playbook) {
             for pattern in &rule.match_any {
                 patterns.push(pattern.clone());
-                metadata.push((
-                    rule.name.clone(),
-                    pattern.clone(),
-                    playbook.try_actions.clone(),
-                    playbook.final_actions.clone(),
-                ));
+                metadata.push(SignatureMeta::Rule {
+                    name: rule.name.clone(),
+                    playbook: rule.playbook.clone(),
+                    pattern: pattern.clone(),
+                    try_actions: playbook.try_actions.clone(),
+                    final_actions: playbook.final_actions.clone(),
+                });
             }
         }
     }
@@ -95,35 +114,37 @@ pub fn compile_manifest_rules(
 
     CompiledManifest {
         regex_set,
-        rule_metadata: metadata,
+        metadata,
+        mappings,
     }
-}
-
-pub fn get_line_matches<'a>(line: &str, rules: &'a CompiledManifest) -> Vec<RuleMatch<'a>> {
-    let matches = rules.regex_set.matches(line);
-    matches
-        .into_iter()
-        .map(|idx| {
-            let (name, pattern, try_act, final_act) = &rules.rule_metadata[idx];
-            RuleMatch {
-                rule_name: name,
-                matched_pattern: pattern,
-                try_actions: try_act,
-                final_actions: final_act,
-            }
-        })
-        .collect()
 }
 
 pub fn run_offline_reprocessing(
     config: &GuardConfig,
-    rules: &CompiledManifest,
+    compiled_manifest: &CompiledManifest,
     json_enabled: bool,
+    offline_map_path: Option<String>,
+    hide_bypasses: bool,
 ) {
     let log_dir_path = Path::new(&config.monitor.log_dir);
+
     if !log_dir_path.exists() {
         eprintln!("[ERROR] Log directory does not exist: {:?}", log_dir_path);
         return;
+    }
+
+    let mut historical_map: HashMap<String, String> = HashMap::new();
+    if let Some(path) = offline_map_path {
+        if let Ok(content) = fs::read_to_string(&path) {
+            if let Ok(parsed) = serde_json::from_str(&content) {
+                historical_map = parsed;
+                println!(
+                    "[*] Loaded {} historical ID-to-Name mappings from {}",
+                    historical_map.len(),
+                    path
+                );
+            }
+        }
     }
 
     println!(
@@ -160,42 +181,122 @@ pub fn run_offline_reprocessing(
                                 active_container_id = scrape_container_id(&line);
                             }
 
-                            let hits = get_line_matches(&line, rules);
-                            if !hits.is_empty() {
+                            let raw_hits = compiled_manifest.regex_set.matches(&line);
+                            if !raw_hits.matched_any() {
+                                continue;
+                            }
 
-                                print!("\r\x1B[K");
+                            print!("\r\x1B[K");
+                            let display_id = active_container_id.as_deref().unwrap_or("UNKNOWN_ID");
+                            let resolved_name = historical_map
+                                .get(display_id)
+                                .map(|s| s.as_str())
+                                .unwrap_or(display_id);
 
-                                let display_id = active_container_id.as_deref().unwrap_or("UNKNOWN_ID");
+                            let mut whitelisted = false;
+                            let mut rule_hits = Vec::new();
 
-                                for hit in hits {
-                                    if json_enabled {
-                                        emit_log(
-                                            "INFO",
-                                            "forensics",
-                                            Some(hit.rule_name),
-                                            Some(display_id),
-                                            None,
-                                            Some("offline_scan"),
-                                            "MATCH_FOUND",
-                                            &format!(
-                                                "Pattern triggered: '{}' | Raw log: '{}'",
-                                                hit.matched_pattern, line
-                                            ),
-                                            config.monitor.log_level,
-                                            true,
-                                        );
-                                    } else {
-                                        println!(
-                                            "[FORENSIC] Container: {} | Rule: '{}' | Pattern: '{}'\n  └─ Log: '{}'",
-                                            display_id, hit.rule_name, hit.matched_pattern, line
-                                        );
+                            for idx in raw_hits.into_iter() {
+                                let meta = &compiled_manifest.metadata[idx];
+                                let identity_name = match meta {
+                                    SignatureMeta::Rule { name, .. } => name,
+                                    SignatureMeta::Whitelist { name, .. } => name,
+                                };
+
+                                let is_whitelist = matches!(meta, SignatureMeta::Whitelist { .. });
+                                let mut is_mapped = false;
+
+                                if let Some(specific_mapping) =
+                                    compiled_manifest.mappings.get(resolved_name)
+                                {
+                                    if specific_mapping
+                                        .contains_signature(identity_name, is_whitelist)
+                                    {
+                                        is_mapped = true;
                                     }
+                                }
+                                if !is_mapped {
+                                    if let Some(global_mapping) =
+                                        compiled_manifest.mappings.get("*")
+                                    {
+                                        if global_mapping
+                                            .contains_signature(identity_name, is_whitelist)
+                                        {
+                                            is_mapped = true;
+                                        }
+                                    }
+                                }
+
+                                if is_mapped {
+                                    match meta {
+                                        SignatureMeta::Whitelist { name, pattern } => {
+                                            whitelisted = true;
+
+                                            if !hide_bypasses {
+                                                if json_enabled {
+                                                    emit_log(
+                                                        "INFO",
+                                                        "forensics",
+                                                        Some(name),
+                                                        Some(display_id),
+                                                        None,
+                                                        Some("offline_scan"),
+                                                        "WHITELISTED",
+                                                        &format!("Pattern: '{}'", pattern),
+                                                        config.monitor.log_level,
+                                                        true,
+                                                    );
+                                                } else {
+                                                    println!(
+                                                        "[FORENSIC-BYPASS] Container: {} | Whitelist: '{}' | Pattern: '{}'",
+                                                        display_id, name, pattern
+                                                    );
+                                                }
+                                            }
+                                            break;
+                                        }
+                                        SignatureMeta::Rule { name, pattern, .. } => {
+                                            rule_hits.push((name.clone(), pattern.clone()));
+                                        }
+                                    }
+                                }
+                            }
+
+                            if whitelisted {
+                                continue;
+                            }
+
+                            for (rule_name, pattern) in rule_hits {
+                                if json_enabled {
+                                    emit_log(
+                                        "INFO",
+                                        "forensics",
+                                        Some(&rule_name),
+                                        Some(display_id),
+                                        None,
+                                        Some("offline_scan"),
+                                        "MATCH_FOUND",
+                                        &format!(
+                                            "Pattern triggered: '{}' | Raw log: '{}'",
+                                            pattern, line
+                                        ),
+                                        config.monitor.log_level,
+                                        true,
+                                    );
+                                } else {
+                                    println!(
+                                        "[FORENSIC] Container: {} | Rule: '{}' | Pattern: '{}'\n  └─ Log: '{}'",
+                                        display_id, rule_name, pattern, line
+                                    );
                                 }
                             }
                         }
                     }
 
-                    println!("\n  └─ File processing complete. Total lines parsed: {}", line_count);
+                    println!(
+                        "\n  └─ File processing complete. Total lines parsed: {}",
+                        line_count
+                    );
                 }
             }
         }
@@ -207,6 +308,8 @@ pub fn start_monitor_loop(
     config: GuardConfig,
     initial_playbooks: HashMap<String, PlaybookConfig>,
     initial_rules: Vec<JsonRuleConfig>,
+    initial_whitelists: Vec<WhitelistConfig>,
+    initial_mappings: HashMap<String, MappingConfig>,
     shutdown: Arc<AtomicBool>,
     config_path: String,
 ) {
@@ -229,7 +332,8 @@ pub fn start_monitor_loop(
         });
     }
 
-    let active_containers = Arc::new(RwLock::new(HashSet::<String>::new()));
+    let active_containers: Arc<RwLock<HashMap<String, String>>> =
+        Arc::new(RwLock::new(HashMap::new()));
     let anti_dos_state = Arc::new(Mutex::new(AntiDosState::new()));
     let global_limiter = Arc::new(GlobalRateLimiter::new(10000));
 
@@ -276,6 +380,7 @@ pub fn start_monitor_loop(
 
                                 let mut headers = [httparse::EMPTY_HEADER; 64];
                                 let mut res = httparse::Response::new(&mut headers);
+
                                 match res.parse(&header_buf[..bytes_read]) {
                                     Ok(httparse::Status::Complete(body_start_offset)) => {
                                         header_end = body_start_offset;
@@ -305,8 +410,10 @@ pub fn start_monitor_loop(
                                 let leftover = header_buf[header_end..bytes_read].to_vec();
                                 let mut reader =
                                     BufReader::new(Cursor::new(leftover).chain(stream));
+
                                 let mut chunk_size_buf = String::new();
                                 let mut line_buffer = Vec::new();
+
                                 while !stream_shutdown.load(Ordering::SeqCst) {
                                     chunk_size_buf.clear();
                                     if reader.read_line(&mut chunk_size_buf).is_err() {
@@ -321,6 +428,7 @@ pub fn start_monitor_loop(
                                         Ok(size) => size,
                                         Err(_) => break,
                                     };
+
                                     if chunk_size == 0 {
                                         break;
                                     }
@@ -336,6 +444,7 @@ pub fn start_monitor_loop(
                                     }
 
                                     line_buffer.extend_from_slice(&chunk_buf);
+
                                     if line_buffer.len() > 65536 {
                                         line_buffer.clear();
                                     }
@@ -358,7 +467,12 @@ pub fn start_monitor_loop(
                                             ) {
                                                 let mut guard = cache_clone.write();
                                                 if event.action == "start" {
-                                                    guard.insert(event.actor.id);
+                                                    let name = event
+                                                        .actor
+                                                        .attributes
+                                                        .and_then(|attr| attr.get("name").cloned())
+                                                        .unwrap_or_else(|| event.actor.id.clone());
+                                                    guard.insert(event.actor.id, name);
                                                 } else if event.action == "die" {
                                                     guard.remove(&event.actor.id);
                                                 }
@@ -403,11 +517,15 @@ pub fn start_monitor_loop(
     let worker_registry: Arc<RwLock<RegistryMap>> = Arc::new(RwLock::new(HashMap::new()));
     let regex_compiled = Arc::new(RwLock::new(compile_manifest_rules(
         &initial_rules,
+        &initial_whitelists,
         &initial_playbooks,
+        initial_mappings,
     )));
+
     let rules_watch_clone = Arc::clone(&regex_compiled);
     let path_watch_clone = config_path.clone();
     let json_enabled_clone = json_enabled;
+
     thread::spawn(move || {
         use notify::{RecursiveMode, Watcher};
         let (tx, rx) = std::sync::mpsc::channel();
@@ -435,12 +553,17 @@ pub fn start_monitor_loop(
                     thread::sleep(Duration::from_millis(100));
 
                     if let Ok(new_config) = crate::config::load_config(&path_watch_clone) {
-                        if let Ok((new_playbooks, new_rules)) =
+                        if let Ok((new_playbooks, new_rules, new_whitelists, new_mappings)) =
                             crate::config::load_and_merge_manifests(
                                 &new_config.monitor.security_manifest_paths,
                             )
                         {
-                            let new_compiled = compile_manifest_rules(&new_rules, &new_playbooks);
+                            let new_compiled = compile_manifest_rules(
+                                &new_rules,
+                                &new_whitelists,
+                                &new_playbooks,
+                                new_mappings,
+                            );
                             {
                                 let mut guard = rules_watch_clone.write();
                                 *guard = new_compiled;
@@ -466,32 +589,21 @@ pub fn start_monitor_loop(
                                 None,
                                 None,
                                 "FAILURE",
-                                "Hot-reload aborted: Manifest files contain schema errors or format collisions.",
+                                "Hot-reload aborted: Manifest files contain schema errors.",
                                 config_log_level,
                                 json_enabled_clone,
                             );
                         }
-                    } else {
-                        emit_log(
-                            "WARN",
-                            "config_reload",
-                            None,
-                            None,
-                            None,
-                            None,
-                            "FAILURE",
-                            "Hot-reload aborted: Updated configuration profile contains errors.",
-                            config_log_level,
-                            json_enabled_clone,
-                        );
                     }
                 }
             }
         }
     });
+
     let id_extractor = Regex::new(r"--id=\b([a-fA-F0-9]{12}|[a-fA-F0-9]{64})\b").unwrap();
     let mut file_state_tracker: HashMap<String, LogDescriptor> = HashMap::new();
     let mut first_run = true;
+
     if mode == &IngestionMode::Socket || mode == &IngestionMode::Dual {
         let uds_registry = Arc::clone(&worker_registry);
         let uds_regex = Arc::clone(&regex_compiled);
@@ -503,6 +615,7 @@ pub fn start_monitor_loop(
         let uds_anti_dos = Arc::clone(&anti_dos_state);
         let uds_shutdown = Arc::clone(&shutdown);
         let limiter_clone = Arc::clone(&global_limiter);
+
         thread::spawn(move || {
             crate::socket::run_uds_server(
                 uds_registry,
@@ -531,7 +644,7 @@ pub fn start_monitor_loop(
             None,
             None,
             "STARTED",
-            "Out-of-band UDS receiver active. Production monitoring path fully armed.",
+            "Out-of-band UDS receiver active.",
             config_log_level,
             json_enabled,
         );
@@ -652,6 +765,7 @@ pub fn start_monitor_loop(
                     let file_result = open_log_safe(log_dir_path, path.file_name().unwrap());
                     #[cfg(not(unix))]
                     let file_result = fs::File::open(&path);
+
                     if let Ok(file) = file_result {
                         #[cfg(unix)]
                         {
@@ -671,12 +785,14 @@ pub fn start_monitor_loop(
                         const MAX_LINE_SIZE: usize = 65536;
                         let mut stream_buffer = vec![0u8; MAX_LINE_SIZE * 2];
                         let mut buffer_len = 0;
+
                         loop {
                             let bytes_read = match reader.read(&mut stream_buffer[buffer_len..]) {
                                 Ok(0) => break,
                                 Ok(n) => n,
                                 Err(_) => break,
                             };
+
                             buffer_len += bytes_read;
                             let mut start_pos = 0;
 
@@ -690,7 +806,6 @@ pub fn start_monitor_loop(
                                 let trimmed = line_slice.trim_end();
 
                                 if !trimmed.is_empty() {
-
                                     if cached_id.is_none() {
                                         cached_id = scrape_container_id(trimmed);
                                     }
@@ -763,45 +878,10 @@ pub fn start_monitor_loop(
     }
 }
 
-#[cfg(target_os = "linux")]
-fn is_container_active_sync(container_id: &str, socket_path: &str) -> bool {
-    use std::io::{Read, Write};
-    if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(socket_path) {
-        let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
-        let request = format!("GET /containers/{}/json HTTP/1.0\r\n\r\n", container_id);
-
-        if stream.write_all(request.as_bytes()).is_ok() {
-            let mut header_buf = [0u8; 1024];
-            let mut bytes_read = 0;
-
-            loop {
-                if bytes_read >= header_buf.len() {
-                    break;
-                }
-                match stream.read(&mut header_buf[bytes_read..]) {
-                    Ok(n) if n > 0 => bytes_read += n,
-                    _ => break,
-                }
-
-                let mut headers = [httparse::EMPTY_HEADER; 16];
-                let mut res = httparse::Response::new(&mut headers);
-                match res.parse(&header_buf[..bytes_read]) {
-                    Ok(httparse::Status::Complete(_)) => {
-                        return res.code == Some(200);
-                    }
-                    Ok(httparse::Status::Partial) => continue,
-                    Err(_) => break,
-                }
-            }
-        }
-    }
-    false
-}
-
 #[allow(unused_variables)]
 pub fn evaluate_line_signatures(
     line: &str,
-    rules: &CompiledManifest,
+    compiled_manifest: &CompiledManifest,
     id_extractor: &Regex,
     registry: &Arc<RwLock<RegistryMap>>,
     whitelist: &Arc<Vec<ipnet::IpNet>>,
@@ -811,13 +891,13 @@ pub fn evaluate_line_signatures(
     docker_socket_path: &str,
     file_container_id: Option<String>,
     is_from_file: bool,
-    active_containers: &Arc<RwLock<HashSet<String>>>,
+    active_containers: &Arc<RwLock<HashMap<String, String>>>,
     anti_dos_state: &Arc<Mutex<AntiDosState>>,
     max_workers: usize,
     global_limiter: &GlobalRateLimiter,
 ) {
-    let hits = get_line_matches(line, rules);
-    if hits.is_empty() {
+    let raw_hits = compiled_manifest.regex_set.matches(line);
+    if !raw_hits.matched_any() {
         return;
     }
 
@@ -850,7 +930,7 @@ pub fn evaluate_line_signatures(
             None,
             Some("trust_boundary"),
             "REJECTED",
-            "Socket stream failed kernel identity resolution. Dropping unauthenticated payload.",
+            "Socket stream missing authenticated ID.",
             config_log_level,
             json_enabled,
         );
@@ -867,37 +947,30 @@ pub fn evaluate_line_signatures(
 
     #[allow(unused_mut)]
     let mut dispatch_id = container_id.clone();
+    #[allow(unused_mut)]
+    let mut resolved_name = container_id.clone();
 
     #[cfg(target_os = "linux")]
     let mut is_valid = {
         let active_guard = active_containers.read();
-        active_guard.contains(&container_id)
-            || active_guard
-            .iter()
-            .any(|long_id| long_id.starts_with(&container_id))
+        if let Some(name) = active_guard.get(&container_id) {
+            resolved_name = name.clone();
+            true
+        } else {
+            if let Some((_, name)) = active_guard
+                .iter()
+                .find(|(long_id, _)| long_id.starts_with(&container_id))
+            {
+                resolved_name = name.clone();
+                true
+            } else {
+                false
+            }
+        }
     };
 
     #[cfg(target_os = "linux")]
     {
-        if !is_valid && !is_from_file {
-            let mut active_write = active_containers.write();
-            active_write.insert(container_id.clone());
-            is_valid = true;
-
-            emit_log(
-                "DEBUG",
-                "orchestrator",
-                None,
-                Some(&container_id),
-                None,
-                Some("kernel_promotion"),
-                "SUCCESS",
-                "Startup transaction detected. Container context cache seeded via verified peer credentials.",
-                config_log_level,
-                json_enabled,
-            );
-        }
-
         if !is_valid {
             let mut dos_guard = anti_dos_state.lock();
             let now = std::time::Instant::now();
@@ -914,10 +987,12 @@ pub fn evaluate_line_signatures(
                 dos_guard.tokens -= 1;
                 drop(dos_guard);
 
-                let actually_exists = is_container_active_sync(&container_id, docker_socket_path);
-                if actually_exists {
+                if let Some(fetched_name) =
+                    crate::worker::fetch_container_name_sync(&container_id, docker_socket_path)
+                {
                     let mut active_write = active_containers.write();
-                    active_write.insert(container_id.clone());
+                    active_write.insert(container_id.clone(), fetched_name.clone());
+                    resolved_name = fetched_name;
                     is_valid = true;
                 } else {
                     let mut dos_write = anti_dos_state.lock();
@@ -960,7 +1035,79 @@ pub fn evaluate_line_signatures(
         }
     }
 
-    for hit in hits {
+    let mut whitelisted = false;
+    let mut rule_hits = Vec::new();
+
+    for idx in raw_hits.into_iter() {
+        let meta = &compiled_manifest.metadata[idx];
+
+        let identity_name = match meta {
+            SignatureMeta::Rule { name, .. } => name,
+            SignatureMeta::Whitelist { name, .. } => name,
+        };
+
+        let is_whitelist = matches!(meta, SignatureMeta::Whitelist { .. });
+        let mut is_mapped = false;
+
+        if let Some(specific_mapping) = compiled_manifest.mappings.get(&resolved_name) {
+            if specific_mapping.contains_signature(identity_name, is_whitelist) {
+                is_mapped = true;
+            }
+        }
+
+        if !is_mapped {
+            if let Some(global_mapping) = compiled_manifest.mappings.get("*") {
+                if global_mapping.contains_signature(identity_name, is_whitelist) {
+                    is_mapped = true;
+                }
+            }
+        }
+
+        if is_mapped {
+            match meta {
+                SignatureMeta::Whitelist { name, pattern } => {
+                    whitelisted = true;
+                    emit_log(
+                        "DEBUG",
+                        "orchestrator",
+                        Some(name),
+                        Some(&dispatch_id),
+                        None,
+                        Some("whitelist_override"),
+                        "SUPPRESSED",
+                        &format!(
+                            "Signature explicitly exempted by mapping. Pattern: '{}'",
+                            pattern
+                        ),
+                        config_log_level,
+                        json_enabled,
+                    );
+                    break;
+                }
+                SignatureMeta::Rule {
+                    name,
+                    playbook,
+                    pattern,
+                    try_actions,
+                    final_actions,
+                } => {
+                    rule_hits.push((
+                        name.clone(),
+                        playbook.clone(),
+                        pattern.clone(),
+                        try_actions.clone(),
+                        final_actions.clone(),
+                    ));
+                }
+            }
+        }
+    }
+
+    if whitelisted {
+        return;
+    }
+
+    for (rule_name, _playbook_name, pattern, try_acts, final_acts) in rule_hits {
         emit_log(
             "DEBUG",
             "orchestrator",
@@ -970,27 +1117,25 @@ pub fn evaluate_line_signatures(
             Some("signature_eval"),
             "EVALUATING",
             &format!(
-                "Automaton detected rule '{}' via specific pattern: '{}'",
-                hit.rule_name, hit.matched_pattern
+                "Automaton detected rule '{}' via pattern: '{}'",
+                rule_name, pattern
             ),
             config_log_level,
             json_enabled,
         );
 
-        let mut active_try = hit.try_actions.clone();
+        let mut active_try = try_acts;
         if is_from_file && active_try.first() != Some(&AtomicAction::ValidateState) {
             active_try.insert(0, AtomicAction::ValidateState);
         }
 
-        let enhanced_trigger_message =
-            format!("[Matched Pattern: {}] Raw: {}", hit.matched_pattern, line);
-
+        let enhanced_trigger_message = format!("[Matched Pattern: {}] Raw: {}", pattern, line);
         dispatch_to_worker(
             registry,
             dispatch_id.clone(),
             active_try,
-            hit.final_actions.clone(),
-            hit.rule_name.to_string(),
+            final_acts,
+            rule_name.to_string(),
             Arc::clone(whitelist),
             Arc::clone(table),
             json_enabled,
@@ -1084,6 +1229,7 @@ fn dispatch_to_worker(
         config_log_level,
         json_enabled,
     );
+
     let tx = reg_write.entry(container_id.clone()).or_insert_with(|| {
         let (worker_tx, worker_rx) = sync_channel::<WorkerChannelMessage>(64);
         let cid_clone = container_id.clone();
@@ -1104,9 +1250,9 @@ fn dispatch_to_worker(
                 ds_clone,
             );
         });
-
         worker_tx
     });
+
     let _ = tx
         .try_send((
             try_actions,
@@ -1213,22 +1359,6 @@ fn run_worker_lifecycle(
     }
 }
 
-fn notify_systemd_watchdog() {
-    if let Ok(socket_path) = std::env::var("NOTIFY_SOCKET") {
-        if !socket_path.is_empty() {
-            use std::os::unix::net::UnixDatagram;
-            let resolved_path = if let Some(stripped) = socket_path.strip_prefix('@') {
-                format!("\0{}", stripped)
-            } else {
-                socket_path
-            };
-            if let Ok(socket) = UnixDatagram::unbound() {
-                let _ = socket.send_to(b"WATCHDOG=1\n", resolved_path);
-            }
-        }
-    }
-}
-
 pub fn notify_systemd_ready() {
     if let Ok(socket_path) = std::env::var("NOTIFY_SOCKET") {
         if !socket_path.is_empty() {
@@ -1245,12 +1375,29 @@ pub fn notify_systemd_ready() {
     }
 }
 
+fn notify_systemd_watchdog() {
+    if let Ok(socket_path) = std::env::var("NOTIFY_SOCKET") {
+        if !socket_path.is_empty() {
+            use std::os::unix::net::UnixDatagram;
+            let resolved_path = if let Some(stripped) = socket_path.strip_prefix('@') {
+                format!("\0{}", stripped)
+            } else {
+                socket_path
+            };
+            if let Ok(socket) = UnixDatagram::unbound() {
+                let _ = socket.send_to(b"WATCHDOG=1\n", resolved_path);
+            }
+        }
+    }
+}
+
 #[cfg(unix)]
 fn open_log_safe(dir_path: &Path, file_name: &OsStr) -> std::io::Result<fs::File> {
     let dir_c = CString::new(dir_path.as_os_str().as_bytes())
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     let file_c = CString::new(file_name.as_bytes())
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+
     unsafe {
         let dir_fd = libc::open(
             dir_c.as_ptr(),

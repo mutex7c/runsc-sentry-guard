@@ -1,0 +1,10 @@
+{
+  "whitelists": [
+    {
+      "name": "local_healthcheck_bypass",
+      "match_any": [
+        " execve\\(.*\\bwget\\b.*\"https?://127\\.0\\.0\\.1/health\""
+      ]
+    }
+  ]
+}

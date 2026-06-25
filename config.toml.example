@@ -1,7 +1,7 @@
 [monitor]
 mode = "file" # Options: "file", "socket", or "dual"
-log_level = "info" # Options: "error", "warn", "info", "debug", "trace"
-log_dir = "/var/log/gvisor/"
+log_level = "debug" # Options: "error", "warn", "info", "debug", "trace"
+log_dir = "./mock_logs"  # <-- Change this from "/var/log/gvisor/"
 docker_socket_path = "/var/run/docker.sock"
 check_interval_ms = 1000
 ip_whitelist = ["127.0.0.1/32", "10.11.11.0/24", "192.168.3.0/24"]
@@ -10,8 +10,10 @@ json_logging_enabled = true
 systemd_watchdog_interval_ms = 5000
 flush_firewall_on_shutdown = false
 max_workers = 100
+
 security_manifest_paths = [
-  "/etc/runsc-sentry-guard/playbooks.json",
-#  "/etc/runsc-sentry-guard/rules.d/common_iocs.json",
-#  "/etc/runsc-sentry-guard/rules.d/emergency_rules.json"
+    "./config/playbooks.json",
+    "./config/rules.json",
+    "./config/whitelists.json",
+    "./config/mappings.json"
 ]

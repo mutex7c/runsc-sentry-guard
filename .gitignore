@@ -18,7 +18,7 @@
 config.toml
 
 # Omit local rule files
-rules.json
+/config/*.json
 
 # Local mock_logs
 /mock_logs

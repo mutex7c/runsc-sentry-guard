@@ -55,7 +55,7 @@ curl -L -O https://github.com/mutex7c/runsc-sentry-guard/releases/latest/downloa
 # 2. Initialize your config (adjust as required)
 
 mv config.toml.example config.toml
-mv rules.json.example rules.json
+mv rules.json.example.example rules.json.example
 
 # 3. Arm the executable and start out-of-band monitoring
 

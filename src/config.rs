@@ -92,6 +92,10 @@ pub struct SecurityManifest {
     pub playbooks: HashMap<String, PlaybookConfig>,
     #[serde(default)]
     pub rules: Vec<JsonRuleConfig>,
+    #[serde(default)]
+    pub whitelists: Vec<WhitelistConfig>,
+    #[serde(default)]
+    pub mappings: HashMap<String, MappingConfig>,
 }
 
 #[derive(Debug, Deserialize, Clone, PartialEq)]
@@ -107,28 +111,60 @@ pub struct JsonRuleConfig {
     pub playbook: String,
 }
 
+#[derive(Debug, Deserialize, Clone)]
+pub struct WhitelistConfig {
+    pub name: String,
+    pub match_any: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct MappingConfig {
+    #[serde(default)]
+    pub active_rules: Vec<String>,
+    #[serde(default)]
+    pub active_whitelists: Vec<String>,
+}
+
+impl MappingConfig {
+    pub fn contains_signature(&self, identity_name: &str, is_whitelist: bool) -> bool {
+        if is_whitelist {
+            self.active_whitelists
+                .iter()
+                .any(|name| name == identity_name)
+        } else {
+            self.active_rules.iter().any(|name| name == identity_name)
+        }
+    }
+}
+
 pub fn load_config<P: AsRef<Path>>(path: P) -> Result<GuardConfig> {
     let path_ref = path.as_ref();
-
     let content = fs::read_to_string(path_ref).with_context(|| {
         format!(
             "Configuration missing, inaccessible, or tampered at '{}'",
             path_ref.display()
         )
     })?;
-
     let config: GuardConfig =
         toml::from_str(&content).context("Configuration structural verification failed")?;
-
     Ok(config)
 }
 
 pub fn load_and_merge_manifests(
     paths: &[PathBuf],
-) -> Result<(HashMap<String, PlaybookConfig>, Vec<JsonRuleConfig>)> {
+) -> Result<(
+    HashMap<String, PlaybookConfig>,
+    Vec<JsonRuleConfig>,
+    Vec<WhitelistConfig>,
+    HashMap<String, MappingConfig>,
+)> {
     let mut global_playbooks: HashMap<String, PlaybookConfig> = HashMap::new();
     let mut global_rules: Vec<JsonRuleConfig> = Vec::new();
+    let mut global_whitelists: Vec<WhitelistConfig> = Vec::new();
+    let mut global_mappings: HashMap<String, MappingConfig> = HashMap::new();
+
     let mut seen_rule_names: HashSet<String> = HashSet::new();
+    let mut seen_whitelist_names: HashSet<String> = HashSet::new();
 
     for path in paths {
         let content = fs::read_to_string(path).with_context(|| {
@@ -137,7 +173,6 @@ pub fn load_and_merge_manifests(
                 path.display()
             )
         })?;
-
         let manifest: SecurityManifest = serde_json::from_str(&content).with_context(|| {
             format!(
                 "JSON schema structural verification failed for file: '{}'",
@@ -167,6 +202,29 @@ pub fn load_and_merge_manifests(
             seen_rule_names.insert(rule.name.clone());
             global_rules.push(rule);
         }
+
+        for wl in manifest.whitelists {
+            if seen_whitelist_names.contains(&wl.name) {
+                return Err(anyhow!(
+                    "Configuration Collision Error: Whitelist name '{}' defined in '{}' conflicts with an existing whitelist declaration.",
+                    wl.name,
+                    path.display()
+                ));
+            }
+            seen_whitelist_names.insert(wl.name.clone());
+            global_whitelists.push(wl);
+        }
+
+        for (target, mapping) in manifest.mappings {
+            if global_mappings.contains_key(&target) {
+                return Err(anyhow!(
+                    "Configuration Collision Error: Mapping target '{}' defined in '{}' conflicts with an existing mapping declaration.",
+                    target,
+                    path.display()
+                ));
+            }
+            global_mappings.insert(target, mapping);
+        }
     }
 
     if global_rules.is_empty() {
@@ -191,6 +249,7 @@ pub fn load_and_merge_manifests(
             .try_actions
             .iter()
             .chain(playbook.final_actions.iter());
+
         for action in combined_actions {
             if let AtomicAction::NftBlacklist { timeout, .. } = action {
                 if !timeout_regex.is_match(timeout) {
@@ -214,7 +273,33 @@ pub fn load_and_merge_manifests(
         }
     }
 
-    Ok((global_playbooks, global_rules))
+    for (target, mapping) in &global_mappings {
+        for rule_ref in &mapping.active_rules {
+            if !seen_rule_names.contains(rule_ref) {
+                return Err(anyhow!(
+                    "Integrity Constraint Violation: Mapping '{}' references an undefined rule: '{}'",
+                    target,
+                    rule_ref
+                ));
+            }
+        }
+        for wl_ref in &mapping.active_whitelists {
+            if !seen_whitelist_names.contains(wl_ref) {
+                return Err(anyhow!(
+                    "Integrity Constraint Violation: Mapping '{}' references an undefined whitelist: '{}'",
+                    target,
+                    wl_ref
+                ));
+            }
+        }
+    }
+
+    Ok((
+        global_playbooks,
+        global_rules,
+        global_whitelists,
+        global_mappings,
+    ))
 }
 
 pub type WorkerChannelMessage = (Vec<AtomicAction>, Vec<AtomicAction>, String, String);
@@ -231,7 +316,6 @@ mod tests {
     fn test_load_config_valid_atomic_read() {
         let mut temp_path = env::temp_dir();
         temp_path.push("runsc_valid_test_config.toml");
-
         let mut file = File::create(&temp_path).unwrap();
         let toml_data = r#"
             [monitor]
@@ -244,7 +328,7 @@ mod tests {
             docker_socket_path = "/var/run/docker.sock"
             systemd_watchdog_interval_ms = 5000
             flush_firewall_on_shutdown = false
-            security_manifest_paths = ["/etc/runsc-sentry-guard/rules.json"]
+            security_manifest_paths = ["/etc/runsc-sentry-guard/rules.json.example"]
         "#;
         file.write_all(toml_data.as_bytes()).unwrap();
 
